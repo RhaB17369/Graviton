@@ -1,0 +1,20 @@
+[package]
+name = "graviton-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "grv"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+graviton-core = { path = "../core" }
+graviton-indexer = { path = "../indexer" }
+graviton-llm = { path = "../llm" }
