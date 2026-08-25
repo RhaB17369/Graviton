@@ -158,6 +158,62 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
+## Language coverage (v0.2)
+
+Each parsed language is one tree-sitter grammar crate + one `def_query_src`
+entry in `crates/indexer/src/lang.rs`. Adding a language is: find its
+grammar on crates.io, pull its `node-types.json` to find the right node/field
+names for function/class/method definitions, write the query, and let the
+existing "best-effort, never fatal" machinery handle version drift.
+
+Two real constraints surfaced while adding the v0.2 batch (Java, C#, PHP,
+Ruby, Bash, Lua, Solidity, PowerShell):
+
+- **Node/field names must be looked up per grammar, not assumed.** They
+  don't follow one convention: Ruby's `class`/`module` nodes *do* expose a
+  `name:` field (unlike what a naive guess suggests), while Kotlin and
+  PowerShell's grammars expose the name as a bare positional child with no
+  field label at all (`(class_declaration (type_identifier) @name)` instead
+  of `(class_declaration name: (type_identifier) @name)`). Get this wrong
+  and the query still compiles — it just silently matches nothing, which is
+  why every language here was verified against a real sample file, not just
+  compiled.
+- **Cargo's `links` uniqueness bites grammar crates that lag upstream.**
+  `tree-sitter-kotlin` (0.3.8, the latest release on crates.io) depends on
+  tree-sitter 0.21/0.22; every other grammar here depends on 0.26. Cargo
+  will not link two versions of a native library that both declare `links =
+  "tree-sitter"` into one binary, so Kotlin can't be added as a parsed
+  language without vendoring a patched grammar crate — not worth it for one
+  language when the file is still fully searchable either way. This is the
+  actual failure mode to expect when adding more languages later, not a
+  one-off: check what tree-sitter core version a candidate grammar crate
+  pins before writing its query.
+
+## Tool execution (`grv tool`)
+
+`crates/cli/src/tools.rs` runs a whitelisted binary via `std::process::Command`
+with piped stdout/stderr, tees each line to the terminal live (two reader
+threads feeding one `mpsc::channel`, since `Command`'s piped streams aren't
+`Read` from two threads without separate handles) while also accumulating
+it, then writes one `tool_runs` row plus one `content_fts` row (`kind =
+'tool_output'`, `path = 'tool://<tool>#<id>'`) on exit.
+
+That second insert is the entire integration point with retrieval: `ask`'s
+`search_chunks` pass already queries `content_fts` with no `kind` filter, so
+a scan's output becomes part of the context budget for the very next `grv
+ask` with no additional plumbing. `grv index --force` deliberately spares
+`content_fts` rows with `kind = 'tool_output'` (see `clear_index` in
+`crates/core/src/lib.rs`) — recon history isn't derived from the repo tree,
+so re-indexing code shouldn't discard it.
+
+The whitelist (`ALLOWED_TOOLS`) is a scoping choice, not a sandboxing one:
+`grv tool run` executes exactly the command you typed with your own
+process permissions, identical to running it in the shell directly. Its
+purpose is keeping the subcommand a recon-tool launcher instead of turning
+into a second, worse shell — it is not a defense against a malicious
+argument to a whitelisted tool, which was never the threat model here (you
+already have a shell).
+
 ## What's explicitly *not* built yet (see README roadmap)
 
 - Call-graph edges (`callers`/`callees` beyond a name-match placeholder) —

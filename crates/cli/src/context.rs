@@ -67,6 +67,7 @@ pub fn search_symbols(
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut stmt = conn.prepare(
         "SELECT f.path, s.kind, s.name, s.start_line, s.end_line \
          FROM symbols s JOIN files f ON f.id = s.file_id \
@@ -87,6 +88,11 @@ pub fn search_symbols(
         })?;
         for row in rows.filter_map(|r| r.ok()) {
             let (path, kind, name, start, end) = row;
+            // The question can split into multiple tokens (e.g. "Invoke-Recon"
+            // -> "Invoke", "Recon") that both hit the same symbol; keep one.
+            if !seen.insert((path.clone(), start, end)) {
+                continue;
+            }
             let full_path = root.join(&path);
             let body = read_lines(&full_path, start, end).unwrap_or_default();
             if body.is_empty() {

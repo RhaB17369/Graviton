@@ -1,5 +1,6 @@
 mod context;
 mod prompts;
+mod tools;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -61,6 +62,42 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Run recon/security tools and index their output for `ask`/`search`
+    Tool {
+        #[command(subcommand)]
+        action: ToolCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToolCommand {
+    /// Run a whitelisted tool (e.g. `grv tool run nmap -- -sV 10.10.10.5`),
+    /// streaming its output live and indexing it under `tool://<name>#<id>`
+    Run {
+        tool: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Index output you already captured elsewhere (e.g. `cat scan.txt | grv tool ingest nmap "initial scan"`)
+    Ingest {
+        tool: String,
+        #[arg(default_value = "")]
+        label: String,
+    },
+    /// List whitelisted tools and recent runs
+    List {
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+    },
+    /// Print a stored run's full output (from `grv tool run`/`ingest`)
+    Show { id: i64 },
+}
+
+fn chrono_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn repo_root() -> Result<PathBuf> {
@@ -75,6 +112,13 @@ fn open_repo_db(cfg: &Config, root: &std::path::Path) -> Result<rusqlite::Connec
             db_path.display()
         );
     }
+    graviton_core::open_db(&db_path)
+}
+
+/// Like `open_repo_db`, but creates an empty index if none exists yet —
+/// used by `grv tool`, which is useful even before you've run `grv index`.
+fn open_or_init_repo_db(cfg: &Config, root: &std::path::Path) -> Result<rusqlite::Connection> {
+    let db_path = graviton_core::db_path_for(root, &cfg.index_dir)?;
     graviton_core::open_db(&db_path)
 }
 
@@ -97,6 +141,7 @@ async fn main() -> Result<()> {
         Command::Investigate { question, files } => cmd_ask(&cfg, &question, files, true).await,
         Command::Status => cmd_status(&cfg).await,
         Command::Config { model, num_ctx, host } => cmd_config(model, num_ctx, host),
+        Command::Tool { action } => cmd_tool(&cfg, action),
     }
 }
 
@@ -224,6 +269,61 @@ async fn cmd_status(cfg: &Config) -> Result<()> {
             }
         }
         Err(e) => println!("ollama: unreachable ({e})"),
+    }
+    Ok(())
+}
+
+fn cmd_tool(cfg: &Config, action: ToolCommand) -> Result<()> {
+    let root = repo_root()?;
+    match action {
+        ToolCommand::Run { tool, args } => {
+            let conn = open_or_init_repo_db(cfg, &root)?;
+            let id = tools::run_and_index(&conn, &tool, &args)?;
+            println!(
+                "\n[stored as tool run #{id} — try `grv ask \"analyze tool run #{id}\"` or `grv search '{tool}'`]"
+            );
+        }
+        ToolCommand::Ingest { tool, label } => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .context("reading tool output from stdin")?;
+            if buf.trim().is_empty() {
+                anyhow::bail!("no input on stdin — pipe tool output in, e.g. `cat scan.txt | grv tool ingest nmap`");
+            }
+            let conn = open_or_init_repo_db(cfg, &root)?;
+            let id = tools::ingest(&conn, &tool, &label, &buf)?;
+            println!("stored as tool run #{id} ({} lines)", buf.lines().count());
+        }
+        ToolCommand::List { limit } => {
+            println!("whitelisted tools: {}", tools::ALLOWED_TOOLS.join(", "));
+            let conn = open_or_init_repo_db(cfg, &root)?;
+            let runs = tools::recent_runs(&conn, limit)?;
+            if runs.is_empty() {
+                println!("\nno tool runs recorded yet in this repo's index");
+            } else {
+                println!("\nrecent runs:");
+                for r in runs {
+                    let status = r
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "?".into());
+                    let secs_ago = (chrono_now() - r.ran_at).max(0);
+                    println!(
+                        "  #{:<4} {:<12} exit={:<4} {}s ago  {}",
+                        r.id, r.tool, status, secs_ago, r.args
+                    );
+                }
+            }
+        }
+        ToolCommand::Show { id } => {
+            let conn = open_or_init_repo_db(cfg, &root)?;
+            let output: String = conn.query_row(
+                "SELECT output FROM tool_runs WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            ).with_context(|| format!("no tool run #{id}"))?;
+            print!("{output}");
+        }
     }
     Ok(())
 }

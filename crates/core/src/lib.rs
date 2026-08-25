@@ -179,16 +179,28 @@ pub fn open_db(path: &Path) -> Result<Connection> {
             name UNINDEXED,
             body
         );
+
+        CREATE TABLE IF NOT EXISTS tool_runs (
+            id          INTEGER PRIMARY KEY,
+            tool        TEXT NOT NULL,
+            args        TEXT NOT NULL,
+            ran_at      INTEGER NOT NULL,
+            exit_code   INTEGER,
+            output      TEXT NOT NULL
+        );
         "#,
     )?;
     Ok(conn)
 }
 
-/// Wipe all indexed data for a fresh re-index (schema is kept).
+/// Wipe indexed *code* for a fresh re-index (schema is kept). Tool-run
+/// history (`tool_runs` and its `content_fts` rows) is untouched — it's
+/// recon log, not derived from the repo tree, so re-indexing code shouldn't
+/// discard it.
 pub fn clear_index(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
-        DELETE FROM content_fts;
+        DELETE FROM content_fts WHERE kind != 'tool_output';
         DELETE FROM symbols;
         DELETE FROM files;
         "#,
