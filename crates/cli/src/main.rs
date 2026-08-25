@@ -1,4 +1,7 @@
+mod agentic;
 mod agents;
+mod browser;
+mod checkpoint;
 mod context;
 mod tools;
 
@@ -71,6 +74,34 @@ enum Command {
     },
     /// List GRAVITON's agent roster
     Agents,
+    /// Autonomous agentic loop: the agent reads/writes/edits files, runs
+    /// shell commands, and (with --browser) drives a headless browser,
+    /// until the task is done. Writes/edits/deletes/shell calls are
+    /// confirmed unless --yolo is set; file changes are checkpointed
+    /// (`grv rollback` undoes them).
+    Run {
+        task: String,
+        #[arg(long = "file")]
+        files: Vec<PathBuf>,
+        #[arg(long, default_value = "architect")]
+        agent: String,
+        /// Skip confirmation prompts — full autonomy
+        #[arg(long)]
+        yolo: bool,
+        /// Offer browser_navigate/eval/screenshot/console tools (launches headless Chromium on first use)
+        #[arg(long)]
+        browser: bool,
+    },
+    /// List `grv run` checkpoint sessions
+    Checkpoints,
+    /// Undo a `grv run` session's file changes (all of it, or back to one step)
+    Rollback {
+        /// Session id from `grv checkpoints` (defaults to the most recent one)
+        session: Option<String>,
+        /// Undo only steps after this one, instead of the whole session
+        #[arg(long)]
+        to: Option<u64>,
+    },
     /// Show index stats and Ollama connectivity
     Status,
     /// Show or update the config file (~/.config/graviton/config.toml)
@@ -179,6 +210,12 @@ async fn main() -> Result<()> {
             println!("{}", agents::list_text());
             Ok(())
         }
+        Command::Run { task, files, agent, yolo, browser } => {
+            let spec = resolve_agent(&agent)?;
+            cmd_run(&cfg, &task, files, spec, yolo, browser).await
+        }
+        Command::Checkpoints => cmd_checkpoints(),
+        Command::Rollback { session, to } => cmd_rollback(session, to),
         Command::Status => cmd_status(&cfg).await,
         Command::Config { model, num_ctx, host } => cmd_config(model, num_ctx, host),
         Command::Tool { action } => cmd_tool(&cfg, action),
@@ -261,19 +298,22 @@ fn agent_system_prompt(agent: &AgentSpec, investigate: bool) -> String {
     }
 }
 
-/// Stream one agent's reply to stdout, returning the full text.
+/// Stream one agent's reply to stdout, returning the full text. This path
+/// never offers tools — `ask`/`investigate`/`crew` are read-only analysis
+/// over retrieved context. `grv run` (see `agentic.rs`) is the tool-using
+/// agentic loop.
 async fn run_agent(client: &OllamaClient, cfg: &Config, system: &str, user_msg: &str) -> Result<String> {
     let messages = vec![ChatMessage::system(system), ChatMessage::user(user_msg)];
     let stdout = std::io::stdout();
     let result = client
-        .chat_stream(&cfg.model, &messages, cfg.num_ctx, |tok| {
+        .chat_stream(&cfg.model, &messages, cfg.num_ctx, &[], |tok| {
             let mut lock = stdout.lock();
             let _ = lock.write_all(tok.as_bytes());
             let _ = lock.flush();
         })
-        .await;
+        .await?;
     println!();
-    result
+    Ok(result.content)
 }
 
 async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &AgentSpec, investigate: bool) -> Result<()> {
@@ -343,6 +383,42 @@ async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &
         }
         println!();
     }
+    Ok(())
+}
+
+async fn cmd_run(cfg: &Config, task: &str, files: Vec<PathBuf>, agent: &AgentSpec, yolo: bool, browser: bool) -> Result<()> {
+    let root = repo_root()?;
+    let conn = open_or_init_repo_db(cfg, &root)?;
+    let context_text = build_context(cfg, &root, &conn, task, &files).unwrap_or_default();
+    let loop_cfg = agentic::AgentLoopConfig { auto_approve: yolo, enable_browser: browser };
+    agentic::run(cfg, &conn, &root, agent, task, Some(context_text), loop_cfg).await
+}
+
+fn cmd_checkpoints() -> Result<()> {
+    let root = repo_root()?;
+    let sessions = checkpoint::list_sessions(&root)?;
+    if sessions.is_empty() {
+        println!("no checkpoint sessions yet — they're created by `grv run`");
+        return Ok(());
+    }
+    for s in sessions {
+        println!("{:<20} {} step(s), {} file(s) touched", s.id, s.steps, s.files_touched);
+    }
+    Ok(())
+}
+
+fn cmd_rollback(session: Option<String>, to: Option<u64>) -> Result<()> {
+    let root = repo_root()?;
+    let session_id = match session {
+        Some(s) => s,
+        None => checkpoint::list_sessions(&root)?
+            .into_iter()
+            .last()
+            .map(|s| s.id)
+            .ok_or_else(|| anyhow::anyhow!("no checkpoint sessions to roll back"))?,
+    };
+    let undone = checkpoint::rollback(&root, &session_id, to)?;
+    println!("rolled back {undone} change(s) from session {session_id}");
     Ok(())
 }
 

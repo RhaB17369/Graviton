@@ -258,6 +258,75 @@ roadmap), not an oversight: giving each agent its own retrieval query is
 straightforward to add once it's clear the shared-context version is
 actually leaving relevant code unfound in practice.
 
+## The agentic loop (`grv run`, `crates/cli/src/agentic.rs`)
+
+Everything above (`ask`/`investigate`/`crew`) is one retrieval pass and one
+generation: the model reads context and answers in text. `grv run` is a
+different interaction model entirely — a real tool-use loop, matching
+Ollama's `/api/chat` `tools` parameter (OpenAI-style function calling):
+
+1. Send the conversation so far + the tool schemas (`agentic::tool_defs`).
+2. If the model's response carries `tool_calls` instead of (or alongside)
+   text, execute each one (`dispatch_inner`), append an assistant message
+   carrying the raw tool calls and a `role: "tool"` message per result, and
+   loop.
+3. If the response is plain text with no tool calls, that's the final
+   answer — stream it and stop. Hard cap at `MAX_STEPS` (40) so a
+   model that won't converge doesn't loop forever.
+
+This required extending `graviton-llm` beyond the original text-only
+`chat_stream`: `ChatMessage` gained `tool_calls`/`tool_name` fields (so
+assistant-with-tool-calls and tool-result messages serialize correctly),
+and `ChatResult` carries both accumulated text and accumulated tool calls
+out of the streamed response.
+
+### Tools
+
+`read_file`, `list_dir`, `write_file`, `edit_file` (unique
+old_string/new_string replace — same shape as this codebase's own edit
+tool, chosen over unified-diff patches because a small local model
+produces "replace this exact block" far more reliably than a correctly
+context-lined diff), `delete_file`, `run_shell`, and `recon_tool` (the
+`grv tool` whitelist, exposed as a tool so the agent can run nmap/ffuf/etc.
+itself instead of the user doing it out-of-band). `--browser` adds
+`browser_navigate`/`browser_eval`/`browser_screenshot`/`browser_console`,
+backed by `chromiumoxide` driving the system's Chromium over CDP
+(`crates/cli/src/browser.rs`) — headless, one page kept alive for the
+session, console output captured via a `Runtime.consoleAPICalled` event
+listener. Browser tools are opt-in (`--browser`) rather than always-on
+because launching Chromium has real startup cost and most coding tasks
+don't need it.
+
+`resolve_rel` gives every file tool a cheap containment check (rejects a
+path that normalizes outside the repo root) — not a hardened sandbox
+(symlinks aren't specially handled), just a guard against the model
+wandering outside the project by constructing a `../../` path.
+
+### Safety model: confirm by default, checkpoint always
+
+This is the one place in GRAVITON where the *model* decides to write files
+or run commands, not the user typing them — a materially different trust
+situation from `grv tool run`, where the user names the exact tool and
+args. Two independent mechanisms, chosen deliberately not to overlap:
+
+- **Confirmation** (`agentic::confirm`) gates `write_file`, `edit_file`,
+  `delete_file`, `run_shell`, and `recon_tool` — the user sees the exact
+  diff (`similar`-generated, via `diff_preview`) or command before it runs,
+  and can decline. `--yolo` skips this for a fully autonomous run.
+- **Checkpointing** (`checkpoint.rs`) is unconditional — it runs even under
+  `--yolo` — and is scoped to file state only: before any write/edit/delete,
+  the pre-change bytes (or the fact that the file didn't exist yet) are
+  saved to `.graviton/checkpoints/<session>/<seq>.bak` plus a
+  `manifest.jsonl` line. `grv rollback` replays that manifest backwards.
+
+Deliberately *not* checkpointed: `run_shell`. A shell command's side
+effects are unbounded (it can touch anything on the filesystem, start a
+process, hit the network) and there's no generic way to snapshot "the
+world" before running one. That's exactly why confirmation is the primary
+safety net for `run_shell` rather than promising a rollback the system
+can't actually guarantee — being honest about that boundary matters more
+than making the feature look more complete than it is.
+
 ## What's explicitly *not* built yet (see README roadmap)
 
 - Call-graph edges (`callers`/`callees` beyond a name-match placeholder) —

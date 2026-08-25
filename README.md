@@ -13,27 +13,70 @@ can't run a 30B+ model comfortably. It talks to [Ollama](https://ollama.com)
 — no cloud, your code never leaves the machine.
 
 "Multi-agent" here means real specialist personas that hand off actual
-work product to each other, not four names for one prompt:
+work product to each other, not a handful of names for one prompt.
+14 agents across three categories (`grv agents` prints the live roster with
+taglines):
 
-| Agent | Specialty |
+| Category | Agents |
 |---|---|
-| **ARCHITECT** | high-level programming: design, refactoring, correctness, performance |
-| **SENTINEL** | defensive security: vulnerability auditing, hardening, blue-team |
-| **REAPER** | offensive security: exploit dev, payloads, red-team/CTF |
-| **SINGULARITY** | coordinator: synthesizes the other three into one decision brief |
+| Programming | ARCHITECT (design/refactoring), TESTER, DEBUGGER, PERFORMANCE |
+| Defensive security | SENTINEL (general audit), CRYPTOGRAPHER, SUPPLYCHAIN, CLOUDSEC, IDENTITY |
+| Offensive security | REAPER (general exploit dev), WEBHUNTER, BINEXP, ADVERSARY |
+| Coordinator | SINGULARITY — no analysis of its own, synthesizes whichever agents ran |
 
-Ask one directly (`grv ask --agent sentinel "..."`), or run the whole crew
-(`grv crew "..."`) — ARCHITECT explains the code, REAPER finds what's
-exploitable in it, SENTINEL proposes fixes, SINGULARITY reads all three
-outputs and converges them into a prioritized action plan. Every stage
-reads the *actual output* of the ones before it, not just the same raw
-context re-served — that hand-off is what makes it a pipeline instead of
-running the same question three times.
+That's a deliberately curated set, not a padded-out 30-60 — each one covers
+a genuinely distinct failure mode or skill (crypto misuse is a different
+read than IDOR is different from a binary overflow), and the roster is
+data-driven (`crates/cli/src/agents.rs`) so adding a 15th is copy-paste-edit,
+not a redesign. Depth over headcount: a roster of near-duplicate personas
+would just make `grv crew` slower without finding anything more.
+
+Ask one directly (`grv ask --agent webhunter "..."`), or run a crew — the
+default pipeline is ARCHITECT → REAPER → SENTINEL → SINGULARITY, or pick
+your own: `grv crew --agents cryptographer,identity,singularity "audit the auth module"`.
+Every stage reads the *actual output* of the ones before it, not just the
+same raw context re-served — that hand-off is what makes it a pipeline
+instead of running the same question N times.
 
 They all run on the one local model configured in `grv config` (there's no
 second GPU to run four models on) — the specialization comes from four
 different system prompts and a real sequential hand-off, not four separate
 brains.
+
+### `ask`/`crew` (read-only) vs. `run` (acts on your project)
+
+`ask`, `investigate`, and `crew` are analysis only: they retrieve context
+and answer in text, never touching disk. **`grv run` is the mode that
+actually acts** — the agent gets real tools and a loop, like Claude Code:
+
+```sh
+grv run "add input validation to the login form and fix any bug you find"
+grv run --browser "add a /health endpoint to the Express app, then curl it and confirm it returns 200"
+grv run --agent reaper --yolo "fuzz the login endpoint for SQLi and write a PoC script"
+```
+
+Tools available to the agent: `read_file`, `list_dir`, `write_file`,
+`edit_file`, `delete_file`, `run_shell`, `recon_tool` (the same whitelisted
+nmap/ffuf/etc. as `grv tool`), and — with `--browser` — `browser_navigate`,
+`browser_eval`, `browser_screenshot`, `browser_console`, driving the
+system's headless Chromium via CDP so the agent can actually load a page,
+run JS in it, and see what broke, not just guess from source.
+
+Every `write_file`/`edit_file`/`delete_file`/`run_shell`/`recon_tool` call
+is shown to you and confirmed before it happens — you see the exact diff or
+command — unless you pass `--yolo` for a fully autonomous run. File changes
+are checkpointed regardless of `--yolo`:
+
+```sh
+grv checkpoints                # list grv run sessions and what they touched
+grv rollback                   # undo the most recent session's file changes entirely
+grv rollback <session-id> --to 3   # undo everything after step 3 in that session
+```
+
+Rollback covers file writes/edits/deletes only — a `run_shell` call's side
+effects (installing a package, starting a server) aren't generically
+undoable, which is exactly why it's confirmed up front instead of promising
+an undo it can't deliver.
 
 Instead of stuffing an entire repository into a context window (impossible
 past a few hundred KLOC anyway), GRAVITON indexes the repo once with
