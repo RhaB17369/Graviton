@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chromiumoxide",
@@ -688,6 +688,7 @@ dependencies = [
  "graviton-indexer",
  "graviton-llm",
  "ignore",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -700,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -711,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-indexer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "graviton-core",
@@ -739,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-llm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "futures-util",

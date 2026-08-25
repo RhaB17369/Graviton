@@ -216,11 +216,14 @@ already have a shell).
 
 ## Multi-agent design (`grv ask --agent`, `grv crew`)
 
-`crates/cli/src/agents.rs` defines four `AgentSpec`s (key, display name,
-tagline, system prompt): ARCHITECT (high-level programming), SENTINEL
-(defensive security), REAPER (offensive security), and SINGULARITY (a
-coordinator with no first-hand analysis of its own — it only synthesizes
-the other three's actual output).
+`crates/cli/src/agents.rs` defines 22 `AgentSpec`s (key, display name,
+tagline, system prompt, model tier) across five categories — programming,
+infrastructure & engineering, defensive security, offensive security, and
+SINGULARITY as a coordinator with no first-hand analysis of its own (it
+only synthesizes whichever other agents' output it's given). `grv agents`
+prints the live, data-driven roster; this section covers the mechanics
+that make it more than a system-prompt picker, using the original four
+(ARCHITECT/SENTINEL/REAPER/SINGULARITY) as the running example.
 
 Two important scoping decisions:
 
@@ -261,12 +264,14 @@ roadmap), not an oversight: giving each agent its own retrieval query is
 straightforward to add once it's clear the shared-context version is
 actually leaving relevant code unfound in practice.
 
-## Model tiers and `grv swarm`: real multi-model, resource-aware
+## Model tiers, `grv swarm`, and `grv mission`: real multi-model, resource-aware
 
-The 4-agent (later 14-agent) design above runs everything through one
-model — accurate for the default config, but the tiering added in v0.3
-of this document makes GRAVITON capable of genuinely running more than
-one model, sized to what the machine can actually hold:
+The 4-agent (later 22-agent) design above runs everything through one
+model — accurate for the default config, but the tiering added from v0.3
+onward makes GRAVITON capable of genuinely running more than one model,
+concurrently, sized continuously to what the machine can actually hold —
+this section covers `model_fast`/`model_deep`, `grv swarm`, and the
+recursive `grv mission`, in the order they build on each other.
 
 - `Config.model` is the `Standard` tier and always the fallback.
   `model_fast`/`model_deep` are optional overrides (`grv config
@@ -277,32 +282,117 @@ one model, sized to what the machine can actually hold:
   real hand-off, so parallelizing it would just make each stage read a
   half-finished prior stage. Multi-model there means *different-sized*
   models per stage, not concurrent ones.
-- **`grv swarm --agents a,b,c "question"`** is the actually-concurrent
-  mode: independent agents (no hand-off — this is for questions that don't
-  need one, e.g. running SENTINEL/REAPER/CRYPTOGRAPHER over the same
+- **`grv swarm --agents a,b,c "question"`** is the flat, one-level
+  concurrent mode: independent agents (no hand-off — for questions that
+  don't need one, e.g. running SENTINEL/REAPER/CRYPTOGRAPHER over the same
   question at once) fired via `tokio::task::JoinSet`, each against its own
-  tier's model, gated by a `tokio::sync::Semaphore` sized by
-  `resources::safe_concurrency`.
-- **The concurrency number is computed, not assumed.** `crates/cli/src/
-  resources.rs` reads total system RAM (`sysinfo`) and each configured
-  model's on-disk size (`OllamaClient::model_sizes_mb`, via `/api/tags`),
-  reserves a 30% safety margin for the OS/KV-cache growth, and packs as
-  many of the *distinct* configured models as fit — e.g. 16GB RAM with a
-  1.5GB fast model and a 5GB standard model comfortably fits both (2-way
-  concurrency); three 8B models would not, so `swarm` would cap at 1-2
-  instead of pretending otherwise. `--max-parallel` overrides the estimate
-  for a user who knows their actual headroom better than a heuristic does.
+  tier's model.
+- **`grv mission "big task" --max-depth N`** (`crates/cli/src/mission.rs`)
+  is the recursive mode: a planner call (`ModelTier::Fast`, cheap — it's
+  called once per tree node) proposes a JSON list of subtasks, each
+  assigned to whichever specialist fits; each subtask recurses through the
+  same planner step up to `--max-depth` (default 2, hard ceiling 4), and a
+  subtask the planner judges already atomic returns a single
+  self-referential entry, which short-circuits straight to a leaf — so a
+  simple task doesn't get artificially split just because depth budget is
+  available. Children of one node run concurrently
+  (`tokio::task::JoinSet`, recursed via a hand-rolled `Pin<Box<dyn Future
+  + Send>>` — Rust needs that indirection for a function that calls
+  itself in async code, since the naive recursive-`async fn` type would be
+  infinitely sized), and their results are combined by one more model call
+  (a synthesis step, also `Fast` tier) before returning up to the parent.
+  JSON extraction from the planner's response is bracket-counted by hand
+  (string-escape aware) rather than assumed well-formed, because a small
+  local model asked for "ONLY a JSON array, no prose" often adds prose or
+  a code fence anyway.
+
+### The concurrency number is computed and continuously re-sampled, not assumed once
+
+`crates/cli/src/resources.rs` separates two different constraints that a
+single "how many models fit" number was conflating in earlier drafts of
+this design:
+
+- **RAM bounds how many *distinct* models can be resident at once.**
+  `Capacity::detect()` reads total/available system RAM (`sysinfo`);
+  `model_sizes_mb` reads each configured model's on-disk size
+  (`OllamaClient::model_sizes_mb`, via `/api/tags`); `pick_concurrency`
+  reserves a 30% safety margin and packs as many distinct model tags as
+  fit in the rest.
+- **A resident model's own parallel-serving capacity bounds how many
+  callers can share it.** Five agents on the same `Standard`-tier model is
+  the common case (see the tier assignments in `grv agents`) — capping
+  concurrency at "number of distinct models" would wrongly serialize them
+  even though Ollama happily serves several concurrent requests against
+  one already-loaded model. `ASSUMED_PARALLEL_PER_MODEL` (3) accounts for
+  that: final concurrency = distinct-models-resident ×
+  `ASSUMED_PARALLEL_PER_MODEL`, capped by however many agents/subtasks are
+  actually pending. This was caught empirically, not assumed correct up
+  front — an early version capped concurrency at 1 whenever only one
+  distinct model was configured, which a mock-server test then visibly
+  serialized three independent `swarm` agents that should have run
+  together; fixed once the flaw showed up in real output, not left as a
+  known gap.
+- **`grv swarm`** computes this once at startup (`safe_concurrency`, a
+  thin wrapper: fetch sizes, then `pick_concurrency` once).
+- **`grv mission`** needs more than a one-shot number, because a mission's
+  shape (how many subtasks exist, how deep they recurse) isn't known until
+  the planner starts producing it — `resources::LiveScheduler` fetches
+  model sizes once at spawn (they don't change mid-run) then re-samples
+  the cheap, local part (`Capacity::detect()`, no network call) every 3
+  seconds for the whole mission, growing or shrinking a
+  `tokio::sync::Semaphore`'s permit count via `add_permits`/
+  `forget_permits` to match. Every single model call anywhere in a
+  mission's tree — leaf work, every planner call, every synthesis call —
+  acquires one permit from the *same* scheduler instance, so a mission
+  that fans out into 15 subtasks can never put more concurrent model calls
+  on the machine than its RAM can hold *at that moment*, and the gate
+  grows back into headroom that frees up as earlier subtasks finish. This
+  is the direct answer to "don't crash Ollama or the OS no matter how much
+  the task decomposes" — a hard structural guarantee (one shared gate,
+  every call site goes through it), not a best-effort convention agents
+  are trusted to follow.
+- `--max-parallel` (both `swarm` and `mission`) overrides the estimate for
+  a user who has tuned `OLLAMA_NUM_PARALLEL` differently or otherwise
+  knows their real headroom better than the heuristic does.
+- **`grv status`** surfaces the same estimate plus
+  `resources::top_memory_consumers` — the actual heaviest processes on the
+  machine right now, via `sysinfo`'s process list — so "why did it pick
+  this number" has a concrete answer instead of a black box.
 - **What this doesn't pretend to solve**: CPU threads (6C/12T on the
-  reference hardware) are shared across whatever runs concurrently — three
-  agents generating at once each get roughly a third of the cores, so each
-  individual stream is slower than it would be alone. The win is wall-clock
-  for the *batch*: three independent questions that would otherwise run one
-  after another finish closer to together. `grv swarm` prints the capacity
-  note up front so this trade-off isn't hidden.
+  reference hardware) are shared across whatever runs concurrently —
+  three agents generating at once each get roughly a third of the cores,
+  so each individual stream is slower than it would be alone. The win is
+  wall-clock for the *batch*: independent work that would otherwise run
+  one piece after another finishes closer to together. Both `swarm` and
+  `mission` state this up front rather than hiding it.
 - Ollama itself owns actual model residency (loading on first request,
   evicting LRU under memory pressure) — GRAVITON's estimate exists only to
   pick a sane concurrency *before* asking Ollama to do anything, not to
   duplicate Ollama's own memory management.
+
+### Real-time web access (`web_search`/`web_fetch`, `crates/cli/src/web.rs`)
+
+Added so agents don't answer version-specific or time-sensitive questions
+from a frozen training snapshot. Deliberately no API key: a keyed search
+API (Brave/Tavily) returns better results but requires the user to
+provision and manage a key before the tool works at all, which fails the
+"works out of the box" bar this project holds itself to elsewhere (no
+cloud, no signup, `ollama pull` and go). The cost of that choice is
+fragility — `web.rs` parses DuckDuckGo's actual result HTML with
+hand-rolled string scanning (no HTML-parser crate, same philosophy as
+`graviton_core`'s hand-rolled TOML), so a markup redesign on their end
+breaks it until updated. Two DuckDuckGo endpoints (`lite` and `html` —
+same engine, different endpoints, so not real backend diversity but
+resilient to one being throttled) are used with a fallback. Mojeek and
+Startpage were tried and rejected during development, not assumed to
+work: Mojeek serves a captcha to scripted requests, Startpage refused the
+connection outright — verified with a live `curl` before writing a parser
+for either. `web_fetch` strips `<script>`/`<style>` blocks and tags,
+unescapes entities, and collapses whitespace, also hand-rolled. Both
+tools are scoped to `grv run` (and `grv mission`'s underlying agent
+calls) — `ask`/`investigate`/`crew`/`swarm` stay single-pass and
+tool-free by design (§ above); reach for `run`/`mission` when an answer
+needs to be checked against the live internet, not assumed from memory.
 
 ## The agentic loop (`grv run`, `crates/cli/src/agentic.rs`)
 

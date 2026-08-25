@@ -3,8 +3,10 @@ mod agents;
 mod browser;
 mod checkpoint;
 mod context;
+mod mission;
 mod resources;
 mod tools;
+mod web;
 
 use agents::AgentSpec;
 
@@ -16,7 +18,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "grv", version, about = "GRAVITON — local multi-agent framework for high-level programming, defensive & offensive security, powered by Ollama")]
+#[command(name = "grv", version, about = "GRAVITON — local multi-agent framework for high-level programming, infrastructure, and offensive & defensive security, powered by Ollama")]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
@@ -75,6 +77,22 @@ enum Command {
     },
     /// List GRAVITON's agent roster
     Agents,
+    /// Recursively decompose a large task across the agent roster: a
+    /// planner call splits it into subtasks assigned to specialists, each
+    /// subtask can decompose further up to --max-depth, and results are
+    /// synthesized back up the tree. Every model call anywhere in the tree
+    /// shares one live, RAM-resampled concurrency gate (see `grv status`).
+    Mission {
+        task: String,
+        #[arg(long = "file")]
+        files: Vec<PathBuf>,
+        /// How many levels a subtask may recurse (default 2, hard ceiling 4)
+        #[arg(long)]
+        max_depth: Option<usize>,
+        /// Cap on concurrent model calls in flight at once (default: auto-detected from RAM)
+        #[arg(long)]
+        max_parallel: Option<usize>,
+    },
     /// Run several independent agents concurrently (no hand-off between
     /// them, unlike `crew`) — each on its own tier's model. Concurrency
     /// defaults to what this machine's RAM can hold resident at once;
@@ -234,6 +252,9 @@ async fn main() -> Result<()> {
         }
         Command::Swarm { question, files, agents, max_parallel } => {
             cmd_swarm(&cfg, &question, files, &agents, max_parallel).await
+        }
+        Command::Mission { task, files, max_depth, max_parallel } => {
+            cmd_mission(&cfg, &task, files, max_depth, max_parallel).await
         }
         Command::Run { task, files, agent, yolo, browser } => {
             let spec = resolve_agent(&agent)?;
@@ -440,25 +461,24 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
     }
 
     let client = OllamaClient::new(&cfg.ollama_host);
-    let models: Vec<&str> = {
-        let mut m: Vec<&str> = specs.iter().map(|s| cfg.model_for_tier(s.tier)).collect();
+    let models: Vec<String> = {
+        let mut m: Vec<String> = specs.iter().map(|s| cfg.model_for_tier(s.tier).to_string()).collect();
         m.dedup();
         m
     };
-    let cap = resources::detect();
-    let concurrency = match max_parallel {
-        Some(n) => n.max(1),
-        None => {
-            let (n, note) = resources::safe_concurrency(&client, &models, &cap).await;
-            println!("\x1b[2m{note}\x1b[0m\n");
-            n
-        }
-    };
+    let sizes = resources::model_sizes_mb(&client).await;
+    let hard_cap = max_parallel.unwrap_or(specs.len()).max(1);
+    let scheduler = resources::LiveScheduler::spawn(models, sizes, hard_cap);
+    if max_parallel.is_none() {
+        println!(
+            "\x1b[2mstarting concurrency ~{} (auto, re-sampled live from RAM as the swarm runs — see `grv status`)\x1b[0m\n",
+            scheduler.current_target()
+        );
+    }
 
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut tasks = tokio::task::JoinSet::new();
     for spec in specs {
-        let sem = sem.clone();
+        let scheduler = scheduler.clone();
         let client = OllamaClient::new(&cfg.ollama_host);
         let model = cfg.model_for_tier(spec.tier).to_string();
         let num_ctx = cfg.num_ctx;
@@ -467,7 +487,7 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
         let display = spec.display;
         let tagline = spec.tagline;
         tasks.spawn(async move {
-            let _permit = sem.acquire_owned().await;
+            let _permit = scheduler.acquire().await;
             let started = std::time::Instant::now();
             let result = client.chat_stream(&model, &[ChatMessage::system(system), ChatMessage::user(user_msg)], num_ctx, &[], |_| {}).await;
             (display, tagline, model, started.elapsed(), result)
@@ -483,6 +503,18 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
         }
     }
     Ok(())
+}
+
+async fn cmd_mission(cfg: &Config, task: &str, files: Vec<PathBuf>, max_depth: Option<usize>, max_parallel: Option<usize>) -> Result<()> {
+    let root = repo_root()?;
+    let conn = open_repo_db(cfg, &root)?;
+    let context_text = build_context(cfg, &root, &conn, task, &files)?;
+    let context_block = if context_text.is_empty() {
+        "(No indexed context matched — either run `grv index` first, or this task doesn't map to specific code.)".to_string()
+    } else {
+        format!("Retrieved context:\n{context_text}")
+    };
+    mission::run(cfg, &root, context_block, task, max_depth, max_parallel).await
 }
 
 async fn cmd_run(cfg: &Config, task: &str, files: Vec<PathBuf>, agent: &AgentSpec, yolo: bool, browser: bool) -> Result<()> {
@@ -564,6 +596,10 @@ async fn cmd_status(cfg: &Config) -> Result<()> {
     let distinct = cfg.distinct_models();
     let (_, note) = resources::safe_concurrency(&client, &distinct, &cap).await;
     println!("swarm capacity: {note}");
+    println!("heaviest processes on this machine right now (what that estimate is actually competing with):");
+    for (name, mb) in resources::top_memory_consumers(5) {
+        println!("  {name:<24} {mb} MB");
+    }
     Ok(())
 }
 

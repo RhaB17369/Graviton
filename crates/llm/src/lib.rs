@@ -129,6 +129,7 @@ pub struct ChatResult {
     pub tool_calls: Vec<ToolCall>,
 }
 
+#[derive(Clone)]
 pub struct OllamaClient {
     base_url: String,
     http: reqwest::Client,

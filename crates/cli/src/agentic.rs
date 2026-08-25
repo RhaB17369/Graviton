@@ -12,6 +12,7 @@ use crate::agents::AgentSpec;
 use crate::browser::BrowserSession;
 use crate::checkpoint;
 use crate::tools as recon_tools;
+use crate::web;
 use anyhow::{Context, Result};
 use graviton_core::Config;
 use graviton_llm::{ChatMessage, OllamaClient, ToolCall, ToolDef};
@@ -34,8 +35,12 @@ struct State {
     browser: Option<BrowserSession>,
 }
 
-fn tool_defs(enable_browser: bool) -> Vec<ToolDef> {
-    let mut tools = vec![
+/// The read-only subset of the tool roster — no file writes/shell/recon,
+/// just reading the repo and the live web. Shared with `mission.rs`, whose
+/// leaves stay analysis-only (like `ask`/`crew`/`swarm`) rather than
+/// gaining `grv run`'s full acting/checkpointed tool set.
+pub(crate) fn read_only_tool_defs() -> Vec<ToolDef> {
+    vec![
         ToolDef::new(
             "read_file",
             "Read a text file's contents, given a path relative to the repo root.",
@@ -56,6 +61,54 @@ fn tool_defs(enable_browser: bool) -> Vec<ToolDef> {
                 }
             }),
         ),
+        ToolDef::new(
+            "web_search",
+            "Search the web (DuckDuckGo) for current information and get titles + URLs + snippets back. \
+             Use this whenever a technique, API, CVE, or best practice might have changed since training — \
+             don't answer from memory alone for anything version-specific or time-sensitive.",
+            json!({ "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }),
+        ),
+        ToolDef::new(
+            "web_fetch",
+            "Fetch a URL and return its page text (HTML stripped) — read a specific page, e.g. one found via web_search, official docs, or an advisory.",
+            json!({ "type": "object", "properties": { "url": { "type": "string" } }, "required": ["url"] }),
+        ),
+    ]
+}
+
+/// Dispatch one of `read_only_tool_defs`' tools outside the full agentic
+/// loop's `State`/checkpoint machinery — used by `mission.rs`, which has no
+/// write/edit/delete tools to checkpoint in the first place.
+pub(crate) async fn dispatch_read_only(root: &Path, name: &str, args: &Value) -> String {
+    let arg_str = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let result: Result<String> = async {
+        match name {
+            "read_file" => {
+                let rel = arg_str("path");
+                let full = resolve_rel(root, &rel)?;
+                Ok(std::fs::read_to_string(&full).with_context(|| format!("reading {rel}"))?)
+            }
+            "list_dir" => {
+                let rel = arg_str("path");
+                let rel = if rel.is_empty() { "." } else { &rel };
+                let full = resolve_rel(root, rel)?;
+                list_dir(&full, args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false))
+            }
+            "web_search" => web::search(&arg_str("query")).await,
+            "web_fetch" => web::fetch(&arg_str("url")).await,
+            other => anyhow::bail!("unknown read-only tool '{other}'"),
+        }
+    }
+    .await;
+    match result {
+        Ok(s) => truncate(s),
+        Err(e) => format!("error: {e:#}"),
+    }
+}
+
+fn tool_defs(enable_browser: bool) -> Vec<ToolDef> {
+    let mut tools = read_only_tool_defs();
+    tools.extend(vec![
         ToolDef::new(
             "write_file",
             "Create a file or overwrite it entirely with new content. Checkpointed — undoable via `grv rollback`.",
@@ -117,7 +170,7 @@ fn tool_defs(enable_browser: bool) -> Vec<ToolDef> {
                 "required": ["tool", "args"]
             }),
         ),
-    ];
+    ]);
 
     if enable_browser {
         tools.push(ToolDef::new(
@@ -303,6 +356,14 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             combined.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
             Ok(truncate(combined))
         }
+        "web_search" => {
+            let query = arg_str("query")?;
+            Ok(truncate(web::search(&query).await?))
+        }
+        "web_fetch" => {
+            let url = arg_str("url")?;
+            Ok(truncate(web::fetch(&url).await?))
+        }
         "recon_tool" => {
             let tool = arg_str("tool")?;
             let args_list: Vec<String> = args
@@ -380,12 +441,17 @@ pub async fn run(
 
     let system = format!(
         "{}\n\nYou have tools to read/write/edit/delete files, run shell commands, \
-         run recon tools, and (if offered) drive a headless browser — use them; \
-         don't just describe what you'd do. Paths are relative to the repo root. \
-         File writes/edits/deletes and shell commands are confirmed with the user \
-         before they happen, so propose them directly rather than asking permission \
-         in text first. When the task is complete, stop calling tools and give a \
-         final summary of what you did and the result.",
+         run recon tools, search the web and fetch pages, and (if offered) drive a \
+         headless browser — use them; don't just describe what you'd do. Paths are \
+         relative to the repo root. File writes/edits/deletes and shell commands are \
+         confirmed with the user before they happen, so propose them directly rather \
+         than asking permission in text first. Use web_search/web_fetch whenever the \
+         task depends on something that could have changed since your training — a \
+         library's current API, a recent CVE, a best practice — instead of answering \
+         from memory and risking an obsolete technique; a wrong answer that looks \
+         current is worse than admitting you need to check. When the task is \
+         complete, stop calling tools and give a final summary of what you did and \
+         the result.",
         agent.system_prompt
     );
 

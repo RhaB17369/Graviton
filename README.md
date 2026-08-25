@@ -14,22 +14,24 @@ can't run a 30B+ model comfortably. It talks to [Ollama](https://ollama.com)
 
 "Multi-agent" here means real specialist personas that hand off actual
 work product to each other, not a handful of names for one prompt.
-14 agents across three categories (`grv agents` prints the live roster with
+22 agents across five categories (`grv agents` prints the live roster with
 taglines):
 
 | Category | Agents |
 |---|---|
 | Programming | ARCHITECT (design/refactoring), TESTER, DEBUGGER, PERFORMANCE |
-| Defensive security | SENTINEL (general audit), CRYPTOGRAPHER, SUPPLYCHAIN, CLOUDSEC, IDENTITY |
-| Offensive security | REAPER (general exploit dev), WEBHUNTER, BINEXP, ADVERSARY |
+| Infrastructure & engineering | NETARCH, DEVOPS, CLOUDARCH, DEPLOY, AUTOMATOR, DOCUMENTOR |
+| Defensive security | SENTINEL (general audit), CRYPTOGRAPHER, QUANTUMCRYPTO, SUPPLYCHAIN, CLOUDSEC, IDENTITY |
+| Offensive security | REAPER (general exploit dev), WEBHUNTER, BINEXP, ADVERSARY, OSINT |
 | Coordinator | SINGULARITY — no analysis of its own, synthesizes whichever agents ran |
 
-That's a deliberately curated set, not a padded-out 30-60 — each one covers
-a genuinely distinct failure mode or skill (crypto misuse is a different
-read than IDOR is different from a binary overflow), and the roster is
-data-driven (`crates/cli/src/agents.rs`) so adding a 15th is copy-paste-edit,
-not a redesign. Depth over headcount: a roster of near-duplicate personas
-would just make `grv crew` slower without finding anything more.
+That's a curated set, not padding — each one covers a genuinely distinct
+failure mode or skill (crypto misuse is a different read than IDOR is
+different from a binary overflow; network architecture is a different
+question than cloud-cost architecture), and the roster is data-driven
+(`crates/cli/src/agents.rs`) so adding one more is copy-paste-edit, not a
+redesign. Depth over headcount: a roster of near-duplicate personas would
+just make `grv crew`/`swarm`/`mission` slower without finding anything more.
 
 Ask one directly (`grv ask --agent webhunter "..."`), or run a crew — the
 default pipeline is ARCHITECT → REAPER → SENTINEL → SINGULARITY, or pick
@@ -52,14 +54,36 @@ grv swarm --agents sentinel,reaper,cryptographer "audit auth.rs"
 ```
 
 `swarm` (unlike `crew`) has no hand-off — it fires independent agents
-*concurrently*, each on its own tier's model, capped by a concurrency
-number `grv` actually computes from total system RAM and each configured
-model's on-disk size (`grv status` shows the same estimate), not a fixed
-guess. `--max-parallel` overrides it. This is the honest version of
-"multiple agents at once": real concurrent requests to real distinct
-models, bounded by what a 16GB laptop can hold resident, with CPU threads
-still shared across whatever's running (see ARCHITECTURE.md for the
-trade-off spelled out).
+*concurrently*, each on its own tier's model, gated by a concurrency
+number `grv` actually computes (RAM ÷ model size × Ollama's per-model
+parallel-request capacity, not a fixed guess) and keeps *re-computing
+live* for the whole run — `grv status` shows the same estimate, plus
+what else on your machine is currently eating that RAM. `--max-parallel`
+overrides it.
+
+For a task too big to hand a fixed agent list, **`grv mission`** lets a
+planner call decide the breakdown itself, recursively:
+
+```sh
+grv mission "harden this API service end to end" --max-depth 2
+```
+
+A planner call splits the task into subtasks assigned to whichever
+specialists fit, each subtask can decompose *again* up to `--max-depth`
+(a subtask the planner judges already atomic short-circuits straight to a
+leaf, so depth adapts to the task instead of always maxing out), and
+results synthesize back up the tree. One rule holds no matter how wide or
+deep it gets: every model call anywhere in the tree — leaves, every
+planner call, every synthesis step — shares one live-resampled concurrency
+gate, so a mission that fans out into 15 subtasks can't put more
+concurrent model calls on the machine than its RAM can actually take at
+that moment; the gate grows back into headroom as earlier subtasks finish.
+
+This is the honest version of "multiple agents at once, as many as the
+machine can take": real concurrent requests, bounded by what a 16GB laptop
+can hold resident and re-checked continuously rather than assumed once at
+startup — with CPU threads still shared across whatever's running (see
+ARCHITECTURE.md for the trade-off spelled out).
 
 ### `ask`/`crew` (read-only) vs. `run` (acts on your project)
 
@@ -75,10 +99,12 @@ grv run --agent reaper --yolo "fuzz the login endpoint for SQLi and write a PoC 
 
 Tools available to the agent: `read_file`, `list_dir`, `write_file`,
 `edit_file`, `delete_file`, `run_shell`, `recon_tool` (the same whitelisted
-nmap/ffuf/etc. as `grv tool`), and — with `--browser` — `browser_navigate`,
-`browser_eval`, `browser_screenshot`, `browser_console`, driving the
-system's headless Chromium via CDP so the agent can actually load a page,
-run JS in it, and see what broke, not just guess from source.
+nmap/ffuf/etc. as `grv tool`), `web_search`/`web_fetch` (DuckDuckGo-backed,
+no API key — so the agent checks a current API/CVE/best-practice instead of
+answering from a possibly-stale training snapshot), and — with `--browser`
+— `browser_navigate`, `browser_eval`, `browser_screenshot`, `browser_console`,
+driving the system's headless Chromium via CDP so the agent can actually
+load a page, run JS in it, and see what broke, not just guess from source.
 
 Every `write_file`/`edit_file`/`delete_file`/`run_shell`/`recon_tool` call
 is shown to you and confirmed before it happens — you see the exact diff or
@@ -138,8 +164,9 @@ grv ask --agent reaper --file exploit.c "write a working PoC for this overflow"
 grv investigate "is this deserialization path exploitable?"       # REAPER by default, structured output
 grv crew "is Vault.sol safe to deploy?"                            # full pipeline, all four agents
 grv swarm --agents sentinel,reaper,cryptographer "audit auth.rs"  # independent agents, concurrent
+grv mission "harden this API service end to end" --max-depth 2    # recursive planner + execution
 
-grv status                         # index stats + Ollama connectivity + swarm capacity estimate
+grv status                         # index stats + Ollama connectivity + live capacity/top-consumers
 grv config --model qwen3:8b --num-ctx 8192 --host http://127.0.0.1:11434
 grv config --model-fast qwen2.5:1.5b --model-deep qwen3:14b        # opt into real multi-model
 ```
@@ -181,7 +208,7 @@ sandbox — it runs exactly what you typed with your own permissions, same as
 typing it in the shell; the whitelist just keeps `tool run` scoped to recon
 tools rather than becoming a second shell.
 
-## Current scope (v0.2)
+## Current scope (v0.6)
 
 - **Languages with symbol extraction (17):** Rust, Python, JavaScript,
   TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity,
@@ -204,7 +231,7 @@ tools rather than becoming a second shell.
 
 ## Roadmap
 
-- Let agents request more context mid-run instead of one fixed retrieval pass (model issues its own `search`/`symbol` calls, or triggers `grv tool run` itself, before answering)
+- Let agents request more context mid-run instead of one fixed retrieval pass — partially done: `grv mission`'s leaves can already call `web_search`/`web_fetch`/`read_file`/`list_dir` mid-answer (see ARCHITECTURE.md); `ask`/`investigate`/`crew`/`swarm` still don't, and issuing their own `search`/`symbol` calls against the local index (not just the web) is still open
 - Call-graph edges (`grv callers`/`grv callees`) from tree-sitter reference queries
 - Incremental re-index on file save (watch mode)
 - Optional local embeddings for semantic (not just lexical) search
