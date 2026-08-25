@@ -5,14 +5,40 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Which model an agent should run on. `Standard` is always `Config::model`
+/// — the other two are optional overrides (`None` falls back to `model`),
+/// so a config file with none of this set behaves exactly as before: one
+/// model for everything. Set `model_fast`/`model_deep` to actually spread
+/// work across differently-sized models (see `Config::model_for_tier`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTier {
+    /// Cheap, bounded reasoning (pattern-matching, mechanical rewrites) —
+    /// a small model (1.5B-3B) is usually enough and frees RAM for others.
+    Fast,
+    /// Default: whatever `Config::model` is.
+    Standard,
+    /// Reasoning that benefits from the biggest model that still fits —
+    /// exploit dev, crypto correctness, architecture decisions.
+    Deep,
+}
+
 /// Runtime configuration, loaded from `~/.config/graviton/config.toml`
 /// (created with sane defaults on first run).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Base URL of the local Ollama daemon.
     pub ollama_host: String,
-    /// Model tag to use for chat/generation, e.g. "qwen3:8b".
+    /// Model tag to use for chat/generation, e.g. "qwen3:8b". Also the
+    /// `Standard` tier and the fallback for `Fast`/`Deep` when unset.
     pub model: String,
+    /// Optional smaller/faster model for `ModelTier::Fast` agents. Running
+    /// this alongside `model` means two models resident at once — only set
+    /// it if there's RAM to spare (see `Config::model_for_tier`).
+    #[serde(default)]
+    pub model_fast: Option<String>,
+    /// Optional larger/stronger model for `ModelTier::Deep` agents.
+    #[serde(default)]
+    pub model_deep: Option<String>,
     /// Context window requested from the model (must fit in RAM as KV cache).
     pub num_ctx: usize,
     /// Fraction of num_ctx reserved for injected code context (0.0-1.0).
@@ -27,6 +53,8 @@ impl Default for Config {
         Self {
             ollama_host: "http://127.0.0.1:11434".to_string(),
             model: "qwen3:8b".to_string(),
+            model_fast: None,
+            model_deep: None,
             num_ctx: 8192,
             context_budget_fraction: 0.55,
             index_dir: ".graviton".to_string(),
@@ -73,15 +101,51 @@ impl Config {
         let tokens = (self.num_ctx as f32 * self.context_budget_fraction) as usize;
         tokens * 4
     }
+
+    /// Resolve which model tag an agent in the given tier should call.
+    /// `Fast`/`Deep` fall back to `model` when no override is configured,
+    /// so an untouched config runs everything on one model exactly as v0.4
+    /// did — tiering is opt-in.
+    pub fn model_for_tier(&self, tier: ModelTier) -> &str {
+        match tier {
+            ModelTier::Fast => self.model_fast.as_deref().unwrap_or(&self.model),
+            ModelTier::Standard => &self.model,
+            ModelTier::Deep => self.model_deep.as_deref().unwrap_or(&self.model),
+        }
+    }
+
+    /// The distinct model tags this config would actually call across all
+    /// three tiers (deduplicated) — used to size concurrent-capacity
+    /// estimates without guessing at agent assignments.
+    pub fn distinct_models(&self) -> Vec<&str> {
+        let mut out = vec![self.model.as_str()];
+        for m in [self.model_fast.as_deref(), self.model_deep.as_deref()].into_iter().flatten() {
+            if !out.contains(&m) {
+                out.push(m);
+            }
+        }
+        out
+    }
 }
 
 // Minimal hand-rolled TOML (de)serialization so we don't pull in the `toml`
 // crate just for a handful of scalar fields.
 fn toml_to_string(cfg: &Config) -> Result<String> {
-    Ok(format!(
-        "ollama_host = \"{}\"\nmodel = \"{}\"\nnum_ctx = {}\ncontext_budget_fraction = {}\nindex_dir = \"{}\"\n",
-        cfg.ollama_host, cfg.model, cfg.num_ctx, cfg.context_budget_fraction, cfg.index_dir
-    ))
+    let mut out = format!(
+        "ollama_host = \"{}\"\nmodel = \"{}\"\n",
+        cfg.ollama_host, cfg.model
+    );
+    if let Some(m) = &cfg.model_fast {
+        out.push_str(&format!("model_fast = \"{m}\"\n"));
+    }
+    if let Some(m) = &cfg.model_deep {
+        out.push_str(&format!("model_deep = \"{m}\"\n"));
+    }
+    out.push_str(&format!(
+        "num_ctx = {}\ncontext_budget_fraction = {}\nindex_dir = \"{}\"\n",
+        cfg.num_ctx, cfg.context_budget_fraction, cfg.index_dir
+    ));
+    Ok(out)
 }
 
 fn toml_from_str(raw: &str) -> Result<Config> {
@@ -99,6 +163,8 @@ fn toml_from_str(raw: &str) -> Result<Config> {
         match key {
             "ollama_host" => cfg.ollama_host = value.to_string(),
             "model" => cfg.model = value.to_string(),
+            "model_fast" => cfg.model_fast = (!value.is_empty()).then(|| value.to_string()),
+            "model_deep" => cfg.model_deep = (!value.is_empty()).then(|| value.to_string()),
             "num_ctx" => cfg.num_ctx = value.parse().unwrap_or(cfg.num_ctx),
             "context_budget_fraction" => {
                 cfg.context_budget_fraction = value.parse().unwrap_or(cfg.context_budget_fraction)

@@ -402,7 +402,7 @@ pub async fn run(
     for step in 0..MAX_STEPS {
         let stdout = std::io::stdout();
         let result = client
-            .chat_stream(&cfg.model, &messages, cfg.num_ctx, &tools, |tok| {
+            .chat_stream(cfg.model_for_tier(agent.tier), &messages, cfg.num_ctx, &tools, |tok| {
                 let mut lock = stdout.lock();
                 let _ = lock.write_all(tok.as_bytes());
                 let _ = lock.flush();

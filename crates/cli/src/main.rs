@@ -3,6 +3,7 @@ mod agents;
 mod browser;
 mod checkpoint;
 mod context;
+mod resources;
 mod tools;
 
 use agents::AgentSpec;
@@ -74,6 +75,21 @@ enum Command {
     },
     /// List GRAVITON's agent roster
     Agents,
+    /// Run several independent agents concurrently (no hand-off between
+    /// them, unlike `crew`) — each on its own tier's model. Concurrency
+    /// defaults to what this machine's RAM can hold resident at once;
+    /// override with --max-parallel.
+    Swarm {
+        question: String,
+        #[arg(long = "file")]
+        files: Vec<PathBuf>,
+        /// Comma-separated agent list, e.g. "sentinel,reaper,cryptographer"
+        #[arg(long)]
+        agents: String,
+        /// Cap on concurrent agents (default: auto-detected from RAM)
+        #[arg(long)]
+        max_parallel: Option<usize>,
+    },
     /// Autonomous agentic loop: the agent reads/writes/edits files, runs
     /// shell commands, and (with --browser) drives a headless browser,
     /// until the task is done. Writes/edits/deletes/shell calls are
@@ -108,6 +124,12 @@ enum Command {
     Config {
         #[arg(long)]
         model: Option<String>,
+        /// Smaller/faster model for ModelTier::Fast agents (unset = use `model` for everything)
+        #[arg(long)]
+        model_fast: Option<String>,
+        /// Larger/stronger model for ModelTier::Deep agents (unset = use `model` for everything)
+        #[arg(long)]
+        model_deep: Option<String>,
         #[arg(long)]
         num_ctx: Option<usize>,
         #[arg(long)]
@@ -210,6 +232,9 @@ async fn main() -> Result<()> {
             println!("{}", agents::list_text());
             Ok(())
         }
+        Command::Swarm { question, files, agents, max_parallel } => {
+            cmd_swarm(&cfg, &question, files, &agents, max_parallel).await
+        }
         Command::Run { task, files, agent, yolo, browser } => {
             let spec = resolve_agent(&agent)?;
             cmd_run(&cfg, &task, files, spec, yolo, browser).await
@@ -217,7 +242,9 @@ async fn main() -> Result<()> {
         Command::Checkpoints => cmd_checkpoints(),
         Command::Rollback { session, to } => cmd_rollback(session, to),
         Command::Status => cmd_status(&cfg).await,
-        Command::Config { model, num_ctx, host } => cmd_config(model, num_ctx, host),
+        Command::Config { model, model_fast, model_deep, num_ctx, host } => {
+            cmd_config(model, model_fast, model_deep, num_ctx, host)
+        }
         Command::Tool { action } => cmd_tool(&cfg, action),
     }
 }
@@ -302,11 +329,11 @@ fn agent_system_prompt(agent: &AgentSpec, investigate: bool) -> String {
 /// never offers tools — `ask`/`investigate`/`crew` are read-only analysis
 /// over retrieved context. `grv run` (see `agentic.rs`) is the tool-using
 /// agentic loop.
-async fn run_agent(client: &OllamaClient, cfg: &Config, system: &str, user_msg: &str) -> Result<String> {
+async fn run_agent(client: &OllamaClient, cfg: &Config, model: &str, system: &str, user_msg: &str) -> Result<String> {
     let messages = vec![ChatMessage::system(system), ChatMessage::user(user_msg)];
     let stdout = std::io::stdout();
     let result = client
-        .chat_stream(&cfg.model, &messages, cfg.num_ctx, &[], |tok| {
+        .chat_stream(model, &messages, cfg.num_ctx, &[], |tok| {
             let mut lock = stdout.lock();
             let _ = lock.write_all(tok.as_bytes());
             let _ = lock.flush();
@@ -333,7 +360,7 @@ async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &Agen
 
     println!("\x1b[1;35m═══ {} ═══\x1b[0m", agent.display);
     let client = OllamaClient::new(&cfg.ollama_host);
-    run_agent(&client, cfg, &system, &user_msg).await.map(|_| ())
+    run_agent(&client, cfg, cfg.model_for_tier(agent.tier), &system, &user_msg).await.map(|_| ())
 }
 
 async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &str) -> Result<()> {
@@ -368,7 +395,7 @@ async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &
                  Findings from the rest of the crew so far:\n{prior}"
             )
         };
-        let output = run_agent(&client, cfg, spec.system_prompt, &user_msg).await?;
+        let output = run_agent(&client, cfg, cfg.model_for_tier(spec.tier), spec.system_prompt, &user_msg).await?;
         prior.push_str(&format!("\n--- {} ---\n{}\n", spec.display, output.trim()));
         // Cap accrued findings so a long crew doesn't blow past num_ctx by
         // the final stage — keep the most recent agents' output, since
@@ -382,6 +409,78 @@ async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &
             prior = format!("[...earlier agents truncated...]\n{}", &prior[cut..]);
         }
         println!();
+    }
+    Ok(())
+}
+
+/// Run several agents concurrently on the same question, no hand-off
+/// between them (unlike `crew`, where each stage reads the previous one's
+/// output). Each agent calls its own tier's model. Concurrency is capped
+/// by what `resources::safe_concurrency` estimates this machine's RAM can
+/// hold resident at once, unless the user overrides it — running more
+/// agents at once than RAM can hold just means Ollama thrashes, evicting
+/// and reloading models between requests, which is slower than sequential.
+async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &str, max_parallel: Option<usize>) -> Result<()> {
+    let root = repo_root()?;
+    let conn = open_repo_db(cfg, &root)?;
+    let context_text = build_context(cfg, &root, &conn, question, &files)?;
+    let context_block = if context_text.is_empty() {
+        "(No indexed context matched — either run `grv index` first, or this question doesn't map to specific code.)".to_string()
+    } else {
+        format!("Retrieved context:\n{context_text}")
+    };
+
+    let keys: Vec<&str> = roster.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if keys.is_empty() {
+        anyhow::bail!("empty agent roster — pass --agents a,b,c");
+    }
+    let mut specs = Vec::with_capacity(keys.len());
+    for k in &keys {
+        specs.push(resolve_agent(k)?);
+    }
+
+    let client = OllamaClient::new(&cfg.ollama_host);
+    let models: Vec<&str> = {
+        let mut m: Vec<&str> = specs.iter().map(|s| cfg.model_for_tier(s.tier)).collect();
+        m.dedup();
+        m
+    };
+    let cap = resources::detect();
+    let concurrency = match max_parallel {
+        Some(n) => n.max(1),
+        None => {
+            let (n, note) = resources::safe_concurrency(&client, &models, &cap).await;
+            println!("\x1b[2m{note}\x1b[0m\n");
+            n
+        }
+    };
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut tasks = tokio::task::JoinSet::new();
+    for spec in specs {
+        let sem = sem.clone();
+        let client = OllamaClient::new(&cfg.ollama_host);
+        let model = cfg.model_for_tier(spec.tier).to_string();
+        let num_ctx = cfg.num_ctx;
+        let system = spec.system_prompt.to_string();
+        let user_msg = format!("Question: {question}\n\n{context_block}");
+        let display = spec.display;
+        let tagline = spec.tagline;
+        tasks.spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            let started = std::time::Instant::now();
+            let result = client.chat_stream(&model, &[ChatMessage::system(system), ChatMessage::user(user_msg)], num_ctx, &[], |_| {}).await;
+            (display, tagline, model, started.elapsed(), result)
+        });
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        let (display, tagline, model, elapsed, result) = joined.context("swarm task panicked")?;
+        println!("\x1b[1;35m═══ {display} — {tagline} [{model}, {:.1}s] ═══\x1b[0m", elapsed.as_secs_f32());
+        match result {
+            Ok(r) => println!("{}\n", r.content.trim()),
+            Err(e) => println!("(failed: {e})\n"),
+        }
     }
     Ok(())
 }
@@ -425,7 +524,13 @@ fn cmd_rollback(session: Option<String>, to: Option<u64>) -> Result<()> {
 async fn cmd_status(cfg: &Config) -> Result<()> {
     println!("config: {}", Config::config_path()?.display());
     println!("  ollama_host = {}", cfg.ollama_host);
-    println!("  model       = {}", cfg.model);
+    println!("  model       = {} (standard tier)", cfg.model);
+    if let Some(m) = &cfg.model_fast {
+        println!("  model_fast  = {m} (fast tier)");
+    }
+    if let Some(m) = &cfg.model_deep {
+        println!("  model_deep  = {m} (deep tier)");
+    }
     println!("  num_ctx     = {}", cfg.num_ctx);
     println!(
         "  context budget ≈ {} chars (~{} tokens)",
@@ -454,6 +559,11 @@ async fn cmd_status(cfg: &Config) -> Result<()> {
         }
         Err(e) => println!("ollama: unreachable ({e})"),
     }
+
+    let cap = resources::detect();
+    let distinct = cfg.distinct_models();
+    let (_, note) = resources::safe_concurrency(&client, &distinct, &cap).await;
+    println!("swarm capacity: {note}");
     Ok(())
 }
 
@@ -512,11 +622,25 @@ fn cmd_tool(cfg: &Config, action: ToolCommand) -> Result<()> {
     Ok(())
 }
 
-fn cmd_config(model: Option<String>, num_ctx: Option<usize>, host: Option<String>) -> Result<()> {
+fn cmd_config(
+    model: Option<String>,
+    model_fast: Option<String>,
+    model_deep: Option<String>,
+    num_ctx: Option<usize>,
+    host: Option<String>,
+) -> Result<()> {
     let mut cfg = Config::load_or_init()?;
     let mut changed = false;
     if let Some(m) = model {
         cfg.model = m;
+        changed = true;
+    }
+    if let Some(m) = model_fast {
+        cfg.model_fast = (!m.is_empty()).then_some(m);
+        changed = true;
+    }
+    if let Some(m) = model_deep {
+        cfg.model_deep = (!m.is_empty()).then_some(m);
         changed = true;
     }
     if let Some(n) = num_ctx {

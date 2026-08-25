@@ -112,6 +112,8 @@ struct ChatChunkMessage {
 #[derive(Debug, Deserialize)]
 pub struct ModelInfo {
     pub name: String,
+    #[serde(default)]
+    pub size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +156,19 @@ impl OllamaClient {
         }
         let parsed: TagsResponse = resp.json().await.context("parsing /api/tags response")?;
         Ok(parsed.models.into_iter().map(|m| m.name).collect())
+    }
+
+    /// On-disk size (MB) of every locally pulled model, keyed by tag — used
+    /// to estimate how many models could realistically be resident at once
+    /// on this machine's RAM (see `resources::safe_concurrency`).
+    pub async fn model_sizes_mb(&self) -> Result<std::collections::HashMap<String, u64>> {
+        let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
+        let resp = self.http.get(&url).send().await.with_context(|| format!("connecting to Ollama at {url}"))?;
+        if !resp.status().is_success() {
+            bail!("Ollama returned HTTP {}", resp.status());
+        }
+        let parsed: TagsResponse = resp.json().await.context("parsing /api/tags response")?;
+        Ok(parsed.models.into_iter().map(|m| (m.name, m.size / 1024 / 1024)).collect())
     }
 
     /// Stream a chat completion, invoking `on_token` for every incremental

@@ -38,10 +38,28 @@ Every stage reads the *actual output* of the ones before it, not just the
 same raw context re-served — that hand-off is what makes it a pipeline
 instead of running the same question N times.
 
-They all run on the one local model configured in `grv config` (there's no
-second GPU to run four models on) — the specialization comes from four
-different system prompts and a real sequential hand-off, not four separate
-brains.
+By default they all run on the one local model configured in `grv config`
+— the specialization comes from distinct system prompts and (in `crew`) a
+real sequential hand-off, not separate brains. But each agent also carries
+a `ModelTier` (`grv agents` shows it in brackets: `fast`/`standard`/`deep`),
+and if you configure `model_fast`/`model_deep` overrides, GRAVITON actually
+runs more than one model — sized to what your RAM can hold, not just
+assumed:
+
+```sh
+grv config --model qwen3:8b --model-fast qwen2.5:1.5b --model-deep qwen3:14b
+grv swarm --agents sentinel,reaper,cryptographer "audit auth.rs"
+```
+
+`swarm` (unlike `crew`) has no hand-off — it fires independent agents
+*concurrently*, each on its own tier's model, capped by a concurrency
+number `grv` actually computes from total system RAM and each configured
+model's on-disk size (`grv status` shows the same estimate), not a fixed
+guess. `--max-parallel` overrides it. This is the honest version of
+"multiple agents at once": real concurrent requests to real distinct
+models, bounded by what a 16GB laptop can hold resident, with CPU threads
+still shared across whatever's running (see ARCHITECTURE.md for the
+trade-off spelled out).
 
 ### `ask`/`crew` (read-only) vs. `run` (acts on your project)
 
@@ -119,9 +137,11 @@ grv ask --agent sentinel "audit auth.rb for auth bypass"
 grv ask --agent reaper --file exploit.c "write a working PoC for this overflow"
 grv investigate "is this deserialization path exploitable?"       # REAPER by default, structured output
 grv crew "is Vault.sol safe to deploy?"                            # full pipeline, all four agents
+grv swarm --agents sentinel,reaper,cryptographer "audit auth.rs"  # independent agents, concurrent
 
-grv status                         # index stats + Ollama connectivity
+grv status                         # index stats + Ollama connectivity + swarm capacity estimate
 grv config --model qwen3:8b --num-ctx 8192 --host http://127.0.0.1:11434
+grv config --model-fast qwen2.5:1.5b --model-deep qwen3:14b        # opt into real multi-model
 ```
 
 `ask`/`investigate` take `--agent <architect|sentinel|reaper|singularity>`

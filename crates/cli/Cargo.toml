@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 futures-util = { workspace = true }
 chromiumoxide = { version = "0.9" }
 similar = "3"
+sysinfo = { workspace = true }
 
 graviton-core = { path = "../core" }
 graviton-indexer = { path = "../indexer" }

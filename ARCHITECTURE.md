@@ -224,13 +224,16 @@ the other three's actual output).
 
 Two important scoping decisions:
 
-- **One model, several personas — not several models.** This hardware has
-  one 4GB-VRAM GPU and 16GB RAM; there's no budget to keep multiple distinct
-  models resident, so "multi-agent" here is implemented as one shared
-  `OllamaClient`/model with different system prompts and (for `crew`)
-  different turns in a sequence, not a mixture-of-models setup. If the
-  hardware picture changes, `AgentSpec` already has the shape to add a
-  per-agent model override — it just isn't wired to anything yet.
+- **Personas by default, real multi-model when configured.** Out of the box
+  every agent still calls the one model in `grv config`, because that's
+  what fits this hardware without any setup. But `AgentSpec` carries a
+  `ModelTier` (`Fast`/`Standard`/`Deep`) and `Config::model_for_tier`
+  resolves it against optional `model_fast`/`model_deep` overrides — set
+  those and, e.g., TESTER/SUPPLYCHAIN/CLOUDSEC/SINGULARITY (mechanical,
+  pattern-matching work) actually run on a small 1.5B-3B model while
+  ARCHITECT/CRYPTOGRAPHER/REAPER/BINEXP (design and exploit-dev reasoning)
+  stay on the 8B one. See "Model tiers and `grv swarm`" below for the
+  concurrency story once more than one model is configured.
 - **What makes `crew` a pipeline instead of asking the same question four
   times**: each stage's prompt includes the *actual text* of every prior
   stage's output (`prior` in `cmd_crew`, capped to `context_char_budget()`
@@ -257,6 +260,49 @@ specialty. That's a deliberate v1 simplification (documented in the README
 roadmap), not an oversight: giving each agent its own retrieval query is
 straightforward to add once it's clear the shared-context version is
 actually leaving relevant code unfound in practice.
+
+## Model tiers and `grv swarm`: real multi-model, resource-aware
+
+The 4-agent (later 14-agent) design above runs everything through one
+model — accurate for the default config, but the tiering added in v0.3
+of this document makes GRAVITON capable of genuinely running more than
+one model, sized to what the machine can actually hold:
+
+- `Config.model` is the `Standard` tier and always the fallback.
+  `model_fast`/`model_deep` are optional overrides (`grv config
+  --model-fast qwen2.5:1.5b --model-deep qwen3:14b`); leave them unset and
+  nothing changes from v0.2's one-model behavior. Each `AgentSpec` declares
+  which tier it wants — see the table `grv agents` prints.
+- **`grv crew`** stays sequential by design (§ above) — its whole point is
+  real hand-off, so parallelizing it would just make each stage read a
+  half-finished prior stage. Multi-model there means *different-sized*
+  models per stage, not concurrent ones.
+- **`grv swarm --agents a,b,c "question"`** is the actually-concurrent
+  mode: independent agents (no hand-off — this is for questions that don't
+  need one, e.g. running SENTINEL/REAPER/CRYPTOGRAPHER over the same
+  question at once) fired via `tokio::task::JoinSet`, each against its own
+  tier's model, gated by a `tokio::sync::Semaphore` sized by
+  `resources::safe_concurrency`.
+- **The concurrency number is computed, not assumed.** `crates/cli/src/
+  resources.rs` reads total system RAM (`sysinfo`) and each configured
+  model's on-disk size (`OllamaClient::model_sizes_mb`, via `/api/tags`),
+  reserves a 30% safety margin for the OS/KV-cache growth, and packs as
+  many of the *distinct* configured models as fit — e.g. 16GB RAM with a
+  1.5GB fast model and a 5GB standard model comfortably fits both (2-way
+  concurrency); three 8B models would not, so `swarm` would cap at 1-2
+  instead of pretending otherwise. `--max-parallel` overrides the estimate
+  for a user who knows their actual headroom better than a heuristic does.
+- **What this doesn't pretend to solve**: CPU threads (6C/12T on the
+  reference hardware) are shared across whatever runs concurrently — three
+  agents generating at once each get roughly a third of the cores, so each
+  individual stream is slower than it would be alone. The win is wall-clock
+  for the *batch*: three independent questions that would otherwise run one
+  after another finish closer to together. `grv swarm` prints the capacity
+  note up front so this trade-off isn't hidden.
+- Ollama itself owns actual model residency (loading on first request,
+  evicting LRU under memory pressure) — GRAVITON's estimate exists only to
+  pick a sane concurrency *before* asking Ollama to do anything, not to
+  duplicate Ollama's own memory management.
 
 ## The agentic loop (`grv run`, `crates/cli/src/agentic.rs`)
 
@@ -318,6 +364,21 @@ args. Two independent mechanisms, chosen deliberately not to overlap:
   the pre-change bytes (or the fact that the file didn't exist yet) are
   saved to `.graviton/checkpoints/<session>/<seq>.bak` plus a
   `manifest.jsonl` line. `grv rollback` replays that manifest backwards.
+
+  **Why raw file snapshots instead of git commits/stashes for this**: `grv
+  run` operates inside *the user's* repo, which already has its own git
+  state — staged changes, a mid-rebase, a detached HEAD, or simply no `.git`
+  at all (plenty of quick scratch directories aren't repos, and `grv run`
+  works in them fine). Driving git for internal bookkeeping would mean
+  either polluting the user's actual history/reflog with tool-generated
+  commits, or juggling stashes that can collide with whatever they already
+  have stashed — and it would require a repo to exist in the first place.
+  A plain byte-snapshot-per-tool-call sidesteps all of that: it works
+  identically in a git repo or a bare directory, gives per-*step* rollback
+  granularity (`--to N`) without needing an interactive-rebase-style commit
+  edit, and never touches `.git` at all — no risk of a tool-driven commit,
+  stash, or signing step interacting badly with however the user already
+  has git configured.
 
 Deliberately *not* checkpointed: `run_shell`. A shell command's side
 effects are unbounded (it can touch anything on the filesystem, start a

@@ -8,18 +8,25 @@
 //! one reading the previous agents' actual output, with a coordinator that
 //! synthesizes all of it at the end.
 
+use graviton_core::ModelTier;
+
 pub struct AgentSpec {
     /// CLI key: `grv ask --agent <key>`.
     pub key: &'static str,
     pub display: &'static str,
     pub tagline: &'static str,
     pub system_prompt: &'static str,
+    /// Which model tier this agent should run on if `grv config` has
+    /// `model_fast`/`model_deep` set — see `graviton_core::ModelTier`.
+    /// Falls back to the single configured model when it doesn't.
+    pub tier: ModelTier,
 }
 
 pub const ARCHITECT: AgentSpec = AgentSpec {
     key: "architect",
     display: "ARCHITECT",
     tagline: "high-level programming: design, refactoring, correctness, performance",
+    tier: ModelTier::Deep,
     system_prompt: "\
 You are ARCHITECT, GRAVITON's high-level programming specialist, running \
 locally on the user's own machine. You are given a question plus retrieved \
@@ -37,6 +44,7 @@ pub const SENTINEL: AgentSpec = AgentSpec {
     key: "sentinel",
     display: "SENTINEL",
     tagline: "defensive security: vulnerability auditing, hardening, blue-team",
+    tier: ModelTier::Standard,
     system_prompt: "\
 You are SENTINEL, GRAVITON's defensive-security specialist, running locally \
 for a security professional auditing code they own or are authorized to \
@@ -57,6 +65,7 @@ pub const REAPER: AgentSpec = AgentSpec {
     key: "reaper",
     display: "REAPER",
     tagline: "offensive security: exploit dev, payloads, red-team/CTF",
+    tier: ModelTier::Deep,
     system_prompt: "\
 You are REAPER, GRAVITON's offensive-security specialist, running locally \
 for a security professional working on authorized CTF competitions, \
@@ -78,6 +87,7 @@ pub const SINGULARITY: AgentSpec = AgentSpec {
     key: "singularity",
     display: "SINGULARITY",
     tagline: "coordinator: synthesizes the other agents into one decision",
+    tier: ModelTier::Fast,
     system_prompt: "\
 You are SINGULARITY, GRAVITON's coordinator. You do not do first-hand \
 analysis — you are given a question and the actual output of some \
@@ -100,6 +110,7 @@ pub const TESTER: AgentSpec = AgentSpec {
     key: "tester",
     display: "TESTER",
     tagline: "test engineering: unit/integration tests, coverage gaps, edge cases",
+    tier: ModelTier::Fast,
     system_prompt: "\
 You are TESTER, GRAVITON's test-engineering specialist. You are given a \
 task plus retrieved symbols/chunks from the indexed codebase. Find what's \
@@ -115,6 +126,7 @@ pub const DEBUGGER: AgentSpec = AgentSpec {
     key: "debugger",
     display: "DEBUGGER",
     tagline: "root-causing bugs from stack traces, logs, and failing behavior",
+    tier: ModelTier::Standard,
     system_prompt: "\
 You are DEBUGGER, GRAVITON's root-cause specialist. You are given a bug \
 report, stack trace, or failing-behavior description plus retrieved \
@@ -130,6 +142,7 @@ pub const PERFORMANCE: AgentSpec = AgentSpec {
     key: "performance",
     display: "PERFORMANCE",
     tagline: "profiling and optimization: algorithmic complexity, hot paths, resource use",
+    tier: ModelTier::Standard,
     system_prompt: "\
 You are PERFORMANCE, GRAVITON's optimization specialist. You are given a \
 task plus retrieved symbols/chunks from the indexed codebase. Look for \
@@ -147,6 +160,7 @@ pub const CRYPTOGRAPHER: AgentSpec = AgentSpec {
     key: "cryptographer",
     display: "CRYPTOGRAPHER",
     tagline: "crypto misuse: weak algorithms, key/IV handling, protocol design",
+    tier: ModelTier::Deep,
     system_prompt: "\
 You are CRYPTOGRAPHER, GRAVITON's applied-cryptography auditor, for a \
 security professional auditing code they own or are authorized to test \
@@ -165,6 +179,7 @@ pub const SUPPLYCHAIN: AgentSpec = AgentSpec {
     key: "supplychain",
     display: "SUPPLYCHAIN",
     tagline: "dependency/build risk: vulnerable or malicious packages, CI/build trust",
+    tier: ModelTier::Fast,
     system_prompt: "\
 You are SUPPLYCHAIN, GRAVITON's dependency and build-pipeline auditor, for \
 a security professional auditing code they own or are authorized to test \
@@ -181,6 +196,7 @@ pub const CLOUDSEC: AgentSpec = AgentSpec {
     key: "cloudsec",
     display: "CLOUDSEC",
     tagline: "cloud/container/IaC misconfiguration: Dockerfiles, Compose, Terraform, k8s",
+    tier: ModelTier::Fast,
     system_prompt: "\
 You are CLOUDSEC, GRAVITON's cloud and infrastructure-as-code auditor, for \
 a security professional auditing infrastructure they own or are authorized \
@@ -197,6 +213,7 @@ pub const IDENTITY: AgentSpec = AgentSpec {
     key: "identity",
     display: "IDENTITY",
     tagline: "auth/authz/session deep-dive: bypass, privilege escalation, token handling",
+    tier: ModelTier::Standard,
     system_prompt: "\
 You are IDENTITY, GRAVITON's authentication/authorization specialist, for a \
 security professional auditing code they own or are authorized to test \
@@ -216,6 +233,7 @@ pub const WEBHUNTER: AgentSpec = AgentSpec {
     key: "webhunter",
     display: "WEBHUNTER",
     tagline: "web app exploitation: XSS/CSRF/SSRF/IDOR — can drive the browser to prove it",
+    tier: ModelTier::Standard,
     system_prompt: "\
 You are WEBHUNTER, GRAVITON's web-application offensive specialist, for a \
 security professional working on authorized CTF/lab/certification work \
@@ -232,6 +250,7 @@ pub const BINEXP: AgentSpec = AgentSpec {
     key: "binexp",
     display: "BINEXP",
     tagline: "binary exploitation & reverse engineering: overflows, ROP, format strings",
+    tier: ModelTier::Deep,
     system_prompt: "\
 You are BINEXP, GRAVITON's binary-exploitation specialist, for a security \
 professional working on authorized CTF/lab/certification work \
@@ -248,6 +267,7 @@ pub const ADVERSARY: AgentSpec = AgentSpec {
     key: "adversary",
     display: "ADVERSARY",
     tagline: "network/AD pentest: lateral movement, credential attacks, privilege escalation",
+    tier: ModelTier::Standard,
     system_prompt: "\
 You are ADVERSARY, GRAVITON's network and Active Directory pentest \
 specialist, for a security professional working on authorized CTF/lab/\
@@ -282,26 +302,38 @@ pub const INVESTIGATE_FORMAT: &str = "\n\nFor this request specifically, structu
 (symbol name, file, or search term) needed to keep going if context was \
 insufficient.";
 
+fn tier_label(t: ModelTier) -> &'static str {
+    match t {
+        ModelTier::Fast => "fast",
+        ModelTier::Standard => "standard",
+        ModelTier::Deep => "deep",
+    }
+}
+
 pub fn list_text() -> String {
     let mut out = String::from("GRAVITON agent roster:\n\nprogramming:\n");
     for a in [&ARCHITECT, &TESTER, &DEBUGGER, &PERFORMANCE] {
-        out.push_str(&format!("  {:<14} {}\n", a.key, a.tagline));
+        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, tier_label(a.tier), a.tagline));
     }
     out.push_str("\ndefensive security:\n");
     for a in [&SENTINEL, &CRYPTOGRAPHER, &SUPPLYCHAIN, &CLOUDSEC, &IDENTITY] {
-        out.push_str(&format!("  {:<14} {}\n", a.key, a.tagline));
+        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, tier_label(a.tier), a.tagline));
     }
     out.push_str("\noffensive security:\n");
     for a in [&REAPER, &WEBHUNTER, &BINEXP, &ADVERSARY] {
-        out.push_str(&format!("  {:<14} {}\n", a.key, a.tagline));
+        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, tier_label(a.tier), a.tagline));
     }
     out.push_str("\ncoordinator:\n");
-    out.push_str(&format!("  {:<14} {}\n", SINGULARITY.key, SINGULARITY.tagline));
+    out.push_str(&format!("  {:<14} [{:<8}] {}\n", SINGULARITY.key, tier_label(SINGULARITY.tier), SINGULARITY.tagline));
     out.push_str(
-        "\nUse one directly:   grv ask --agent <key> \"...\"\n\
+        "\n[tier] is which model this agent calls if `grv config` has model_fast/\n\
+         model_deep set (grv config --model-fast <tag> --model-deep <tag>) — unset,\n\
+         everything runs on the one configured model, same as before.\n\n\
+         Use one directly:   grv ask --agent <key> \"...\"\n\
          Act autonomously:   grv run --agent <key> \"...\"   (tools: files, shell, --browser)\n\
          Run the crew:       grv crew \"...\"   (default pipeline: architect -> reaper -> sentinel -> singularity)\n\
-         Custom crew:        grv crew --agents webhunter,identity,singularity \"...\"",
+         Custom crew:        grv crew --agents webhunter,identity,singularity \"...\"\n\
+         Run several at once: grv swarm --agents sentinel,reaper,cryptographer \"...\"   (independent, concurrent, capacity-aware)",
     );
     out
 }
