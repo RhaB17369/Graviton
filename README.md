@@ -6,11 +6,34 @@
 > does the deterministic work (parsing, indexing, retrieval) so the model
 > only has to reason.
 
-`grv` is a local, offline CLI copilot for huge codebases and offensive
-security work (CTF, HTB/THM, OSCP/OSCE/CPTS-style labs, auditing code you
-own or are authorized to test), built for machines that can't run a 30B+
-model comfortably. It talks to [Ollama](https://ollama.com) — no cloud, your
-code never leaves the machine.
+`grv` is a local, offline multi-agent framework specialized in high-level
+programming, defensive security, and offensive security — for huge
+codebases and CTF/HTB/THM/OSCP-style lab work, built for machines that
+can't run a 30B+ model comfortably. It talks to [Ollama](https://ollama.com)
+— no cloud, your code never leaves the machine.
+
+"Multi-agent" here means real specialist personas that hand off actual
+work product to each other, not four names for one prompt:
+
+| Agent | Specialty |
+|---|---|
+| **ARCHITECT** | high-level programming: design, refactoring, correctness, performance |
+| **SENTINEL** | defensive security: vulnerability auditing, hardening, blue-team |
+| **REAPER** | offensive security: exploit dev, payloads, red-team/CTF |
+| **SINGULARITY** | coordinator: synthesizes the other three into one decision brief |
+
+Ask one directly (`grv ask --agent sentinel "..."`), or run the whole crew
+(`grv crew "..."`) — ARCHITECT explains the code, REAPER finds what's
+exploitable in it, SENTINEL proposes fixes, SINGULARITY reads all three
+outputs and converges them into a prioritized action plan. Every stage
+reads the *actual output* of the ones before it, not just the same raw
+context re-served — that hand-off is what makes it a pipeline instead of
+running the same question three times.
+
+They all run on the one local model configured in `grv config` (there's no
+second GPU to run four models on) — the specialization comes from four
+different system prompts and a real sequential hand-off, not four separate
+brains.
 
 Instead of stuffing an entire repository into a context window (impossible
 past a few hundred KLOC anyway), GRAVITON indexes the repo once with
@@ -46,17 +69,26 @@ cd /path/to/some/huge/repo
 grv index                          # build/update the local index (incremental)
 grv search "jwt verify"            # full-text search over indexed chunks
 grv symbol validate_token          # jump straight to a symbol's source
-grv ask "trace user input into os.system in vuln.py"
-grv investigate "is this deserialization path exploitable?"
-grv ask --file exploit.c "write a working PoC for this overflow"
+
+grv agents                         # show the roster
+grv ask "trace user input into os.system in vuln.py"              # ARCHITECT by default
+grv ask --agent sentinel "audit auth.rb for auth bypass"
+grv ask --agent reaper --file exploit.c "write a working PoC for this overflow"
+grv investigate "is this deserialization path exploitable?"       # REAPER by default, structured output
+grv crew "is Vault.sol safe to deploy?"                            # full pipeline, all four agents
 
 grv status                         # index stats + Ollama connectivity
 grv config --model qwen3:8b --num-ctx 8192 --host http://127.0.0.1:11434
 ```
 
-`ask` streams the model's answer token by token. `investigate` uses a
-structured system prompt (symbols found → data flow → analysis → concrete
-next step/PoC) instead of a free-form answer.
+`ask`/`investigate` take `--agent <architect|sentinel|reaper|singularity>`
+(defaults: architect / reaper respectively) and stream the answer token by
+token. `investigate` additionally structures the output as a fixed format
+(symbols found → data flow → analysis → concrete next step/PoC) regardless
+of which agent runs it. `crew` runs several agents in sequence — pass
+`--agents architect,reaper` to run a subset/reorder — printing each stage
+as it streams; expect a full four-stage crew run to take several minutes on
+an 8B CPU-bound model, since it's four full generations, not one.
 
 ### Recon/security tools
 
@@ -109,8 +141,9 @@ tools rather than becoming a second shell.
 
 ## Roadmap
 
-- Agentic tool loop for `investigate` (model can request more symbols/chunks mid-run, and trigger `grv tool run` itself)
+- Let agents request more context mid-run instead of one fixed retrieval pass (model issues its own `search`/`symbol` calls, or triggers `grv tool run` itself, before answering)
 - Call-graph edges (`grv callers`/`grv callees`) from tree-sitter reference queries
 - Incremental re-index on file save (watch mode)
 - Optional local embeddings for semantic (not just lexical) search
 - Kotlin symbol extraction once a crates.io grammar release supports current tree-sitter
+- Per-agent retrieval (each crew stage currently reasons over the same shared context; REAPER asking a differently-shaped question than ARCHITECT could pull in more relevant chunks for each)

@@ -1,6 +1,8 @@
+mod agents;
 mod context;
-mod prompts;
 mod tools;
+
+use agents::AgentSpec;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -10,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "grv", version, about = "GRAVITON — local code-intelligence & offensive-security copilot, powered by Ollama")]
+#[command(name = "grv", version, about = "GRAVITON — local multi-agent framework for high-level programming, defensive & offensive security, powered by Ollama")]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
@@ -38,19 +40,37 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         limit: usize,
     },
-    /// Ask the model a question, with retrieved code as context
+    /// Ask one agent a question, with retrieved code as context
     Ask {
         question: String,
         /// Explicit files to include in full (in addition to retrieval)
         #[arg(long = "file")]
         files: Vec<PathBuf>,
+        /// Which agent answers: architect (default), sentinel, reaper, singularity
+        #[arg(long, default_value = "architect")]
+        agent: String,
     },
     /// Like `ask`, but with a structured multi-step analysis prompt
     Investigate {
         question: String,
         #[arg(long = "file")]
         files: Vec<PathBuf>,
+        /// Which agent investigates: reaper (default), architect, sentinel, singularity
+        #[arg(long, default_value = "reaper")]
+        agent: String,
     },
+    /// Run the full crew on one question: architect -> reaper -> sentinel -> singularity,
+    /// each stage reading the previous agents' actual output.
+    Crew {
+        question: String,
+        #[arg(long = "file")]
+        files: Vec<PathBuf>,
+        /// Comma-separated pipeline override, e.g. "architect,reaper"
+        #[arg(long, default_value = "architect,reaper,sentinel,singularity")]
+        agents: String,
+    },
+    /// List GRAVITON's agent roster
+    Agents,
     /// Show index stats and Ollama connectivity
     Status,
     /// Show or update the config file (~/.config/graviton/config.toml)
@@ -100,6 +120,15 @@ fn chrono_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn resolve_agent(key: &str) -> Result<&'static AgentSpec> {
+    agents::find(key).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown agent '{key}' — run `grv agents` to see the roster ({})",
+            agents::ALL_AGENTS.iter().map(|a| a.key).collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
 fn repo_root() -> Result<PathBuf> {
     std::env::current_dir().context("resolving current directory")
 }
@@ -137,8 +166,19 @@ async fn main() -> Result<()> {
         Command::Index { path, force } => cmd_index(&cfg, path, force),
         Command::Search { query, limit } => cmd_search(&cfg, &query, limit),
         Command::Symbol { name, limit } => cmd_symbol(&cfg, &name, limit),
-        Command::Ask { question, files } => cmd_ask(&cfg, &question, files, false).await,
-        Command::Investigate { question, files } => cmd_ask(&cfg, &question, files, true).await,
+        Command::Ask { question, files, agent } => {
+            let spec = resolve_agent(&agent)?;
+            cmd_ask(&cfg, &question, files, spec, false).await
+        }
+        Command::Investigate { question, files, agent } => {
+            let spec = resolve_agent(&agent)?;
+            cmd_ask(&cfg, &question, files, spec, true).await
+        }
+        Command::Crew { question, files, agents } => cmd_crew(&cfg, &question, files, &agents).await,
+        Command::Agents => {
+            println!("{}", agents::list_text());
+            Ok(())
+        }
         Command::Status => cmd_status(&cfg).await,
         Command::Config { model, num_ctx, host } => cmd_config(model, num_ctx, host),
         Command::Tool { action } => cmd_tool(&cfg, action),
@@ -199,33 +239,31 @@ fn cmd_symbol(cfg: &Config, name: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, investigate: bool) -> Result<()> {
-    let root = repo_root()?;
-    let conn = open_repo_db(cfg, &root)?;
-
+/// Retrieve context for `question` (explicit files + symbol hits + FTS
+/// chunks, budgeted to `cfg`'s context window) — shared by `ask`/
+/// `investigate`/`crew` so every agent reasons over the same evidence.
+fn build_context(cfg: &Config, root: &std::path::Path, conn: &rusqlite::Connection, question: &str, files: &[PathBuf]) -> Result<String> {
     let explicit: Vec<context::ContextBlock> = files
         .iter()
-        .filter_map(|f| context::read_whole_file(&root, f))
+        .filter_map(|f| context::read_whole_file(root, f))
         .collect();
-    let symbol_hits = context::search_symbols(&conn, &root, question, 8)?;
-    let chunk_hits = context::search_chunks(&conn, question, 12)?;
-
+    let symbol_hits = context::search_symbols(conn, root, question, 8)?;
+    let chunk_hits = context::search_chunks(conn, question, 12)?;
     let budget = cfg.context_char_budget();
-    let context_text = context::assemble(budget, vec![explicit, symbol_hits, chunk_hits]);
+    Ok(context::assemble(budget, vec![explicit, symbol_hits, chunk_hits]))
+}
 
-    let system = if investigate { prompts::SYSTEM_INVESTIGATE } else { prompts::SYSTEM_ASK };
-    let user_msg = if context_text.is_empty() {
-        format!(
-            "{question}\n\n(No indexed context matched — either run `grv index` first, \
-             or this question doesn't map to specific code.)"
-        )
+fn agent_system_prompt(agent: &AgentSpec, investigate: bool) -> String {
+    if investigate {
+        format!("{}{}", agent.system_prompt, agents::INVESTIGATE_FORMAT)
     } else {
-        format!("Question: {question}\n\nRetrieved context:\n{context_text}")
-    };
+        agent.system_prompt.to_string()
+    }
+}
 
-    let client = OllamaClient::new(&cfg.ollama_host);
+/// Stream one agent's reply to stdout, returning the full text.
+async fn run_agent(client: &OllamaClient, cfg: &Config, system: &str, user_msg: &str) -> Result<String> {
     let messages = vec![ChatMessage::system(system), ChatMessage::user(user_msg)];
-
     let stdout = std::io::stdout();
     let result = client
         .chat_stream(&cfg.model, &messages, cfg.num_ctx, |tok| {
@@ -235,7 +273,77 @@ async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, investigate:
         })
         .await;
     println!();
-    result.map(|_| ())
+    result
+}
+
+async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &AgentSpec, investigate: bool) -> Result<()> {
+    let root = repo_root()?;
+    let conn = open_repo_db(cfg, &root)?;
+    let context_text = build_context(cfg, &root, &conn, question, &files)?;
+
+    let system = agent_system_prompt(agent, investigate);
+    let user_msg = if context_text.is_empty() {
+        format!(
+            "{question}\n\n(No indexed context matched — either run `grv index` first, \
+             or this question doesn't map to specific code.)"
+        )
+    } else {
+        format!("Question: {question}\n\nRetrieved context:\n{context_text}")
+    };
+
+    println!("\x1b[1;35m═══ {} ═══\x1b[0m", agent.display);
+    let client = OllamaClient::new(&cfg.ollama_host);
+    run_agent(&client, cfg, &system, &user_msg).await.map(|_| ())
+}
+
+async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &str) -> Result<()> {
+    let root = repo_root()?;
+    let conn = open_repo_db(cfg, &root)?;
+    let context_text = build_context(cfg, &root, &conn, question, &files)?;
+    let context_block = if context_text.is_empty() {
+        "(No indexed context matched — either run `grv index` first, or this question doesn't map to specific code.)".to_string()
+    } else {
+        format!("Retrieved context:\n{context_text}")
+    };
+
+    let keys: Vec<&str> = pipeline.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if keys.is_empty() {
+        anyhow::bail!("empty agent pipeline");
+    }
+    let mut specs = Vec::with_capacity(keys.len());
+    for k in &keys {
+        specs.push(resolve_agent(k)?);
+    }
+
+    let client = OllamaClient::new(&cfg.ollama_host);
+    let mut prior = String::new(); // other agents' findings so far, fed to each subsequent stage
+
+    for spec in specs {
+        println!("\x1b[1;35m═══ {} — {} ═══\x1b[0m", spec.display, spec.tagline);
+        let user_msg = if prior.is_empty() {
+            format!("Question: {question}\n\n{context_block}")
+        } else {
+            format!(
+                "Question: {question}\n\n{context_block}\n\n\
+                 Findings from the rest of the crew so far:\n{prior}"
+            )
+        };
+        let output = run_agent(&client, cfg, spec.system_prompt, &user_msg).await?;
+        prior.push_str(&format!("\n--- {} ---\n{}\n", spec.display, output.trim()));
+        // Cap accrued findings so a long crew doesn't blow past num_ctx by
+        // the final stage — keep the most recent agents' output, since
+        // that's what the next stage (and the coordinator) most needs.
+        let cap = cfg.context_char_budget();
+        if prior.len() > cap {
+            let mut cut = prior.len() - cap;
+            while !prior.is_char_boundary(cut) {
+                cut += 1;
+            }
+            prior = format!("[...earlier agents truncated...]\n{}", &prior[cut..]);
+        }
+        println!();
+    }
+    Ok(())
 }
 
 async fn cmd_status(cfg: &Config) -> Result<()> {

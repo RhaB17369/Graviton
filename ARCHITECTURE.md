@@ -214,6 +214,50 @@ into a second, worse shell — it is not a defense against a malicious
 argument to a whitelisted tool, which was never the threat model here (you
 already have a shell).
 
+## Multi-agent design (`grv ask --agent`, `grv crew`)
+
+`crates/cli/src/agents.rs` defines four `AgentSpec`s (key, display name,
+tagline, system prompt): ARCHITECT (high-level programming), SENTINEL
+(defensive security), REAPER (offensive security), and SINGULARITY (a
+coordinator with no first-hand analysis of its own — it only synthesizes
+the other three's actual output).
+
+Two important scoping decisions:
+
+- **One model, several personas — not several models.** This hardware has
+  one 4GB-VRAM GPU and 16GB RAM; there's no budget to keep multiple distinct
+  models resident, so "multi-agent" here is implemented as one shared
+  `OllamaClient`/model with different system prompts and (for `crew`)
+  different turns in a sequence, not a mixture-of-models setup. If the
+  hardware picture changes, `AgentSpec` already has the shape to add a
+  per-agent model override — it just isn't wired to anything yet.
+- **What makes `crew` a pipeline instead of asking the same question four
+  times**: each stage's prompt includes the *actual text* of every prior
+  stage's output (`prior` in `cmd_crew`, capped to `context_char_budget()`
+  and truncated from the front — i.e. it keeps the most recent agents'
+  findings — if a long crew run would otherwise blow past `num_ctx`), not
+  just the same retrieved code again. REAPER reads what ARCHITECT actually
+  said about the code before finding what's exploitable in it; SINGULARITY
+  reads all three real outputs before writing a decision brief. This is the
+  one part of the system where output literally becomes another call's
+  input — everywhere else in GRAVITON, retrieval and generation are one
+  fixed pass (see the next section for why, and the roadmap for what a
+  fuller agentic loop would add).
+
+`grv investigate` is orthogonal to the agent roster: it's a structured
+*output format* (`agents::INVESTIGATE_FORMAT`, appended to whichever
+agent's base prompt) rather than its own persona, so
+`grv investigate --agent sentinel "..."` is meaningful (structured
+defensive audit) distinct from plain `grv ask --agent sentinel` (free-form).
+
+Context retrieval (`build_context`) is shared and computed once per
+`ask`/`investigate`/`crew` invocation — every agent in a `crew` run
+currently sees identical retrieved chunks, not a query tailored to its own
+specialty. That's a deliberate v1 simplification (documented in the README
+roadmap), not an oversight: giving each agent its own retrieval query is
+straightforward to add once it's clear the shared-context version is
+actually leaving relevant code unfound in practice.
+
 ## What's explicitly *not* built yet (see README roadmap)
 
 - Call-graph edges (`callers`/`callees` beyond a name-match placeholder) —
