@@ -98,7 +98,13 @@ grv run --agent reaper --yolo "fuzz the login endpoint for SQLi and write a PoC 
 ```
 
 Tools available to the agent: `read_file`, `list_dir`, `write_file`,
-`edit_file`, `delete_file`, `run_shell`, `recon_tool` (the same whitelisted
+`edit_file`, `delete_file`, `run_shell`, `run_tests` (auto-detects
+`cargo test`/`npm test`/`pytest`/`go test`/`bundle exec rspec` from the
+repo, or takes an explicit `command`, and returns a parsed pass/fail
+summary with the specific failing tests instead of raw noise — the agent
+is told to run this after a change, before declaring the task done),
+`git_status`/`git_diff`/`git_log` (real git state, not guessed from
+separate file reads) and `git_commit`, `recon_tool` (the same whitelisted
 nmap/ffuf/etc. as `grv tool`), `web_search`/`web_fetch` (DuckDuckGo-backed,
 no API key — so the agent checks a current API/CVE/best-practice instead of
 answering from a possibly-stale training snapshot), and — with `--browser`
@@ -106,10 +112,13 @@ answering from a possibly-stale training snapshot), and — with `--browser`
 driving the system's headless Chromium via CDP so the agent can actually
 load a page, run JS in it, and see what broke, not just guess from source.
 
-Every `write_file`/`edit_file`/`delete_file`/`run_shell`/`recon_tool` call
-is shown to you and confirmed before it happens — you see the exact diff or
-command — unless you pass `--yolo` for a fully autonomous run. File changes
-are checkpointed regardless of `--yolo`:
+Every `write_file`/`edit_file`/`delete_file`/`run_shell`/`run_tests`/
+`git_commit`/`recon_tool` call is shown to you and confirmed before it
+happens — you see the exact diff or command — unless you pass `--yolo` for
+a fully autonomous run. `git_commit` isn't checkpointed the way file writes
+are: a commit is already its own undo point (`git reset`/`git revert`), so
+GRAVITON doesn't duplicate that. File changes are checkpointed regardless
+of `--yolo`:
 
 ```sh
 grv checkpoints                # list grv run sessions and what they touched
@@ -146,6 +155,44 @@ the session):
 grv plan                # show the most recent session's current plan
 grv plan <session-id>   # show a specific one
 ```
+
+**Fine-grained permissions** go under `--yolo`/confirm, not instead of it —
+drop a `.graviton/permissions.toml` in the repo to make specific tool
+calls *stronger* than `--yolo` (never allowed, no override) or *weaker*
+than the default (never prompted, even without `--yolo`):
+
+```toml
+[[rule]]
+tool = "run_shell"
+pattern = "rm -rf*"
+action = "deny"      # blocked even under --yolo
+
+[[rule]]
+tool = "web_search"
+action = "allow"     # never prompts, even without --yolo
+```
+
+Rules are checked in file order, first match wins (`tool = "*"` matches
+anything, `pattern` is a small `*`-wildcard glob against the call's path/
+command); a call that matches nothing behaves exactly as before.
+
+### `grv review` — real git diffs, not retrieved context
+
+`ask`/`crew` answer from *indexed* chunks that happen to match a question.
+For "review what I just changed," that's the wrong source — you want the
+actual diff:
+
+```sh
+grv review                       # every uncommitted change (staged + unstaged) vs HEAD
+grv review --staged              # just what's staged
+grv review main..HEAD            # a specific range
+grv review --agents cryptographer,singularity   # custom pipeline, same as crew
+```
+
+Runs the same sequential hand-off pipeline as `crew` (default:
+`sentinel,architect,singularity`) over the real diff text instead of FTS
+retrieval — each stage cites the actual changed lines, not a symbol that
+happened to match a keyword.
 
 Instead of stuffing an entire repository into a context window (impossible
 past a few hundred KLOC anyway), GRAVITON indexes the repo once with
@@ -190,6 +237,7 @@ grv investigate "is this deserialization path exploitable?"       # REAPER by de
 grv crew "is Vault.sol safe to deploy?"                            # full pipeline, all four agents
 grv swarm --agents sentinel,reaper,cryptographer "audit auth.rs"  # independent agents, concurrent
 grv mission "harden this API service end to end" --max-depth 2    # recursive planner + execution
+grv review                                                        # crew review of your actual uncommitted diff
 
 grv status                         # index stats + Ollama connectivity + live capacity/top-consumers
 grv config --model qwen3:8b --num-ctx 8192 --host http://127.0.0.1:11434
@@ -269,7 +317,7 @@ same confirm-before-running gate as `run_shell` (or runs straight through
 under `--yolo`) — a custom tool is a friendlier, self-documenting name and
 argument schema for the model, not a new trust boundary.
 
-## Current scope (v0.8)
+## Current scope (v0.9)
 
 - **Languages with symbol extraction (17):** Rust, Python, JavaScript,
   TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity,

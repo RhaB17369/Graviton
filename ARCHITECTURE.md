@@ -584,6 +584,75 @@ that argument's value at call time.
   (`read_only_tool_defs`) by design (§ above), and a shell-command tool is
   definitionally not read-only.
 
+## Git-native tools, `grv review`, structured tests, and fine-grained permissions
+
+Four gaps closed together (from a "what's missing vs. Claude Code"
+conversation) — each is a small, self-contained addition, grouped here
+because they share the same shape: a new tool or gate slotted into the
+existing `agentic.rs`/`dispatch_inner` machinery, not a new subsystem.
+
+- **`git_status`/`git_diff`/`git_log`** (read-only, shared with `mission`'s
+  leaves via `dispatch_git_readonly`) and **`git_commit`** (`grv run`-only,
+  gated like every other action) shell out to `git` with fixed argument
+  arrays — never a model-supplied arbitrary git command string — so the
+  agent gets real repository state instead of reconstructing it from
+  separate `read_file` calls. `git_commit` is deliberately *not*
+  checkpointed the way file writes are: a commit is already its own undo
+  point (`git reset`/`git revert`), and there's no interactive-rebase
+  machinery here to justify duplicating that.
+  - **Caught during testing, not assumed correct**: these three read-only
+    tools were initially added only to `read_only_tool_defs`/
+    `dispatch_read_only` (the subset `mission` uses) and not to `grv run`'s
+    own `dispatch_inner` — a mock-server test that had the model call
+    `git_status` surfaced "unknown tool" immediately. Fixed by extracting
+    the three tools' logic into `dispatch_git_readonly`, called from both
+    dispatch paths, so the same bug class (a tool defined in the schema
+    `grv run` sends but not wired into the dispatcher it uses) can't
+    recur silently for these three.
+- **`run_tests`**: auto-detects a test command from repo markers
+  (`Cargo.toml` → `cargo test`, `go.mod` → `go test ./...`,
+  `pyproject.toml`/`setup.py`/`pytest.ini` → `pytest`, `package.json` →
+  `npm test`, `Gemfile` → `bundle exec rspec`; a model-supplied `command`
+  overrides detection), runs it, and returns `summarize_test_output`'s
+  parsed result — pass/fail, and for failures the specific failing test
+  names/error lines — instead of raw stdout+stderr. The "loop" in
+  "test→failure→fix loop" isn't new orchestration code: `grv run`'s
+  existing step loop already lets the model call `run_tests`, see what
+  failed, `edit_file`, and call `run_tests` again — what was missing was a
+  clean enough failure summary for the model to act on without wasting a
+  step misreading noisy raw output. The parser is explicitly heuristic
+  (substring/prefix markers across cargo/pytest/jest/go/rspec's typical
+  output shapes, unit-tested against a representative cargo-test failure
+  and a no-recognizable-marker case), with a tail-of-raw-output fallback
+  when nothing matches rather than returning an empty summary.
+- **`grv review [range] [--staged] [--agents ...]`**: reuses the exact
+  sequential hand-off loop `grv crew` uses (extracted into a shared
+  `run_pipeline` helper during this change, so both stay in sync rather
+  than drifting) but sources `context_block` from a real `git diff`
+  instead of FTS retrieval — the distinction the README draws between
+  `ask`/`crew` (indexed-chunk-based) and this. No range/`--staged` means
+  `git diff HEAD` (staged + unstaged together), since "review what I
+  haven't committed yet" is the common case, not just one half of it.
+- **`.graviton/permissions.toml`** (`crates/cli/src/permissions.rs`):
+  rules layered *underneath* confirm/`--yolo`, not replacing it — every
+  side-effecting dispatch arm now calls `gate(state, tool, primary_arg,
+  ...)` instead of `confirm` directly; `gate` checks permission rules
+  first (first match in file order wins) and only falls through to the
+  existing confirm/`--yolo` behavior when nothing matches. This is why a
+  `deny` rule is *stronger* than `--yolo` (it's checked before
+  `auto_approve` is ever consulted) and an `allow` rule is *weaker* than
+  the default (skips the prompt even without `--yolo`) — two independent
+  axes the old binary confirm-or-yolo model couldn't express. Pattern
+  matching is a small hand-rolled `*`-wildcard glob (unit-tested), not a
+  crate — the realistic cases (`"rm -rf*"`, `"*.env"`, `"*password*"`)
+  don't need one.
+  - Verified end-to-end together with the git tools: a
+    `.graviton/permissions.toml` denying `run_shell` matching `"rm -rf*"`
+    correctly blocked a mock model's attempt at that command *while
+    running under `--yolo`*, with the exact rule cited back to the model
+    as the reason — confirming the "stronger than yolo" property actually
+    holds, not just reads that way in the rule file.
+
 ## What's explicitly *not* built yet (see README roadmap)
 
 - Call-graph edges (`callers`/`callees` beyond a name-match placeholder) —

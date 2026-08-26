@@ -5,6 +5,7 @@ mod checkpoint;
 mod context;
 mod custom_tools;
 mod mission;
+mod permissions;
 mod resources;
 mod tools;
 mod web;
@@ -74,6 +75,18 @@ enum Command {
         files: Vec<PathBuf>,
         /// Comma-separated pipeline override, e.g. "architect,reaper"
         #[arg(long, default_value = "architect,reaper,sentinel,singularity")]
+        agents: String,
+    },
+    /// Review a real git diff (not retrieved/indexed context) with a crew,
+    /// each stage reading the previous ones' actual findings. Defaults to
+    /// every uncommitted change (staged + unstaged) vs HEAD.
+    Review {
+        /// Diff a specific range instead, e.g. "main..HEAD" or "HEAD~3..HEAD"
+        range: Option<String>,
+        /// Diff only staged changes (ignored if `range` is given)
+        #[arg(long)]
+        staged: bool,
+        #[arg(long, default_value = "sentinel,architect,singularity")]
         agents: String,
     },
     /// List GRAVITON's agent roster
@@ -278,6 +291,7 @@ async fn main() -> Result<()> {
             cmd_ask(&cfg, &question, files, spec, true).await
         }
         Command::Crew { question, files, agents } => cmd_crew(&cfg, &question, files, &agents).await,
+        Command::Review { range, staged, agents } => cmd_review(&cfg, range, staged, &agents).await,
         Command::Agents => {
             println!("{}", agents::list_text());
             Ok(())
@@ -439,34 +453,36 @@ async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &
     } else {
         format!("Retrieved context:\n{context_text}")
     };
+    let specs = resolve_pipeline(pipeline)?;
+    run_pipeline(cfg, &format!("Question: {question}"), &context_block, "Findings from the rest of the crew so far:", &specs).await
+}
 
+fn resolve_pipeline(pipeline: &str) -> Result<Vec<&'static AgentSpec>> {
     let keys: Vec<&str> = pipeline.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if keys.is_empty() {
         anyhow::bail!("empty agent pipeline");
     }
-    let mut specs = Vec::with_capacity(keys.len());
-    for k in &keys {
-        specs.push(resolve_agent(k)?);
-    }
+    keys.iter().map(|k| resolve_agent(k)).collect()
+}
 
+/// The sequential hand-off loop shared by `crew` and `review`: each stage
+/// reads the *actual output* of every prior stage (`prior`, capped to
+/// `context_char_budget()` and truncated from the front so a long pipeline
+/// doesn't blow past `num_ctx` by the final stage), not just the same
+/// context re-served.
+async fn run_pipeline(cfg: &Config, prompt: &str, context_block: &str, handoff_label: &str, specs: &[&'static AgentSpec]) -> Result<()> {
     let client = OllamaClient::new(&cfg.ollama_host);
-    let mut prior = String::new(); // other agents' findings so far, fed to each subsequent stage
+    let mut prior = String::new();
 
     for spec in specs {
         println!("\x1b[1;35m═══ {} — {} ═══\x1b[0m", spec.display, spec.tagline);
         let user_msg = if prior.is_empty() {
-            format!("Question: {question}\n\n{context_block}")
+            format!("{prompt}\n\n{context_block}")
         } else {
-            format!(
-                "Question: {question}\n\n{context_block}\n\n\
-                 Findings from the rest of the crew so far:\n{prior}"
-            )
+            format!("{prompt}\n\n{context_block}\n\n{handoff_label}\n{prior}")
         };
         let output = run_agent(&client, cfg, cfg.model_for_tier(spec.tier), spec.system_prompt, &user_msg).await?;
         prior.push_str(&format!("\n--- {} ---\n{}\n", spec.display, output.trim()));
-        // Cap accrued findings so a long crew doesn't blow past num_ctx by
-        // the final stage — keep the most recent agents' output, since
-        // that's what the next stage (and the coordinator) most needs.
         let cap = cfg.context_char_budget();
         if prior.len() > cap {
             let mut cut = prior.len() - cap;
@@ -478,6 +494,45 @@ async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &
         println!();
     }
     Ok(())
+}
+
+/// Review a real `git diff` with a crew pipeline — distinct from `ask`'s
+/// retrieval-based context, this feeds the model the actual changed lines,
+/// not indexed chunks that happen to match a question.
+async fn cmd_review(cfg: &Config, range: Option<String>, staged: bool, pipeline: &str) -> Result<()> {
+    let root = repo_root()?;
+    let mut args = vec!["diff".to_string()];
+    match &range {
+        Some(r) => args.push(r.clone()),
+        None if staged => args.push("--staged".to_string()),
+        None => args.push("HEAD".to_string()),
+    }
+    let output = std::process::Command::new("git").args(&args).current_dir(&root).output().context("running git diff")?;
+    if !output.status.success() {
+        anyhow::bail!("git diff failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let diff = String::from_utf8_lossy(&output.stdout).to_string();
+    if diff.trim().is_empty() {
+        println!("no changes to review");
+        return Ok(());
+    }
+
+    let cap = cfg.context_char_budget();
+    let diff = if diff.len() > cap {
+        let mut cut = cap;
+        while !diff.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}\n[...diff truncated to fit context budget...]", &diff[..cut])
+    } else {
+        diff
+    };
+    let context_block = format!("Diff under review:\n```diff\n{diff}\n```");
+    let specs = resolve_pipeline(pipeline)?;
+    let prompt = "Review this diff for correctness, security, and design issues. Be specific: \
+                  cite the exact changed line, explain the concrete risk or improvement it \
+                  creates (not a generic label), and give the fix.";
+    run_pipeline(cfg, prompt, &context_block, "Findings from the rest of the review so far:", &specs).await
 }
 
 /// Run several agents concurrently on the same question, no hand-off

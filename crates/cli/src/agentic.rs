@@ -12,6 +12,7 @@ use crate::agents::AgentSpec;
 use crate::browser::BrowserSession;
 use crate::checkpoint;
 use crate::custom_tools::{self, CustomTool};
+use crate::permissions;
 use crate::tools as recon_tools;
 use crate::web;
 use anyhow::{Context, Result};
@@ -35,6 +36,7 @@ struct State {
     auto_approve: bool,
     browser: Option<BrowserSession>,
     custom_tools: Vec<CustomTool>,
+    permissions: Vec<permissions::Rule>,
 }
 
 /// The read-only subset of the tool roster — no file writes/shell/recon,
@@ -75,7 +77,78 @@ pub(crate) fn read_only_tool_defs() -> Vec<ToolDef> {
             "Fetch a URL and return its page text (HTML stripped) — read a specific page, e.g. one found via web_search, official docs, or an advisory.",
             json!({ "type": "object", "properties": { "url": { "type": "string" } }, "required": ["url"] }),
         ),
+        ToolDef::new(
+            "git_status",
+            "Show `git status` (branch, staged/unstaged/untracked files) for the repo.",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        ToolDef::new(
+            "git_diff",
+            "Show a real git diff — staged changes, or unstaged if staged=false (default), optionally restricted to one path. Use this instead of guessing what changed from separate read_file calls.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "staged": { "type": "boolean", "description": "diff the index instead of the working tree; defaults to false" },
+                    "path": { "type": "string", "description": "restrict the diff to this path; omit for the whole repo" }
+                }
+            }),
+        ),
+        ToolDef::new(
+            "git_log",
+            "Show recent commit history (oneline), optionally restricted to one path.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "defaults to 10" },
+                    "path": { "type": "string" }
+                }
+            }),
+        ),
     ]
+}
+
+/// Run a git subcommand with fixed, safe arguments (never a model-supplied
+/// arbitrary argument string) and return its combined output — used by
+/// both the read-only git tools and `grv review`.
+fn run_git(root: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git").args(args).current_dir(root).output().context("running git")?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(combined)
+}
+
+/// The three read-only git tools' logic, shared between `dispatch_read_only`
+/// (used by `mission`'s leaves) and `dispatch_inner` (used by `grv run`) —
+/// `None` if `name` isn't one of them.
+fn dispatch_git_readonly(root: &Path, name: &str, args: &Value) -> Option<Result<String>> {
+    let arg_str = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    match name {
+        "git_status" => Some(run_git(root, &["status"])),
+        "git_diff" => {
+            let staged = args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+            let path = arg_str("path");
+            let mut a = vec!["diff"];
+            if staged {
+                a.push("--staged");
+            }
+            if !path.is_empty() {
+                a.push("--");
+                a.push(&path);
+            }
+            Some(run_git(root, &a))
+        }
+        "git_log" => {
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10).to_string();
+            let path = arg_str("path");
+            let mut a = vec!["log", "--oneline", "-n", &limit];
+            if !path.is_empty() {
+                a.push("--");
+                a.push(&path);
+            }
+            Some(run_git(root, &a))
+        }
+        _ => None,
+    }
 }
 
 /// Dispatch one of `read_only_tool_defs`' tools outside the full agentic
@@ -98,7 +171,10 @@ pub(crate) async fn dispatch_read_only(root: &Path, name: &str, args: &Value) ->
             }
             "web_search" => web::search(&arg_str("query")).await,
             "web_fetch" => web::fetch(&arg_str("url")).await,
-            other => anyhow::bail!("unknown read-only tool '{other}'"),
+            other => match dispatch_git_readonly(root, other, args) {
+                Some(r) => r,
+                None => anyhow::bail!("unknown read-only tool '{other}'"),
+            },
         }
     }
     .await;
@@ -183,6 +259,33 @@ fn tool_defs(enable_browser: bool, custom: &[CustomTool]) -> Vec<ToolDef> {
             }),
         ),
         ToolDef::new(
+            "run_tests",
+            "Run this project's test suite and get back a structured summary (pass/fail, and for \
+             failures the specific failing test names and error output) instead of raw noise. The \
+             command is auto-detected from the repo (cargo test / npm test / pytest / go test / \
+             bundle exec rspec) — pass `command` to override if detection is wrong or the task \
+             needs a narrower run (one test file, one test name). Prefer this over run_shell for \
+             tests. After a fix, run this again before declaring the task done.",
+            json!({
+                "type": "object",
+                "properties": { "command": { "type": "string", "description": "override the auto-detected test command" } }
+            }),
+        ),
+        ToolDef::new(
+            "git_commit",
+            "Stage and commit changes. Not checkpointed the way file writes are — a commit is \
+             already its own undo point (`git reset`/`git revert`), so this doesn't duplicate that. \
+             Confirmed before running unless auto-approve is on.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "specific paths to stage; omit to stage all changes" }
+                },
+                "required": ["message"]
+            }),
+        ),
+        ToolDef::new(
             "recon_tool",
             &format!(
                 "Run a whitelisted recon/security tool ({}) and get its output.",
@@ -263,6 +366,19 @@ fn require_allowed(decision: Decision, declined_msg: &str) -> Result<()> {
         Decision::Allow => Ok(()),
         Decision::Deny => anyhow::bail!("{declined_msg}"),
         Decision::Redirect(note) => anyhow::bail!("{declined_msg} — the user says: {note}"),
+    }
+}
+
+/// The single gate every side-effecting tool call goes through:
+/// `.graviton/permissions.toml` rules are checked first (a `deny` rule
+/// blocks even under `--yolo`, an `allow` rule skips the prompt even
+/// without it); anything the rules don't cover falls through to the
+/// existing confirm/`--yolo` behavior unchanged.
+fn gate(state: &State, tool: &str, primary_arg: &str, action_desc: &str, declined_msg: &str) -> Result<()> {
+    match permissions::check(&state.permissions, tool, primary_arg) {
+        permissions::Verdict::Allow => Ok(()),
+        permissions::Verdict::Deny(reason) => anyhow::bail!("{declined_msg} — {reason}"),
+        permissions::Verdict::Fallback => require_allowed(confirm(state.auto_approve, action_desc), declined_msg),
     }
 }
 
@@ -355,7 +471,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             let full = resolve_rel(&state.root, &rel)?;
             let old = std::fs::read_to_string(&full).unwrap_or_default();
             let preview = diff_preview(&old, &content);
-            require_allowed(confirm(state.auto_approve, &format!("write_file {rel}\n{preview}")), "user declined this write")?;
+            gate(state, "write_file", &rel, &format!("write_file {rel}\n{preview}"), "user declined this write")?;
             state.checkpoint.snapshot_before_write(&rel)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).ok();
@@ -378,7 +494,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             }
             let updated = content.replacen(&old_string, &new_string, 1);
             let preview = diff_preview(&content, &updated);
-            require_allowed(confirm(state.auto_approve, &format!("edit_file {rel}\n{preview}")), "user declined this edit")?;
+            gate(state, "edit_file", &rel, &format!("edit_file {rel}\n{preview}"), "user declined this edit")?;
             state.checkpoint.snapshot_before_write(&rel)?;
             std::fs::write(&full, &updated).with_context(|| format!("writing {rel}"))?;
             Ok(format!("edited {rel}"))
@@ -389,7 +505,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             if !full.exists() {
                 anyhow::bail!("{rel} doesn't exist");
             }
-            require_allowed(confirm(state.auto_approve, &format!("delete_file {rel}")), "user declined this delete")?;
+            gate(state, "delete_file", &rel, &format!("delete_file {rel}"), "user declined this delete")?;
             state.checkpoint.snapshot_before_delete(&rel)?;
             std::fs::remove_file(&full).with_context(|| format!("deleting {rel}"))?;
             Ok(format!("deleted {rel}"))
@@ -397,7 +513,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
         "run_shell" => {
             let command = arg_str("command")?;
             let why = args.get("why").and_then(|v| v.as_str()).unwrap_or("");
-            require_allowed(confirm(state.auto_approve, &format!("run_shell: {command}\n({why})")), "user declined running this command")?;
+            gate(state, "run_shell", &command, &format!("run_shell: {command}\n({why})"), "user declined running this command")?;
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&command)
@@ -408,6 +524,42 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
             combined.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
             Ok(truncate(combined))
+        }
+        "run_tests" => {
+            let command = match args.get("command").and_then(|v| v.as_str()) {
+                Some(c) if !c.is_empty() => c.to_string(),
+                _ => detect_test_command(&state.root)
+                    .ok_or_else(|| anyhow::anyhow!("couldn't auto-detect a test command for this project — pass `command` explicitly"))?,
+            };
+            gate(state, "run_tests", &command, &format!("run_tests: {command}"), "user declined running tests")?;
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&state.root)
+                .output()
+                .context("running tests")?;
+            let mut raw = String::from_utf8_lossy(&output.stdout).to_string();
+            raw.push_str(&String::from_utf8_lossy(&output.stderr));
+            Ok(truncate(summarize_test_output(&raw, output.status.success())))
+        }
+        "git_commit" => {
+            let message = arg_str("message")?;
+            let paths: Vec<String> = args
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let stage_desc = if paths.is_empty() { "all changes".to_string() } else { paths.join(", ") };
+            gate(state, "git_commit", &message, &format!("git_commit: \"{message}\" (staging: {stage_desc})"), "user declined this commit")?;
+            let mut add_args = vec!["add".to_string()];
+            if paths.is_empty() {
+                add_args.push("-A".to_string());
+            } else {
+                add_args.extend(paths);
+            }
+            let add_result = run_git(&state.root, &add_args.iter().map(String::as_str).collect::<Vec<_>>())?;
+            let commit_result = run_git(&state.root, &["commit", "-m", &message])?;
+            Ok(truncate(format!("{add_result}{commit_result}")))
         }
         "web_search" => {
             let query = arg_str("query")?;
@@ -424,7 +576,8 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
-            require_allowed(confirm(state.auto_approve, &format!("recon_tool: {tool} {}", args_list.join(" "))), "user declined running this tool")?;
+            let recon_invocation = format!("{tool} {}", args_list.join(" "));
+            gate(state, "recon_tool", &recon_invocation, &format!("recon_tool: {recon_invocation}"), "user declined running this tool")?;
             recon_tools::run_and_index(conn, &tool, &args_list)?;
             let output: String = conn
                 .query_row("SELECT output FROM tool_runs ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
@@ -448,13 +601,19 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
                 _ => unreachable!(),
             }
         }
+        other if dispatch_git_readonly(&state.root, other, args).is_some() => {
+            dispatch_git_readonly(&state.root, other, args).unwrap()
+        }
         other => {
             let Some(tool) = custom_tools::find(&state.custom_tools, other).cloned() else {
                 anyhow::bail!("unknown tool '{other}'");
             };
             let command = tool.render_command(args)?;
-            require_allowed(
-                confirm(state.auto_approve, &format!("custom tool '{}': {command}", tool.name)),
+            gate(
+                state,
+                &tool.name,
+                &command,
+                &format!("custom tool '{}': {command}", tool.name),
                 &format!("user declined running custom tool '{}'", tool.name),
             )?;
             let output = std::process::Command::new("sh")
@@ -487,6 +646,71 @@ pub(crate) fn format_plan(steps: &Value) -> String {
             _ => "[ ]",
         };
         out.push_str(&format!("  {mark} {text}\n"));
+    }
+    out
+}
+
+/// Best-effort test-command detection from repo markers — a starting
+/// point the model can override with an explicit `command`, not a claim
+/// this covers every project layout.
+fn detect_test_command(root: &Path) -> Option<String> {
+    let has = |name: &str| root.join(name).exists();
+    if has("Cargo.toml") {
+        Some("cargo test".to_string())
+    } else if has("go.mod") {
+        Some("go test ./...".to_string())
+    } else if has("pytest.ini") || has("pyproject.toml") || has("setup.py") {
+        Some("pytest".to_string())
+    } else if has("package.json") {
+        Some("npm test".to_string())
+    } else if has("Gemfile") {
+        Some("bundle exec rspec".to_string())
+    } else {
+        None
+    }
+}
+
+/// Heuristic test-output summarizer across common frameworks (cargo test,
+/// pytest, jest/npm test, go test, rspec) — recognizes their usual
+/// pass/fail summary lines and failing-test markers by substring, not a
+/// real parser per framework. When nothing recognizable is found, falls
+/// back to the tail of the raw output (where a test runner's summary
+/// almost always ends up) rather than silently returning nothing useful.
+fn summarize_test_output(raw: &str, success: bool) -> String {
+    let is_failure_marker = |l: &str| {
+        l.starts_with("FAILED ")
+            || l.starts_with("FAIL ")
+            || l.starts_with("--- FAIL:")
+            || l.contains("AssertionError")
+            || l.contains("panicked at")
+            || l.starts_with('✗')
+            || l.starts_with('✕')
+    };
+    let is_summary_marker = |l: &str| {
+        let lower = l.to_lowercase();
+        lower.contains("passed") || lower.contains("failed") || (lower.contains("tests:") && lower.contains("total"))
+    };
+
+    let failing: Vec<&str> = raw.lines().filter(|l| is_failure_marker(l.trim())).take(20).collect();
+    let summary = raw.lines().rev().find(|l| is_summary_marker(l.trim()));
+
+    let mut out = String::new();
+    out.push_str(if success { "TESTS PASSED\n" } else { "TESTS FAILED\n" });
+    if let Some(s) = summary {
+        out.push_str(s.trim());
+        out.push('\n');
+    }
+    if !failing.is_empty() {
+        out.push_str("\nfailing:\n");
+        for l in &failing {
+            out.push_str(l.trim());
+            out.push('\n');
+        }
+    }
+    if summary.is_none() && failing.is_empty() {
+        out.push_str("\n(no recognizable summary line — raw output tail)\n");
+        let tail: Vec<&str> = raw.lines().rev().take(40).collect();
+        out.push_str(&tail.into_iter().rev().collect::<Vec<_>>().join("\n"));
     }
     out
 }
@@ -531,6 +755,10 @@ pub async fn run(
     if !custom.is_empty() {
         println!("\x1b[2mcustom tools loaded: {}\x1b[0m", custom.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
     }
+    let rules = permissions::load(root);
+    if !rules.is_empty() {
+        println!("\x1b[2m{} permission rule(s) loaded from .graviton/permissions.toml\x1b[0m", rules.len());
+    }
     let tools = tool_defs(loop_cfg.enable_browser, &custom);
 
     let (mut state, mut messages, resumed) = match &resume_session {
@@ -538,13 +766,13 @@ pub async fn run(
             let checkpoint = checkpoint::Session::open_existing(root, id)?;
             let restored = checkpoint::load_transcript(root, id)?;
             (
-                State { root: root.to_path_buf(), checkpoint, auto_approve: loop_cfg.auto_approve, browser: None, custom_tools: custom },
+                State { root: root.to_path_buf(), checkpoint, auto_approve: loop_cfg.auto_approve, browser: None, custom_tools: custom, permissions: rules },
                 restored,
                 true,
             )
         }
         None => (
-            State { root: root.to_path_buf(), checkpoint: checkpoint::Session::new(root)?, auto_approve: loop_cfg.auto_approve, browser: None, custom_tools: custom },
+            State { root: root.to_path_buf(), checkpoint: checkpoint::Session::new(root)?, auto_approve: loop_cfg.auto_approve, browser: None, custom_tools: custom, permissions: rules },
             Vec::new(),
             false,
         ),
@@ -565,18 +793,21 @@ pub async fn run(
         // system + user turn as before.
         let system = format!(
             "{}\n\nYou have tools to read/write/edit/delete files, run shell commands, \
-             run recon tools, search the web and fetch pages, report your plan, and (if \
-             offered) drive a headless browser — use them; don't just describe what you'd \
-             do. Paths are relative to the repo root. File writes/edits/deletes and shell \
-             commands are confirmed with the user before they happen, so propose them \
-             directly rather than asking permission in text first. Use web_search/\
-             web_fetch whenever the task depends on something that could have changed \
-             since your training — a library's current API, a recent CVE, a best \
+             run tests, inspect real git state (status/diff/log) and commit, run recon \
+             tools, search the web and fetch pages, report your plan, and (if offered) \
+             drive a headless browser — use them; don't just describe what you'd do. \
+             Paths are relative to the repo root. File writes/edits/deletes, commits, \
+             and shell commands are confirmed with the user before they happen, so \
+             propose them directly rather than asking permission in text first. Use \
+             web_search/web_fetch whenever the task depends on something that could have \
+             changed since your training — a library's current API, a recent CVE, a best \
              practice — instead of answering from memory and risking an obsolete \
              technique; a wrong answer that looks current is worse than admitting you \
              need to check. Use update_plan for any task with more than one real step, \
-             and keep it current. When the task is complete, stop calling tools and give \
-             a final summary of what you did and the result.",
+             and keep it current. After a code change, run_tests before declaring the \
+             task done — a change that hasn't been run isn't verified, it's a guess. \
+             When the task is complete, stop calling tools and give a final summary of \
+             what you did and the result.",
             agent.system_prompt
         );
         push_and_record(&mut messages, &state, ChatMessage::system(system));
@@ -664,5 +895,35 @@ fn truncate_display(s: &str) -> String {
         format!("{}...", &s[..300])
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarizes_cargo_test_failure() {
+        let raw = "running 2 tests\ntest foo::works ... ok\ntest foo::broken ... FAILED\n\nfailures:\n\n---- foo::broken stdout ----\nthread panicked at src/foo.rs:10: assertion failed\n\nfailures:\n    foo::broken\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n";
+        let out = summarize_test_output(raw, false);
+        assert!(out.starts_with("TESTS FAILED"));
+        assert!(out.contains("1 passed; 1 failed"));
+        assert!(out.contains("panicked at"));
+    }
+
+    #[test]
+    fn summarizes_pass_with_no_recognizable_failures() {
+        let raw = "running 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored\n";
+        let out = summarize_test_output(raw, true);
+        assert!(out.starts_with("TESTS PASSED"));
+        assert!(out.contains("3 passed"));
+    }
+
+    #[test]
+    fn falls_back_to_tail_when_unrecognizable() {
+        let raw = "some completely custom test runner output\nwith no known markers\n";
+        let out = summarize_test_output(raw, false);
+        assert!(out.contains("raw output tail"));
+        assert!(out.contains("some completely custom test runner output"));
     }
 }
