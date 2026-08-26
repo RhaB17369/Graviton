@@ -13,6 +13,7 @@ use crate::browser::BrowserSession;
 use crate::checkpoint;
 use crate::custom_tools::{self, CustomTool};
 use crate::permissions;
+use crate::semantic;
 use crate::tools as recon_tools;
 use crate::web;
 use anyhow::{Context, Result};
@@ -37,6 +38,8 @@ struct State {
     browser: Option<BrowserSession>,
     custom_tools: Vec<CustomTool>,
     permissions: Vec<permissions::Rule>,
+    ollama_host: String,
+    embed_model: Option<String>,
 }
 
 /// The read-only subset of the tool roster — no file writes/shell/recon,
@@ -104,13 +107,113 @@ pub(crate) fn read_only_tool_defs() -> Vec<ToolDef> {
                 }
             }),
         ),
+        ToolDef::new(
+            "search_code",
+            "Full-text search over the indexed codebase (lexical, exact-token matching) — \
+             good for a known identifier, error string, or exact API name. Requires \
+             `grv index` to have been run in this repo.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "description": "defaults to 8" }
+                },
+                "required": ["query"]
+            }),
+        ),
+        ToolDef::new(
+            "semantic_search",
+            "Semantic (meaning-based) search over the indexed codebase using embeddings — \
+             finds conceptually related code even when it shares no keywords with the query. \
+             Only works if an embedding model is configured (`grv config --embed-model ...`) \
+             and `grv embed` has been run; returns a clear error otherwise, so try search_code \
+             instead if this one errors.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "description": "defaults to 8" }
+                },
+                "required": ["query"]
+            }),
+        ),
     ]
+}
+
+/// Everything `search_code`/`semantic_search` need after the (synchronous)
+/// index read: either a ready answer, or the loaded embeddings + query text
+/// still needing an embedding call + ranking.
+///
+/// Split this way — instead of one `async fn` taking `&rusqlite::Connection`
+/// — because `Connection` isn't `Sync`, so `&Connection` isn't `Send`, and
+/// (per rustc, regardless of whether it's actually touched after an await)
+/// an `async fn` with `&Connection` anywhere in its signature has its
+/// returned future's `Send`-ness poisoned by that alone. `search_code`/
+/// `semantic_search` run from inside mission's `Box::pin(... + Send)`
+/// leaves and `grv serve`'s `tokio::spawn`ed connections, so no async fn in
+/// that path may take `&Connection` — see `semantic::EmbeddedChunk`.
+enum SearchOutcome {
+    Done(Result<String>),
+    Rank { model: String, query: String, limit: usize, chunks: Vec<semantic::EmbeddedChunk> },
+}
+
+/// `search_code`/`semantic_search` logic, shared between `dispatch_inner`
+/// (which already has an open index connection) and `dispatch_read_only`
+/// (which opens a short-lived one per call — fine under WAL, and mission's
+/// leaves calling this concurrently is exactly the case WAL mode is for).
+/// Plain sync fn — see `SearchOutcome`.
+fn prepare_search_tool(conn: &rusqlite::Connection, embed_model: Option<&str>, name: &str, args: &Value) -> Option<SearchOutcome> {
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+    match name {
+        "search_code" => Some(SearchOutcome::Done((|| {
+            let hits = crate::context::search_chunks(conn, &query, limit)?;
+            if hits.is_empty() {
+                return Ok("no matches".to_string());
+            }
+            Ok(hits.iter().map(|h| format!("--- {} ---\n{}", h.header, h.body)).collect::<Vec<_>>().join("\n\n"))
+        })())),
+        "semantic_search" => {
+            let Some(model) = embed_model else {
+                return Some(SearchOutcome::Done(Err(anyhow::anyhow!(
+                    "no embedding model configured — set one with `grv config --embed-model <tag>` and run `grv embed` first"
+                ))));
+            };
+            if !semantic::has_embeddings(conn) {
+                return Some(SearchOutcome::Done(Err(anyhow::anyhow!("no embeddings computed yet — run `grv embed` first"))));
+            }
+            match semantic::load_embeddings(conn, model) {
+                Ok(chunks) => Some(SearchOutcome::Rank { model: model.to_string(), query, limit, chunks }),
+                Err(e) => Some(SearchOutcome::Done(Err(e))),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The (`Connection`-free — see `SearchOutcome`) async half: embed the
+/// query and rank, if needed.
+async fn finish_search_outcome(ollama_host: &str, outcome: SearchOutcome) -> Result<String> {
+    match outcome {
+        SearchOutcome::Done(r) => r,
+        SearchOutcome::Rank { model, query, limit, chunks } => {
+            let hits = semantic::rank_by_query(ollama_host, &model, &query, chunks, limit).await?;
+            if hits.is_empty() {
+                return Ok("no matches".to_string());
+            }
+            Ok(hits
+                .iter()
+                .map(|h| format!("--- {}:{}-{} (score {:.2}) ---\n{}", h.path, h.start_line, h.end_line, h.score, h.body))
+                .collect::<Vec<_>>()
+                .join("\n\n"))
+        }
+    }
 }
 
 /// Run a git subcommand with fixed, safe arguments (never a model-supplied
 /// arbitrary argument string) and return its combined output — used by
 /// both the read-only git tools and `grv review`.
-fn run_git(root: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn run_git(root: &Path, args: &[&str]) -> Result<String> {
     let output = std::process::Command::new("git").args(args).current_dir(root).output().context("running git")?;
     let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -154,7 +257,7 @@ fn dispatch_git_readonly(root: &Path, name: &str, args: &Value) -> Option<Result
 /// Dispatch one of `read_only_tool_defs`' tools outside the full agentic
 /// loop's `State`/checkpoint machinery — used by `mission.rs`, which has no
 /// write/edit/delete tools to checkpoint in the first place.
-pub(crate) async fn dispatch_read_only(root: &Path, name: &str, args: &Value) -> String {
+pub(crate) async fn dispatch_read_only(cfg: &Config, root: &Path, name: &str, args: &Value) -> String {
     let arg_str = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let result: Result<String> = async {
         match name {
@@ -171,6 +274,22 @@ pub(crate) async fn dispatch_read_only(root: &Path, name: &str, args: &Value) ->
             }
             "web_search" => web::search(&arg_str("query")).await,
             "web_fetch" => web::fetch(&arg_str("url")).await,
+            "search_code" | "semantic_search" => {
+                // A short-lived read connection per call — cheap, and safe
+                // under WAL for mission's concurrently-running leaves to
+                // each open their own against the same index.db.
+                let db_path = graviton_core::db_path_for(root, &cfg.index_dir)?;
+                if !db_path.exists() {
+                    anyhow::bail!("no index found — run `grv index` first");
+                }
+                let conn = graviton_core::open_db(&db_path)?;
+                let outcome = prepare_search_tool(&conn, cfg.embed_model.as_deref(), name, args);
+                drop(conn); // done with the connection before the async ranking step below
+                match outcome {
+                    Some(outcome) => finish_search_outcome(&cfg.ollama_host, outcome).await,
+                    None => unreachable!(),
+                }
+            }
             other => match dispatch_git_readonly(root, other, args) {
                 Some(r) => r,
                 None => anyhow::bail!("unknown read-only tool '{other}'"),
@@ -601,6 +720,12 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
                 _ => unreachable!(),
             }
         }
+        "search_code" | "semantic_search" => {
+            match prepare_search_tool(conn, state.embed_model.as_deref(), name, args) {
+                Some(outcome) => finish_search_outcome(&state.ollama_host, outcome).await,
+                None => unreachable!(),
+            }
+        }
         other if dispatch_git_readonly(&state.root, other, args).is_some() => {
             dispatch_git_readonly(&state.root, other, args).unwrap()
         }
@@ -766,13 +891,31 @@ pub async fn run(
             let checkpoint = checkpoint::Session::open_existing(root, id)?;
             let restored = checkpoint::load_transcript(root, id)?;
             (
-                State { root: root.to_path_buf(), checkpoint, auto_approve: loop_cfg.auto_approve, browser: None, custom_tools: custom, permissions: rules },
+                State {
+                    root: root.to_path_buf(),
+                    checkpoint,
+                    auto_approve: loop_cfg.auto_approve,
+                    browser: None,
+                    custom_tools: custom,
+                    permissions: rules,
+                    ollama_host: cfg.ollama_host.clone(),
+                    embed_model: cfg.embed_model.clone(),
+                },
                 restored,
                 true,
             )
         }
         None => (
-            State { root: root.to_path_buf(), checkpoint: checkpoint::Session::new(root)?, auto_approve: loop_cfg.auto_approve, browser: None, custom_tools: custom, permissions: rules },
+            State {
+                root: root.to_path_buf(),
+                checkpoint: checkpoint::Session::new(root)?,
+                auto_approve: loop_cfg.auto_approve,
+                browser: None,
+                custom_tools: custom,
+                permissions: rules,
+                ollama_host: cfg.ollama_host.clone(),
+                embed_model: cfg.embed_model.clone(),
+            },
             Vec::new(),
             false,
         ),
@@ -794,9 +937,10 @@ pub async fn run(
         let system = format!(
             "{}\n\nYou have tools to read/write/edit/delete files, run shell commands, \
              run tests, inspect real git state (status/diff/log) and commit, run recon \
-             tools, search the web and fetch pages, report your plan, and (if offered) \
-             drive a headless browser — use them; don't just describe what you'd do. \
-             Paths are relative to the repo root. File writes/edits/deletes, commits, \
+             tools, search the web and fetch pages, search the indexed codebase (search_code \
+             for exact identifiers/strings, semantic_search for concepts when it's available), \
+             report your plan, and (if offered) drive a headless browser — use them; don't \
+             just describe what you'd do. Paths are relative to the repo root. File writes/edits/deletes, commits, \
              and shell commands are confirmed with the user before they happen, so \
              propose them directly rather than asking permission in text first. Use \
              web_search/web_fetch whenever the task depends on something that could have \

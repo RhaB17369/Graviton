@@ -72,11 +72,16 @@ embeddings/vector store. For v1 that's over-engineering:
   patterns that matter most for "explain/trace/find X in this codebase"
   and "give me the source of function Y" — the bulk of real usage.
 - No embedding model to keep loaded alongside the chat model on a
-  16GB-RAM box. Every extra resident model is RAM you don't have for qwen3.
+  16GB-RAM box, *unless you ask for one* — semantic search (below) is opt-in
+  and off by default, so this constraint is respected until a user
+  deliberately trades some RAM/setup time for better retrieval.
 
-Semantic (embedding-based) search is a legitimate v2 addition once lexical +
-symbol retrieval proves insufficient in practice — it's called out in the
-README roadmap rather than built speculatively now.
+Semantic (embedding-based) search shipped later (`crates/cli/src/semantic.rs`,
+see "Semantic search" below) as exactly that: opt-in, not a replacement for
+FTS5/symbol lookup — both still run, and semantic hits are added as a third
+source when configured. A vector database was still skipped even then:
+cosine similarity over an in-process `Vec<f32>` scan is fast enough at
+single-repo scale (see below) and is one less moving part to run locally.
 
 ### Schema
 
@@ -84,6 +89,7 @@ README roadmap rather than built speculatively now.
 files(id, path UNIQUE, lang, size, mtime, hash)
 symbols(id, file_id -> files, kind, name, start_line, end_line, parent)
 content_fts(path, start_line, end_line, kind, name, body)   -- FTS5 virtual table
+embeddings(chunk_id -> content_fts.rowid, model, dims, vector BLOB)  -- optional, see "Semantic search"
 ```
 
 `hash` (a fast non-cryptographic hash of file content) makes `grv index`
@@ -422,9 +428,12 @@ out of the streamed response.
 old_string/new_string replace — same shape as this codebase's own edit
 tool, chosen over unified-diff patches because a small local model
 produces "replace this exact block" far more reliably than a correctly
-context-lined diff), `delete_file`, `run_shell`, and `recon_tool` (the
+context-lined diff), `delete_file`, `run_shell`, `recon_tool` (the
 `grv tool` whitelist, exposed as a tool so the agent can run nmap/ffuf/etc.
-itself instead of the user doing it out-of-band). `--browser` adds
+itself instead of the user doing it out-of-band), and `search_code`/
+`semantic_search` (the indexed repo, mid-task — see "Semantic search"
+below for why the latter needs an embedding model configured and errors
+clearly when it isn't, rather than silently falling back). `--browser` adds
 `browser_navigate`/`browser_eval`/`browser_screenshot`/`browser_console`,
 backed by `chromiumoxide` driving the system's Chromium over CDP
 (`crates/cli/src/browser.rs`) — headless, one page kept alive for the
@@ -653,12 +662,148 @@ existing `agentic.rs`/`dispatch_inner` machinery, not a new subsystem.
     as the reason — confirming the "stronger than yolo" property actually
     holds, not just reads that way in the rule file.
 
+## Semantic search (`crates/cli/src/semantic.rs`)
+
+Opt-in embedding-based retrieval, additive to (never a replacement for)
+FTS5/symbol lookup. Set `grv config --embed-model <tag>` (any
+embedding-capable model already pulled in Ollama — `nomic-embed-text` and
+`all-minilm` are the common small ones), run `grv embed`, and every
+retrieval path (`build_context`, used by `ask`/`investigate`/`crew`/
+`swarm`/`mission`/`run`; `grv search --semantic`; `search_code`/
+`semantic_search` as tools inside `grv run`/`mission` leaves) picks it up
+automatically. Nothing here changes behavior for a repo that never opts in.
+
+- **Storage**: one `embeddings` row per `content_fts` chunk (`chunk_id` =
+  its `rowid`), vector as a little-endian `f32` BLOB. `graviton_indexer`
+  deletes a file's stale embedding rows in the same transaction it replaces
+  that file's `content_fts` rows on re-index (rowids aren't stable across a
+  re-index, so without this an embedding would silently end up pointing at
+  whatever chunk happens to land on that old rowid next); `clear_index`
+  wipes `embeddings` for the same reason. `grv embed` is otherwise
+  incremental — it only embeds chunks missing a *current-model* embedding,
+  so switching `--embed-model` doesn't require `--force` to notice (the old
+  model's rows just sit unused, matched by a `WHERE model = ?` on read).
+- **Ranking**: cosine similarity, computed in Rust over every stored vector
+  for the query's model — no ANN index. At the scale of chunks a single
+  repo actually produces (thousands, each ~KB of `f32`s) this is
+  single-digit milliseconds; an ANN index would be solving a problem this
+  hasn't hit yet.
+- **Concurrency**: `grv embed`'s requests run concurrently, bounded by CPU
+  thread count (2-8) via a plain `tokio::Semaphore` — embedding a short
+  chunk is light but still contends for one resident model in Ollama, so
+  this pipelines latency without pretending it's independent CPU-bound work
+  (same honesty `resources.rs` applies to `swarm`/`mission`).
+
+### A real `Send` constraint shaped this module's API
+
+`rusqlite::Connection` is `Send` but not `Sync`. Empirically (regardless of
+*where* inside a function body the reference is actually used — before or
+after an `.await`), an `async fn` with `&Connection` anywhere in its
+signature has its returned future's `Send`-ness poisoned. That's fatal for
+two real call paths here: `grv mission`'s leaves run inside
+`Box::pin(... + Send)` (self-referential recursion needs that indirection —
+see "Model tiers, `grv swarm`, and `grv mission`" above), and `grv serve`
+spawns one task per connection via `tokio::spawn`, which requires `Send`
+too.
+
+The fix, applied consistently: split any operation that needs both a DB
+read and a model call into a plain **sync** function that does the DB read
+and returns owned data (`EmbeddedChunk { path, start_line, end_line, body,
+vector }` — all `Send`), and a separate **async** function that takes that
+owned data and does the model call, with no `Connection`-shaped type
+anywhere in its signature:
+
+```rust
+pub fn load_embeddings(conn: &Connection, model: &str) -> Result<Vec<EmbeddedChunk>>          // sync
+pub async fn rank_by_query(ollama_host: &str, model: &str, query: &str,
+                            chunks: Vec<EmbeddedChunk>, limit: usize) -> Result<Vec<SemanticHit>>  // no Connection
+```
+
+The same split appears in `agentic.rs` (`prepare_search_tool` sync /
+`finish_search_outcome` async, backing the `search_code`/`semantic_search`
+tools) and `main.rs` (`build_context_sync` / `finish_context`, backing
+`ask`/`crew`/`swarm`/`mission`/`run`'s context retrieval and reused as-is by
+`grv serve`'s `ask` handler). A thin `async fn search(...)` convenience
+wrapper that *does* take `&Connection` still exists in `semantic.rs` for
+callers with no `Send` constraint (`grv search --semantic` is a plain
+top-level `.await`, never spawned) — the poisoned signature is harmless
+there, so callers aren't forced into the two-step split unless they
+actually need it.
+
+## `grv serve` — a daemon for editor/IDE integrations (`crates/cli/src/daemon.rs`)
+
+A background process (foreground by default, like `ollama serve`) so an
+editor/IDE integration gets code intelligence and agent answers without
+paying a fresh `grv` process's startup cost — re-resolving config,
+re-opening the index, losing `swarm`/`mission`'s warmed-up scheduler state —
+on every request.
+
+### Wire protocol: JSON-RPC 2.0, newline-delimited
+
+One JSON object per line, in both directions — not LSP's `Content-Length`
+header framing. JSON-RPC itself doesn't mandate a framing, and NDJSON needs
+no header parser on either end: `nc -U .graviton/grv.sock` and a few lines
+of Python/Node can already speak this.
+
+```
+--> {"jsonrpc":"2.0","id":1,"method":"status","params":{}}
+<-- {"jsonrpc":"2.0","id":1,"result":{"root":"...","model":"qwen3:8b","embed_model":null,"index":{"files":42,"symbols":310,"chunks":198,"embedded":0},"ollama_reachable":true,"ollama_models":[...],"scheduler_target":3}}
+
+--> {"jsonrpc":"2.0","id":2,"method":"ask","params":{"question":"what does check_password do?","agent":"architect"}}
+<-- {"jsonrpc":"2.0","id":2,"result":{"agent":"architect","model":"qwen3:8b","answer":"..."}}
+
+--> {"jsonrpc":"2.0","id":3,"method":"shutdown"}
+<-- {"jsonrpc":"2.0","id":3,"result":"ok"}
+```
+
+An error is `{"jsonrpc":"2.0","id":...,"error":{"code":-32000,"message":"..."}}`
+— one generic code for now (an unknown method, a missing required param, no
+index yet, no embedding model configured); there's no need for a finer
+error taxonomy until a real client shows up wanting to branch on one.
+
+**Methods**: `status` (index stats + Ollama reachability + scheduler
+target), `agents` (roster: key/display/tagline/tier), `search` (FTS,
+`{query, limit}`), `symbol` (`{name, limit}`), `semantic_search` (`{query,
+limit}`, errors clearly if no embed model/embeddings), `ask` (`{question,
+agent?, files?}`, one non-streaming model call through `build_context_sync`
++ `finish_context` — same retrieval every CLI command uses), `review`
+(`{range?, staged?, agent?}`, single-agent over a real `git diff`, not the
+full `grv review` crew pipeline — kept fast for an editor round-trip),
+`shutdown` (acks then exits; also removes its own socket file so a clean
+shutdown never needs the stale-socket recovery path below).
+
+### Framing/lifecycle details
+
+- **Concurrency**: each accepted connection is its own `tokio::spawn`ed
+  task (`handle_conn`), generic over `AsyncRead + AsyncWrite` so the same
+  handler serves both the Unix listener and the optional `--tcp` one.
+  Model-calling methods acquire a permit from a `LiveScheduler` sized from
+  `cfg.distinct_models()` (same mechanism as `grv swarm`/`mission`, capped
+  at `DAEMON_HARD_CAP = 6` regardless of RAM headroom — an editor is one
+  human's queries, not a swarm, so there's no reason to let it queue more
+  than a handful at once).
+- **Stale socket recovery**: a crashed daemon leaves its socket file
+  behind, which makes `bind` fail with "address in use" even though nothing
+  is listening. `remove_stale_socket` tries `UnixStream::connect` first (a
+  live daemon accepts) and only unlinks the file if that fails — so it
+  never removes a socket a real running daemon still owns.
+- **Unix socket path length**: `SUN_LEN` (~108 bytes on Linux) is a real OS
+  limit, not a GRAVITON one — a deeply nested repo path can exceed it. `grv
+  serve --socket <shorter-path>` sidesteps it; this surfaced during testing
+  (a scratch path under a long tmp directory hit exactly this) and is worth
+  knowing about rather than debugging fresh each time.
+- **No auth on `--tcp`**: fine bound to `127.0.0.1` for local editor use;
+  not something to expose beyond localhost without adding one.
+
 ## What's explicitly *not* built yet (see README roadmap)
 
 - Call-graph edges (`callers`/`callees` beyond a name-match placeholder) —
   needs a second tree-sitter pass resolving call-expression targets against
   the symbol table, including cross-file resolution. Nontrivial, deferred.
-- Agentic loop where the model can issue its own `search`/`symbol` calls
-  mid-answer instead of getting one fixed context injection. This is the
-  highest-value next step for `investigate` on large repos, structured as
-  an explicit roadmap item rather than half-implemented now.
+- `ask`/`investigate`/`crew`/`swarm` still get one fixed retrieval pass up
+  front rather than issuing their own `search_code`/`semantic_search` calls
+  mid-answer — `grv run` and `grv mission`'s leaves already can (see
+  "Tools" above and "Semantic search" above); extending that to the
+  read-only analysis commands is the natural next step.
+- `grv serve`'s `ask`/`review` are one-shot request/response, no streaming
+  and no way to drive a full checkpointed `grv run` session over the socket.

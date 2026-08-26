@@ -242,6 +242,8 @@ grv review                                                        # crew review 
 grv status                         # index stats + Ollama connectivity + live capacity/top-consumers
 grv config --model qwen3:8b --num-ctx 8192 --host http://127.0.0.1:11434
 grv config --model-fast qwen2.5:1.5b --model-deep qwen3:14b        # opt into real multi-model
+grv config --embed-model nomic-embed-text && grv embed             # opt into semantic search
+grv serve                                                          # daemon for editor/IDE integrations
 ```
 
 `ask`/`investigate` take `--agent <architect|sentinel|reaper|singularity>`
@@ -317,7 +319,54 @@ same confirm-before-running gate as `run_shell` (or runs straight through
 under `--yolo`) — a custom tool is a friendlier, self-documenting name and
 argument schema for the model, not a new trust boundary.
 
-## Current scope (v0.9)
+### Semantic search — optional, opt-in, additive
+
+FTS5 (`grv search`/`grv ask`/etc. by default) matches tokens, not meaning —
+a question about "credential verification" won't find a function called
+`check_password` unless the words actually overlap. Semantic search closes
+that gap with embeddings, entirely opt-in:
+
+```sh
+grv config --embed-model nomic-embed-text   # any embedding-capable model you've pulled
+grv embed                                   # embed every indexed chunk (incremental — re-run after `grv index`)
+grv search "credential verification logic" --semantic
+```
+
+Once both are set up, `ask`/`investigate`/`crew`/`swarm`/`mission`/`run`
+automatically add a semantic retrieval pass alongside FTS/symbol hits — no
+flag needed, and silently skipped (not an error) if you never ran `grv
+embed`. `grv run`'s agent also gets `search_code`/`semantic_search` as
+tools it can call mid-task instead of only being handed context up front.
+
+Vectors are stored as BLOBs in `.graviton/index.db` (one `embeddings` row
+per FTS chunk) and ranked by cosine similarity in-process — no ANN index,
+no vector database; at the scale of chunks a single repo actually produces
+this is a non-issue (single-digit milliseconds), and it's one less moving
+part to run locally. `grv embed --force` recomputes everything (e.g. after
+switching embedding models); re-indexing a changed file automatically drops
+its stale embeddings so they never point at chunks that no longer exist.
+
+### `grv serve` — a daemon for editor/IDE integrations
+
+```sh
+grv serve                              # unix socket at .graviton/grv.sock
+grv serve --tcp 127.0.0.1:7420         # also listen on TCP
+```
+
+Runs in the foreground (like `ollama serve`) speaking one JSON object per
+line — JSON-RPC 2.0 over a plain newline-delimited socket, not
+LSP-style `Content-Length` framing, so a three-line script in anything can
+talk to it (`nc -U .graviton/grv.sock` works for manual testing). This
+keeps the index connection and Ollama's warmed-up state alive across
+requests, instead of every editor query paying a fresh `grv` process's
+startup cost. Methods: `status`, `agents`, `search`, `symbol`,
+`semantic_search`, `ask`, `review`, `shutdown` — full request/response
+shapes and an example session are in ARCHITECTURE.md. Model-calling methods
+share a `LiveScheduler` (same design as `swarm`/`mission`), so a chatty
+editor firing several requests at once still can't out-run this machine's
+RAM.
+
+## Current scope (v0.10)
 
 - **Languages with symbol extraction (17):** Rust, Python, JavaScript,
   TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity,
@@ -329,8 +378,9 @@ argument schema for the model, not a new trust boundary.
 - Any other text file is still fully searchable (line-window chunking never
   depends on tree-sitter), it just won't show up in `grv symbol`.
 - **Retrieval:** SQLite FTS5 (bm25) for text, LIKE-based symbol name matching
-  for precise jumps. No embeddings/vector store in v1 — see ARCHITECTURE.md
-  for why that's a deliberate simplification, not an oversight.
+  for precise jumps, plus optional embedding-based semantic search (see
+  above) once `grv config --embed-model` + `grv embed` are set up — off by
+  default, and every command behaves exactly as before if you never opt in.
 - **Single-shot context building:** `ask`/`investigate` run one retrieval
   pass before calling the model. They don't yet let the model ask for more
   context mid-answer (that's the natural v2: give the model a `search`/
@@ -340,9 +390,11 @@ argument schema for the model, not a new trust boundary.
 
 ## Roadmap
 
-- Let agents request more context mid-run instead of one fixed retrieval pass — partially done: `grv mission`'s leaves can already call `web_search`/`web_fetch`/`read_file`/`list_dir` mid-answer (see ARCHITECTURE.md); `ask`/`investigate`/`crew`/`swarm` still don't, and issuing their own `search`/`symbol` calls against the local index (not just the web) is still open
+- Let agents request more context mid-run instead of one fixed retrieval pass — partially done: `grv mission`'s leaves and `grv run` can already call `web_search`/`web_fetch`/`read_file`/`list_dir`/`search_code`/`semantic_search` mid-answer; `ask`/`investigate`/`crew`/`swarm` still only get one fixed retrieval pass up front
 - Call-graph edges (`grv callers`/`grv callees`) from tree-sitter reference queries
 - Incremental re-index on file save (watch mode)
-- Optional local embeddings for semantic (not just lexical) search
 - Kotlin symbol extraction once a crates.io grammar release supports current tree-sitter
 - Per-agent retrieval (each crew stage currently reasons over the same shared context; REAPER asking a differently-shaped question than ARCHITECT could pull in more relevant chunks for each)
+- `grv serve`'s `ask`/`review` are one-shot request/response — no token streaming back to the editor, and no way to drive a full `grv run` agentic session (with its confirm prompts) over the socket yet
+- An ANN index for `grv embed` once a single repo's chunk count grows large enough that the current linear cosine scan actually shows up (not yet observed at any repo size tested)
+- `grv serve --tcp` has no auth — fine bound to 127.0.0.1, not something to expose beyond localhost as-is

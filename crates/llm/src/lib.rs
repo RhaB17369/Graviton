@@ -121,6 +121,17 @@ struct TagsResponse {
     models: Vec<ModelInfo>,
 }
 
+#[derive(Debug, Serialize)]
+struct EmbeddingsRequest<'a> {
+    model: &'a str,
+    prompt: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingsResponse {
+    embedding: Vec<f32>,
+}
+
 /// One turn of a chat completion: either free-text content, or one/more
 /// tool calls the caller is expected to execute and feed back.
 #[derive(Debug, Default)]
@@ -170,6 +181,32 @@ impl OllamaClient {
         }
         let parsed: TagsResponse = resp.json().await.context("parsing /api/tags response")?;
         Ok(parsed.models.into_iter().map(|m| (m.name, m.size / 1024 / 1024)).collect())
+    }
+
+    /// Embed one piece of text with an embedding-capable model (e.g.
+    /// `nomic-embed-text`, `all-minilm`) via Ollama's `/api/embeddings` —
+    /// the foundation for semantic (not just lexical/FTS) search. A model
+    /// with no embedding head (a plain chat model) will error here rather
+    /// than return nonsense; that error is meant to reach the caller.
+    pub async fn embed(&self, model: &str, prompt: &str) -> Result<Vec<f32>> {
+        let url = format!("{}/api/embeddings", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .json(&EmbeddingsRequest { model, prompt })
+            .send()
+            .await
+            .with_context(|| format!("connecting to Ollama at {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Ollama returned HTTP {status} embedding with '{model}': {body}");
+        }
+        let parsed: EmbeddingsResponse = resp.json().await.context("parsing /api/embeddings response")?;
+        if parsed.embedding.is_empty() {
+            bail!("Ollama returned an empty embedding for model '{model}' — is it an embedding model?");
+        }
+        Ok(parsed.embedding)
     }
 
     /// Stream a chat completion, invoking `on_token` for every incremental

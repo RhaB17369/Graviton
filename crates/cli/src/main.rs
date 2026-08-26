@@ -4,9 +4,11 @@ mod browser;
 mod checkpoint;
 mod context;
 mod custom_tools;
+mod daemon;
 mod mission;
 mod permissions;
 mod resources;
+mod semantic;
 mod tools;
 mod web;
 
@@ -41,6 +43,23 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Rank by embedding cosine similarity instead of lexical FTS —
+        /// requires `grv config --embed-model` + `grv embed` first
+        #[arg(long)]
+        semantic: bool,
+    },
+    /// Compute embeddings for indexed code chunks that don't have one yet,
+    /// enabling `grv search --semantic` and semantic retrieval in
+    /// ask/crew/swarm/mission/run. Requires `grv config --embed-model
+    /// <tag>` (a model already pulled in Ollama, e.g. nomic-embed-text or
+    /// all-minilm) unless `--model` overrides it for this run.
+    Embed {
+        /// Recompute every chunk's embedding, not just missing ones
+        #[arg(long)]
+        force: bool,
+        /// Use this embedding model instead of the configured one
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Look up a symbol (function/struct/class/...) by name
     Symbol {
@@ -177,6 +196,9 @@ enum Command {
         /// Larger/stronger model for ModelTier::Deep agents (unset = use `model` for everything)
         #[arg(long)]
         model_deep: Option<String>,
+        /// Embedding model for semantic search (unset = semantic search disabled)
+        #[arg(long)]
+        embed_model: Option<String>,
         #[arg(long)]
         num_ctx: Option<usize>,
         #[arg(long)]
@@ -192,6 +214,19 @@ enum Command {
     Custom {
         #[command(subcommand)]
         action: CustomCommand,
+    },
+    /// Run GRAVITON as a background daemon speaking newline-delimited
+    /// JSON-RPC 2.0 (see ARCHITECTURE.md), for editor/IDE integrations to
+    /// query without spawning a fresh process (and re-opening the index)
+    /// per request. Foreground by default, like `ollama serve` — Ctrl+C or
+    /// a `shutdown` request stops it.
+    Serve {
+        /// Unix socket path (default: <repo>/.graviton/grv.sock)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Also listen on this TCP address, e.g. 127.0.0.1:7420
+        #[arg(long)]
+        tcp: Option<String>,
     },
 }
 
@@ -280,7 +315,8 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Command::Index { path, force } => cmd_index(&cfg, path, force),
-        Command::Search { query, limit } => cmd_search(&cfg, &query, limit),
+        Command::Search { query, limit, semantic } => cmd_search(&cfg, &query, limit, semantic).await,
+        Command::Embed { force, model } => cmd_embed(&cfg, force, model).await,
         Command::Symbol { name, limit } => cmd_symbol(&cfg, &name, limit),
         Command::Ask { question, files, agent } => {
             let spec = resolve_agent(&agent)?;
@@ -322,11 +358,12 @@ async fn main() -> Result<()> {
         Command::Plan { session } => cmd_plan(session),
         Command::Rollback { session, to } => cmd_rollback(session, to),
         Command::Status => cmd_status(&cfg).await,
-        Command::Config { model, model_fast, model_deep, num_ctx, host } => {
-            cmd_config(model, model_fast, model_deep, num_ctx, host)
+        Command::Config { model, model_fast, model_deep, embed_model, num_ctx, host } => {
+            cmd_config(model, model_fast, model_deep, embed_model, num_ctx, host)
         }
         Command::Tool { action } => cmd_tool(&cfg, action),
         Command::Custom { action } => cmd_custom(action),
+        Command::Serve { socket, tcp } => daemon::serve(&cfg, repo_root()?, socket, tcp).await,
     }
 }
 
@@ -351,9 +388,32 @@ fn cmd_index(cfg: &Config, path: Option<PathBuf>, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_search(cfg: &Config, query: &str, limit: usize) -> Result<()> {
+async fn cmd_search(cfg: &Config, query: &str, limit: usize, use_semantic: bool) -> Result<()> {
     let root = repo_root()?;
     let conn = open_repo_db(cfg, &root)?;
+
+    if use_semantic {
+        let model = cfg.embed_model.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("no embedding model configured — set one with `grv config --embed-model <tag>` (e.g. nomic-embed-text), then run `grv embed`")
+        })?;
+        if !semantic::has_embeddings(&conn) {
+            anyhow::bail!("no embeddings computed yet — run `grv embed` first");
+        }
+        let hits = semantic::search(&cfg.ollama_host, &conn, model, query, limit).await?;
+        if hits.is_empty() {
+            println!("no matches");
+            return Ok(());
+        }
+        for h in hits {
+            println!("\x1b[1;36m{}:{}-{}\x1b[0m \x1b[2m(score {:.3})\x1b[0m", h.path, h.start_line, h.end_line, h.score);
+            for line in h.body.lines().take(6) {
+                println!("  {line}");
+            }
+            println!();
+        }
+        return Ok(());
+    }
+
     let blocks = context::search_chunks(&conn, query, limit)?;
     if blocks.is_empty() {
         println!("no matches");
@@ -366,6 +426,20 @@ fn cmd_search(cfg: &Config, query: &str, limit: usize) -> Result<()> {
         }
         println!();
     }
+    Ok(())
+}
+
+async fn cmd_embed(cfg: &Config, force: bool, model_override: Option<String>) -> Result<()> {
+    let root = repo_root()?;
+    let mut conn = open_repo_db(cfg, &root)?;
+    let model = model_override
+        .or_else(|| cfg.embed_model.clone())
+        .ok_or_else(|| anyhow::anyhow!("no embedding model configured — set one with `grv config --embed-model <tag>` (e.g. nomic-embed-text, all-minilm; `ollama pull` it first) or pass `grv embed --model <tag>`"))?;
+    let stats = semantic::embed_index(&cfg.ollama_host, &mut conn, &model, force).await?;
+    println!(
+        "done: {} embedded, {} already up to date, {} failed",
+        stats.embedded, stats.skipped_existing, stats.failed
+    );
     Ok(())
 }
 
@@ -385,17 +459,81 @@ fn cmd_symbol(cfg: &Config, name: &str, limit: usize) -> Result<()> {
 }
 
 /// Retrieve context for `question` (explicit files + symbol hits + FTS
-/// chunks, budgeted to `cfg`'s context window) — shared by `ask`/
-/// `investigate`/`crew` so every agent reasons over the same evidence.
-fn build_context(cfg: &Config, root: &std::path::Path, conn: &rusqlite::Connection, question: &str, files: &[PathBuf]) -> Result<String> {
+/// chunks + semantic hits if embeddings exist, budgeted to `cfg`'s context
+/// window) — shared by `ask`/`investigate`/`crew`/`swarm`/`mission`/`run`
+/// so every agent reasons over the same evidence. Semantic retrieval is
+/// silently skipped (not an error) when no embedding model is configured
+/// or `grv embed` has never been run — this stays a pure improvement, not
+/// a new failure mode, for repos that never opt into it.
+/// The synchronous half of context retrieval — everything that needs
+/// `conn` directly. Split out as a plain (non-async) fn, called separately
+/// from `finish_context` (which does the one async step: embedding the
+/// query, if semantic retrieval applies), because `rusqlite::Connection`
+/// isn't `Sync` and (per rustc, regardless of internal ordering) an async
+/// fn with `&Connection` anywhere in its signature has its returned
+/// future's `Send`-ness poisoned unconditionally. `grv serve` calls these
+/// two directly (see `daemon.rs`) since its request futures are
+/// `tokio::spawn`ed and must be `Send`; `build_context` below is a
+/// convenience wrapper for everyone else (a plain top-level `.await`, not
+/// spawned, so the poisoned signature there is harmless).
+pub(crate) fn build_context_sync(
+    cfg: &Config,
+    root: &std::path::Path,
+    conn: &rusqlite::Connection,
+    question: &str,
+    files: &[PathBuf],
+) -> Result<(Vec<Vec<context::ContextBlock>>, Option<(String, Vec<semantic::EmbeddedChunk>)>)> {
     let explicit: Vec<context::ContextBlock> = files
         .iter()
         .filter_map(|f| context::read_whole_file(root, f))
         .collect();
     let symbol_hits = context::search_symbols(conn, root, question, 8)?;
     let chunk_hits = context::search_chunks(conn, question, 12)?;
+    let groups = vec![explicit, symbol_hits, chunk_hits];
+
+    let semantic_src = match cfg.embed_model.as_deref() {
+        Some(model) if semantic::has_embeddings(conn) => match semantic::load_embeddings(conn, model) {
+            Ok(chunks) => Some((model.to_string(), chunks)),
+            Err(e) => {
+                eprintln!("\x1b[2msemantic retrieval skipped: {e:#}\x1b[0m");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    Ok((groups, semantic_src))
+}
+
+/// The async half: rank the semantic hits (if any) against the question,
+/// and assemble everything into the final budgeted context string. No
+/// `Connection` anywhere in this signature — see `build_context_sync`.
+pub(crate) async fn finish_context(
+    cfg: &Config,
+    question: &str,
+    mut groups: Vec<Vec<context::ContextBlock>>,
+    semantic_src: Option<(String, Vec<semantic::EmbeddedChunk>)>,
+) -> Result<String> {
+    if let Some((model, chunks)) = semantic_src {
+        match semantic::rank_by_query(&cfg.ollama_host, &model, question, chunks, 8).await {
+            Ok(hits) => groups.push(
+                hits.into_iter()
+                    .map(|h| context::ContextBlock {
+                        header: format!("{}:{}-{} (semantic, score {:.2})", h.path, h.start_line, h.end_line, h.score),
+                        body: h.body,
+                    })
+                    .collect(),
+            ),
+            Err(e) => eprintln!("\x1b[2msemantic retrieval skipped: {e:#}\x1b[0m"),
+        }
+    }
     let budget = cfg.context_char_budget();
-    Ok(context::assemble(budget, vec![explicit, symbol_hits, chunk_hits]))
+    Ok(context::assemble(budget, groups))
+}
+
+pub(crate) async fn build_context(cfg: &Config, root: &std::path::Path, conn: &rusqlite::Connection, question: &str, files: &[PathBuf]) -> Result<String> {
+    let (groups, semantic_src) = build_context_sync(cfg, root, conn, question, files)?;
+    finish_context(cfg, question, groups, semantic_src).await
 }
 
 fn agent_system_prompt(agent: &AgentSpec, investigate: bool) -> String {
@@ -427,7 +565,7 @@ async fn run_agent(client: &OllamaClient, cfg: &Config, model: &str, system: &st
 async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &AgentSpec, investigate: bool) -> Result<()> {
     let root = repo_root()?;
     let conn = open_repo_db(cfg, &root)?;
-    let context_text = build_context(cfg, &root, &conn, question, &files)?;
+    let context_text = build_context(cfg, &root, &conn, question, &files).await?;
 
     let system = agent_system_prompt(agent, investigate);
     let user_msg = if context_text.is_empty() {
@@ -447,7 +585,7 @@ async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &Agen
 async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &str) -> Result<()> {
     let root = repo_root()?;
     let conn = open_repo_db(cfg, &root)?;
-    let context_text = build_context(cfg, &root, &conn, question, &files)?;
+    let context_text = build_context(cfg, &root, &conn, question, &files).await?;
     let context_block = if context_text.is_empty() {
         "(No indexed context matched — either run `grv index` first, or this question doesn't map to specific code.)".to_string()
     } else {
@@ -545,7 +683,7 @@ async fn cmd_review(cfg: &Config, range: Option<String>, staged: bool, pipeline:
 async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &str, max_parallel: Option<usize>) -> Result<()> {
     let root = repo_root()?;
     let conn = open_repo_db(cfg, &root)?;
-    let context_text = build_context(cfg, &root, &conn, question, &files)?;
+    let context_text = build_context(cfg, &root, &conn, question, &files).await?;
     let context_block = if context_text.is_empty() {
         "(No indexed context matched — either run `grv index` first, or this question doesn't map to specific code.)".to_string()
     } else {
@@ -609,7 +747,7 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
 async fn cmd_mission(cfg: &Config, task: &str, files: Vec<PathBuf>, max_depth: Option<usize>, max_parallel: Option<usize>) -> Result<()> {
     let root = repo_root()?;
     let conn = open_repo_db(cfg, &root)?;
-    let context_text = build_context(cfg, &root, &conn, task, &files)?;
+    let context_text = build_context(cfg, &root, &conn, task, &files).await?;
     let context_block = if context_text.is_empty() {
         "(No indexed context matched — either run `grv index` first, or this task doesn't map to specific code.)".to_string()
     } else {
@@ -622,7 +760,7 @@ async fn cmd_run(cfg: &Config, task: &str, files: Vec<PathBuf>, agent: &AgentSpe
     let root = repo_root()?;
     let conn = open_or_init_repo_db(cfg, &root)?;
     let context_text = if resume_session.is_none() {
-        build_context(cfg, &root, &conn, task, &files).unwrap_or_default()
+        build_context(cfg, &root, &conn, task, &files).await.unwrap_or_default()
     } else {
         String::new() // unused when resuming — the restored transcript already has the original context
     };
@@ -682,6 +820,10 @@ async fn cmd_status(cfg: &Config) -> Result<()> {
     if let Some(m) = &cfg.model_deep {
         println!("  model_deep  = {m} (deep tier)");
     }
+    match &cfg.embed_model {
+        Some(m) => println!("  embed_model = {m} (semantic search)"),
+        None => println!("  embed_model = <unset> (semantic search disabled — see `grv config --embed-model`)"),
+    }
     println!("  num_ctx     = {}", cfg.num_ctx);
     println!(
         "  context budget ≈ {} chars (~{} tokens)",
@@ -694,7 +836,8 @@ async fn cmd_status(cfg: &Config) -> Result<()> {
             let files: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
             let symbols: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
             let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM content_fts", [], |r| r.get(0))?;
-            println!("index: {files} files, {symbols} symbols, {chunks} chunks");
+            let embedded: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0)).unwrap_or(0);
+            println!("index: {files} files, {symbols} symbols, {chunks} chunks, {embedded} embedded");
         }
         Err(e) => println!("index: {e}"),
     }
@@ -817,6 +960,7 @@ fn cmd_config(
     model: Option<String>,
     model_fast: Option<String>,
     model_deep: Option<String>,
+    embed_model: Option<String>,
     num_ctx: Option<usize>,
     host: Option<String>,
 ) -> Result<()> {
@@ -832,6 +976,10 @@ fn cmd_config(
     }
     if let Some(m) = model_deep {
         cfg.model_deep = (!m.is_empty()).then_some(m);
+        changed = true;
+    }
+    if let Some(m) = embed_model {
+        cfg.embed_model = (!m.is_empty()).then_some(m);
         changed = true;
     }
     if let Some(n) = num_ctx {

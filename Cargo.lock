@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chromiumoxide",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-indexer"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "graviton-core",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "graviton-llm"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "futures-util",

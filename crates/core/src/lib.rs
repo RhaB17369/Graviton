@@ -39,6 +39,12 @@ pub struct Config {
     /// Optional larger/stronger model for `ModelTier::Deep` agents.
     #[serde(default)]
     pub model_deep: Option<String>,
+    /// Optional embedding model (e.g. "nomic-embed-text", "all-minilm") for
+    /// semantic search. Unset means semantic search is simply unavailable —
+    /// `grv search`/`grv ask`/etc. fall back to lexical FTS exactly as
+    /// before, so this is opt-in and never a behavior change by itself.
+    #[serde(default)]
+    pub embed_model: Option<String>,
     /// Context window requested from the model (must fit in RAM as KV cache).
     pub num_ctx: usize,
     /// Fraction of num_ctx reserved for injected code context (0.0-1.0).
@@ -55,6 +61,7 @@ impl Default for Config {
             model: "qwen3:8b".to_string(),
             model_fast: None,
             model_deep: None,
+            embed_model: None,
             num_ctx: 8192,
             context_budget_fraction: 0.55,
             index_dir: ".graviton".to_string(),
@@ -141,6 +148,9 @@ fn toml_to_string(cfg: &Config) -> Result<String> {
     if let Some(m) = &cfg.model_deep {
         out.push_str(&format!("model_deep = \"{m}\"\n"));
     }
+    if let Some(m) = &cfg.embed_model {
+        out.push_str(&format!("embed_model = \"{m}\"\n"));
+    }
     out.push_str(&format!(
         "num_ctx = {}\ncontext_budget_fraction = {}\nindex_dir = \"{}\"\n",
         cfg.num_ctx, cfg.context_budget_fraction, cfg.index_dir
@@ -165,6 +175,7 @@ fn toml_from_str(raw: &str) -> Result<Config> {
             "model" => cfg.model = value.to_string(),
             "model_fast" => cfg.model_fast = (!value.is_empty()).then(|| value.to_string()),
             "model_deep" => cfg.model_deep = (!value.is_empty()).then(|| value.to_string()),
+            "embed_model" => cfg.embed_model = (!value.is_empty()).then(|| value.to_string()),
             "num_ctx" => cfg.num_ctx = value.parse().unwrap_or(cfg.num_ctx),
             "context_budget_fraction" => {
                 cfg.context_budget_fraction = value.parse().unwrap_or(cfg.context_budget_fraction)
@@ -246,6 +257,20 @@ pub fn open_db(path: &Path) -> Result<Connection> {
             body
         );
 
+        -- One row per embedded content_fts chunk (chunk_id = its rowid).
+        -- Not foreign-keyed to content_fts (a virtual fts5 table) -- callers
+        -- that delete/replace chunk rows (indexer re-indexing a changed
+        -- file, clear_index) are responsible for deleting the matching
+        -- embeddings rows too, so this table never silently points at rows
+        -- that no longer exist.
+        CREATE TABLE IF NOT EXISTS embeddings (
+            chunk_id    INTEGER PRIMARY KEY,
+            model       TEXT NOT NULL,
+            dims        INTEGER NOT NULL,
+            vector      BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model);
+
         CREATE TABLE IF NOT EXISTS tool_runs (
             id          INTEGER PRIMARY KEY,
             tool        TEXT NOT NULL,
@@ -266,6 +291,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 pub fn clear_index(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        DELETE FROM embeddings WHERE chunk_id IN (SELECT rowid FROM content_fts WHERE kind != 'tool_output');
         DELETE FROM content_fts WHERE kind != 'tool_output';
         DELETE FROM symbols;
         DELETE FROM files;

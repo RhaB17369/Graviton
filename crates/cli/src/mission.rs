@@ -183,7 +183,7 @@ async fn run_leaf(cfg: &Config, client: &OllamaClient, root: &Path, context_bloc
         messages.push(ChatMessage::assistant_tool_calls(result.tool_calls.clone()));
         for tc in &result.tool_calls {
             println!("\x1b[2m  → {}({})\x1b[0m", tc.function.name, tc.function.arguments);
-            let out = agentic::dispatch_read_only(root, &tc.function.name, &tc.function.arguments).await;
+            let out = agentic::dispatch_read_only(cfg, root, &tc.function.name, &tc.function.arguments).await;
             messages.push(ChatMessage::tool_result(&tc.function.name, out));
         }
     }

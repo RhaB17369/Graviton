@@ -111,6 +111,14 @@ pub fn index_repo(conn: &mut Connection, root: &Path) -> Result<IndexStats> {
 
         let language = Lang::from_path(path);
         let tx = conn.transaction()?;
+        // Any embeddings for this file's old chunks are about to be
+        // orphaned (content_fts rowids aren't stable across a re-index) --
+        // drop them now rather than leave `embeddings` pointing at rows
+        // that no longer exist.
+        tx.execute(
+            "DELETE FROM embeddings WHERE chunk_id IN (SELECT rowid FROM content_fts WHERE path = ?1)",
+            [&rel_path],
+        )?;
         // Replace any previous rows for this file (cascades to symbols).
         tx.execute("DELETE FROM files WHERE path = ?1", [&rel_path])?;
         tx.execute("DELETE FROM content_fts WHERE path = ?1", [&rel_path])?;

@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["kernel-x"]
 license = "MIT"
@@ -20,7 +20,7 @@ serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 ignore = "0.4"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net", "signal"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 futures-util = "0.3"
 tree-sitter = "0.26"
