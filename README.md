@@ -122,6 +122,31 @@ effects (installing a package, starting a server) aren't generically
 undoable, which is exactly why it's confirmed up front instead of promising
 an undo it can't deliver.
 
+**A confirmation prompt isn't just yes/no** — type anything else instead
+and it's read as a redirect: the write/edit/shell call is declined *and*
+what you typed is fed back to the model as the reason, so "no, use a
+different approach" actually reaches the next turn instead of only being
+expressible as a blind refusal.
+
+**Every `grv run` is resumable**, not just the ones you remembered to plan
+for — the full conversation (including every tool call and result) is
+saved to the session automatically:
+
+```sh
+grv run --continue                              # resume the most recent session, no new instruction
+grv run --continue "also add a test for this"   # resume + give it one more thing to do
+grv run --continue --session <id> "..."         # resume a specific (not the latest) session
+```
+
+For anything beyond a one-shot task, the agent is told to maintain a
+visible plan (`update_plan`, shown live as `[ ]`/`[~]`/`[x]` and saved with
+the session):
+
+```sh
+grv plan                # show the most recent session's current plan
+grv plan <session-id>   # show a specific one
+```
+
 Instead of stuffing an entire repository into a context window (impossible
 past a few hundred KLOC anyway), GRAVITON indexes the repo once with
 tree-sitter + SQLite/FTS5, then retrieves only the symbols and chunks

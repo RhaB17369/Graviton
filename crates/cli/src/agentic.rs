@@ -110,6 +110,31 @@ fn tool_defs(enable_browser: bool) -> Vec<ToolDef> {
     let mut tools = read_only_tool_defs();
     tools.extend(vec![
         ToolDef::new(
+            "update_plan",
+            "Report your current step-by-step plan for this task, with a status per step \
+             (pending/in_progress/done). Call this when you form a plan and again whenever it \
+             changes — a step starts, finishes, or the plan itself changes — so progress is \
+             visible to the user watching and saved for `grv run --continue`. Skip it for a \
+             trivial single-step task.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string" },
+                                "status": { "type": "string", "enum": ["pending", "in_progress", "done"] }
+                            },
+                            "required": ["text", "status"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+        ),
+        ToolDef::new(
             "write_file",
             "Create a file or overwrite it entirely with new content. Checkpointed — undoable via `grv rollback`.",
             json!({
@@ -198,17 +223,44 @@ fn tool_defs(enable_browser: bool) -> Vec<ToolDef> {
     tools
 }
 
-fn confirm(auto_approve: bool, action: &str) -> bool {
+/// A confirmation gate's outcome. `Redirect` is the mid-task steering
+/// mechanism: typing anything other than y/n at a confirmation prompt
+/// declines the action *and* carries the typed text back to the model as
+/// the tool result, so "no, do X instead" actually reaches the next turn
+/// instead of only being expressible as a blind yes/no. This only fires at
+/// existing confirmation pauses — a `--yolo` run has none, so it can only
+/// be interrupted with Ctrl-C, which this doesn't change.
+enum Decision {
+    Allow,
+    Deny,
+    Redirect(String),
+}
+
+fn confirm(auto_approve: bool, action: &str) -> Decision {
     if auto_approve {
-        return true;
+        return Decision::Allow;
     }
-    print!("\x1b[1;33m{action}\nallow? [y/N] \x1b[0m");
+    print!("\x1b[1;33m{action}\nallow? [y/N, or type a note to redirect the agent instead] \x1b[0m");
     std::io::stdout().flush().ok();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
+        return Decision::Deny;
     }
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+    match line.trim() {
+        "y" | "Y" | "yes" | "Yes" => Decision::Allow,
+        "" | "n" | "N" | "no" | "No" => Decision::Deny,
+        other => Decision::Redirect(other.to_string()),
+    }
+}
+
+/// Turn a `Decision` into the usual bail-if-not-allowed check, folding a
+/// redirect's text into the error the model sees as this tool's result.
+fn require_allowed(decision: Decision, declined_msg: &str) -> Result<()> {
+    match decision {
+        Decision::Allow => Ok(()),
+        Decision::Deny => anyhow::bail!("{declined_msg}"),
+        Decision::Redirect(note) => anyhow::bail!("{declined_msg} — the user says: {note}"),
+    }
 }
 
 fn resolve_rel(root: &Path, rel: &str) -> Result<PathBuf> {
@@ -276,6 +328,12 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
     };
 
     match name {
+        "update_plan" => {
+            let steps = args.get("steps").cloned().unwrap_or(Value::Array(vec![]));
+            println!("{}", format_plan(&steps));
+            state.checkpoint.save_plan(&json!({ "steps": steps })).ok();
+            Ok(format!("plan updated ({} step(s))", steps.as_array().map(|a| a.len()).unwrap_or(0)))
+        }
         "read_file" => {
             let rel = arg_str("path")?;
             let full = resolve_rel(&state.root, &rel)?;
@@ -294,9 +352,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             let full = resolve_rel(&state.root, &rel)?;
             let old = std::fs::read_to_string(&full).unwrap_or_default();
             let preview = diff_preview(&old, &content);
-            if !confirm(state.auto_approve, &format!("write_file {rel}\n{preview}")) {
-                anyhow::bail!("user declined this write");
-            }
+            require_allowed(confirm(state.auto_approve, &format!("write_file {rel}\n{preview}")), "user declined this write")?;
             state.checkpoint.snapshot_before_write(&rel)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).ok();
@@ -319,9 +375,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             }
             let updated = content.replacen(&old_string, &new_string, 1);
             let preview = diff_preview(&content, &updated);
-            if !confirm(state.auto_approve, &format!("edit_file {rel}\n{preview}")) {
-                anyhow::bail!("user declined this edit");
-            }
+            require_allowed(confirm(state.auto_approve, &format!("edit_file {rel}\n{preview}")), "user declined this edit")?;
             state.checkpoint.snapshot_before_write(&rel)?;
             std::fs::write(&full, &updated).with_context(|| format!("writing {rel}"))?;
             Ok(format!("edited {rel}"))
@@ -332,9 +386,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             if !full.exists() {
                 anyhow::bail!("{rel} doesn't exist");
             }
-            if !confirm(state.auto_approve, &format!("delete_file {rel}")) {
-                anyhow::bail!("user declined this delete");
-            }
+            require_allowed(confirm(state.auto_approve, &format!("delete_file {rel}")), "user declined this delete")?;
             state.checkpoint.snapshot_before_delete(&rel)?;
             std::fs::remove_file(&full).with_context(|| format!("deleting {rel}"))?;
             Ok(format!("deleted {rel}"))
@@ -342,9 +394,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
         "run_shell" => {
             let command = arg_str("command")?;
             let why = args.get("why").and_then(|v| v.as_str()).unwrap_or("");
-            if !confirm(state.auto_approve, &format!("run_shell: {command}\n({why})")) {
-                anyhow::bail!("user declined running this command");
-            }
+            require_allowed(confirm(state.auto_approve, &format!("run_shell: {command}\n({why})")), "user declined running this command")?;
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&command)
@@ -371,9 +421,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
-            if !confirm(state.auto_approve, &format!("recon_tool: {tool} {}", args_list.join(" "))) {
-                anyhow::bail!("user declined running this tool");
-            }
+            require_allowed(confirm(state.auto_approve, &format!("recon_tool: {tool} {}", args_list.join(" "))), "user declined running this tool")?;
             recon_tools::run_and_index(conn, &tool, &args_list)?;
             let output: String = conn
                 .query_row("SELECT output FROM tool_runs ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
@@ -401,6 +449,26 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
     }
 }
 
+/// Render the agent's self-reported plan as a checklist for the terminal —
+/// the visible task-progress view for a long `grv run`.
+pub(crate) fn format_plan(steps: &Value) -> String {
+    let Some(steps) = steps.as_array() else {
+        return String::new();
+    };
+    let mut out = String::from("\x1b[1;36mplan:\x1b[0m\n");
+    for step in steps {
+        let text = step.get("text").and_then(|v| v.as_str()).unwrap_or("?");
+        let status = step.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+        let mark = match status {
+            "done" => "[x]",
+            "in_progress" => "[~]",
+            _ => "[ ]",
+        };
+        out.push_str(&format!("  {mark} {text}\n"));
+    }
+    out
+}
+
 fn list_dir(path: &Path, recursive: bool) -> Result<String> {
     let mut out = String::new();
     let walker = ignore::WalkBuilder::new(path)
@@ -420,6 +488,13 @@ fn list_dir(path: &Path, recursive: bool) -> Result<String> {
 
 /// Run the agentic loop: `agent` answers `task`, with tools, until it stops
 /// calling them or `MAX_STEPS` is hit.
+///
+/// `resume_session`: if set, reopen that checkpoint session (so file-change
+/// step numbering keeps counting up, not restarting at 0) and restore its
+/// saved conversation transcript instead of starting fresh. `task` becomes
+/// an *additional* instruction appended after the restored history — pass
+/// an empty string to just continue the loop from wherever it left off
+/// (e.g. it hit `MAX_STEPS` last time) with no new instruction.
 pub async fn run(
     cfg: &Config,
     conn: &rusqlite::Connection,
@@ -428,39 +503,65 @@ pub async fn run(
     task: &str,
     initial_context: Option<String>,
     loop_cfg: AgentLoopConfig,
+    resume_session: Option<String>,
 ) -> Result<()> {
     let tools = tool_defs(loop_cfg.enable_browser);
-    let mut state = State {
-        root: root.to_path_buf(),
-        checkpoint: checkpoint::Session::new(root)?,
-        auto_approve: loop_cfg.auto_approve,
-        browser: None,
+
+    let (mut state, mut messages, resumed) = match &resume_session {
+        Some(id) => {
+            let checkpoint = checkpoint::Session::open_existing(root, id)?;
+            let restored = checkpoint::load_transcript(root, id)?;
+            (
+                State { root: root.to_path_buf(), checkpoint, auto_approve: loop_cfg.auto_approve, browser: None },
+                restored,
+                true,
+            )
+        }
+        None => (
+            State { root: root.to_path_buf(), checkpoint: checkpoint::Session::new(root)?, auto_approve: loop_cfg.auto_approve, browser: None },
+            Vec::new(),
+            false,
+        ),
     };
 
     println!("\x1b[2mcheckpoint session: {}\x1b[0m", state.checkpoint.id);
 
-    let system = format!(
-        "{}\n\nYou have tools to read/write/edit/delete files, run shell commands, \
-         run recon tools, search the web and fetch pages, and (if offered) drive a \
-         headless browser — use them; don't just describe what you'd do. Paths are \
-         relative to the repo root. File writes/edits/deletes and shell commands are \
-         confirmed with the user before they happen, so propose them directly rather \
-         than asking permission in text first. Use web_search/web_fetch whenever the \
-         task depends on something that could have changed since your training — a \
-         library's current API, a recent CVE, a best practice — instead of answering \
-         from memory and risking an obsolete technique; a wrong answer that looks \
-         current is worse than admitting you need to check. When the task is \
-         complete, stop calling tools and give a final summary of what you did and \
-         the result.",
-        agent.system_prompt
-    );
+    if resumed {
+        println!("\x1b[2mresumed — {} prior message(s) restored\x1b[0m", messages.len());
+        if let Ok(Some(plan)) = checkpoint::load_plan(root, &state.checkpoint.id) {
+            println!("{}", format_plan(plan.get("steps").unwrap_or(&plan)));
+        }
+    }
 
-    let mut messages = vec![ChatMessage::system(system)];
-    let user_msg = match initial_context {
-        Some(ctx) if !ctx.is_empty() => format!("Task: {task}\n\nRetrieved context:\n{ctx}"),
-        _ => format!("Task: {task}"),
-    };
-    messages.push(ChatMessage::user(user_msg));
+    if messages.is_empty() {
+        // Fresh run (or a resume of a session with no saved transcript,
+        // e.g. one from before this feature existed) — build the initial
+        // system + user turn as before.
+        let system = format!(
+            "{}\n\nYou have tools to read/write/edit/delete files, run shell commands, \
+             run recon tools, search the web and fetch pages, report your plan, and (if \
+             offered) drive a headless browser — use them; don't just describe what you'd \
+             do. Paths are relative to the repo root. File writes/edits/deletes and shell \
+             commands are confirmed with the user before they happen, so propose them \
+             directly rather than asking permission in text first. Use web_search/\
+             web_fetch whenever the task depends on something that could have changed \
+             since your training — a library's current API, a recent CVE, a best \
+             practice — instead of answering from memory and risking an obsolete \
+             technique; a wrong answer that looks current is worse than admitting you \
+             need to check. Use update_plan for any task with more than one real step, \
+             and keep it current. When the task is complete, stop calling tools and give \
+             a final summary of what you did and the result.",
+            agent.system_prompt
+        );
+        push_and_record(&mut messages, &state, ChatMessage::system(system));
+        let user_msg = match initial_context {
+            Some(ctx) if !ctx.is_empty() => format!("Task: {task}\n\nRetrieved context:\n{ctx}"),
+            _ => format!("Task: {task}"),
+        };
+        push_and_record(&mut messages, &state, ChatMessage::user(user_msg));
+    } else if !task.trim().is_empty() {
+        push_and_record(&mut messages, &state, ChatMessage::user(format!("Additional instruction: {task}")));
+    }
 
     let client = OllamaClient::new(&cfg.ollama_host);
     println!("\x1b[1;35m═══ {} (agentic) ═══\x1b[0m", agent.display);
@@ -477,25 +578,37 @@ pub async fn run(
         println!();
 
         if result.tool_calls.is_empty() {
+            push_and_record(&mut messages, &state, ChatMessage::assistant(result.content));
             print_checkpoint_summary(&state);
             return Ok(());
         }
 
-        messages.push(ChatMessage::assistant_tool_calls(clone_tool_calls(&result.tool_calls)));
+        push_and_record(&mut messages, &state, ChatMessage::assistant_tool_calls(clone_tool_calls(&result.tool_calls)));
         for call in &result.tool_calls {
             let name = &call.function.name;
             println!("\x1b[2m→ {name}({})\x1b[0m", call.function.arguments);
             let output = dispatch(&mut state, conn, name, &call.function.arguments).await;
             println!("\x1b[2m← {}\x1b[0m", truncate_display(&output));
-            messages.push(ChatMessage::tool_result(name.clone(), output));
+            push_and_record(&mut messages, &state, ChatMessage::tool_result(name.clone(), output));
         }
 
         if step == MAX_STEPS - 1 {
-            println!("\x1b[1;31m[stopped: reached the {MAX_STEPS}-step limit for this run]\x1b[0m");
+            println!(
+                "\x1b[1;31m[stopped: reached the {MAX_STEPS}-step limit for this run — \
+                 `grv run --continue {}` to keep going]\x1b[0m",
+                state.checkpoint.id
+            );
         }
     }
     print_checkpoint_summary(&state);
     Ok(())
+}
+
+/// Push a message onto the in-memory conversation *and* the session's
+/// on-disk transcript in one call, so the two can never drift apart.
+fn push_and_record(messages: &mut Vec<ChatMessage>, state: &State, msg: ChatMessage) {
+    state.checkpoint.append_message(&msg);
+    messages.push(msg);
 }
 
 fn print_checkpoint_summary(state: &State) {

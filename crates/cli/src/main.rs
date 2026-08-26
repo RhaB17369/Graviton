@@ -114,7 +114,10 @@ enum Command {
     /// confirmed unless --yolo is set; file changes are checkpointed
     /// (`grv rollback` undoes them).
     Run {
-        task: String,
+        /// Required unless --continue is given a session with existing history
+        /// (in which case this is treated as an additional instruction, or
+        /// omitted entirely to just resume where it left off)
+        task: Option<String>,
         #[arg(long = "file")]
         files: Vec<PathBuf>,
         #[arg(long, default_value = "architect")]
@@ -125,9 +128,21 @@ enum Command {
         /// Offer browser_navigate/eval/screenshot/console tools (launches headless Chromium on first use)
         #[arg(long)]
         browser: bool,
+        /// Resume a previous session's conversation instead of starting fresh
+        /// (most recent session unless --session is also given)
+        #[arg(long = "continue")]
+        resume: bool,
+        /// Session id to resume (with --continue) — defaults to the most recent
+        #[arg(long)]
+        session: Option<String>,
     },
     /// List `grv run` checkpoint sessions
     Checkpoints,
+    /// Show a session's latest self-reported plan (from `update_plan`)
+    Plan {
+        /// Session id from `grv checkpoints` (defaults to the most recent one)
+        session: Option<String>,
+    },
     /// Undo a `grv run` session's file changes (all of it, or back to one step)
     Rollback {
         /// Session id from `grv checkpoints` (defaults to the most recent one)
@@ -256,11 +271,24 @@ async fn main() -> Result<()> {
         Command::Mission { task, files, max_depth, max_parallel } => {
             cmd_mission(&cfg, &task, files, max_depth, max_parallel).await
         }
-        Command::Run { task, files, agent, yolo, browser } => {
+        Command::Run { task, files, agent, yolo, browser, resume, session } => {
             let spec = resolve_agent(&agent)?;
-            cmd_run(&cfg, &task, files, spec, yolo, browser).await
+            let resume_session = if resume {
+                Some(match session {
+                    Some(id) => id,
+                    None => checkpoint::most_recent_session(&repo_root()?)?
+                        .ok_or_else(|| anyhow::anyhow!("no checkpoint sessions to continue — run `grv run` once first"))?,
+                })
+            } else {
+                None
+            };
+            if resume_session.is_none() && task.as_deref().unwrap_or("").trim().is_empty() {
+                anyhow::bail!("a task is required unless --continue is given");
+            }
+            cmd_run(&cfg, &task.unwrap_or_default(), files, spec, yolo, browser, resume_session).await
         }
         Command::Checkpoints => cmd_checkpoints(),
+        Command::Plan { session } => cmd_plan(session),
         Command::Rollback { session, to } => cmd_rollback(session, to),
         Command::Status => cmd_status(&cfg).await,
         Command::Config { model, model_fast, model_deep, num_ctx, host } => {
@@ -517,12 +545,16 @@ async fn cmd_mission(cfg: &Config, task: &str, files: Vec<PathBuf>, max_depth: O
     mission::run(cfg, &root, context_block, task, max_depth, max_parallel).await
 }
 
-async fn cmd_run(cfg: &Config, task: &str, files: Vec<PathBuf>, agent: &AgentSpec, yolo: bool, browser: bool) -> Result<()> {
+async fn cmd_run(cfg: &Config, task: &str, files: Vec<PathBuf>, agent: &AgentSpec, yolo: bool, browser: bool, resume_session: Option<String>) -> Result<()> {
     let root = repo_root()?;
     let conn = open_or_init_repo_db(cfg, &root)?;
-    let context_text = build_context(cfg, &root, &conn, task, &files).unwrap_or_default();
+    let context_text = if resume_session.is_none() {
+        build_context(cfg, &root, &conn, task, &files).unwrap_or_default()
+    } else {
+        String::new() // unused when resuming — the restored transcript already has the original context
+    };
     let loop_cfg = agentic::AgentLoopConfig { auto_approve: yolo, enable_browser: browser };
-    agentic::run(cfg, &conn, &root, agent, task, Some(context_text), loop_cfg).await
+    agentic::run(cfg, &conn, &root, agent, task, Some(context_text), loop_cfg, resume_session).await
 }
 
 fn cmd_checkpoints() -> Result<()> {
@@ -534,6 +566,20 @@ fn cmd_checkpoints() -> Result<()> {
     }
     for s in sessions {
         println!("{:<20} {} step(s), {} file(s) touched", s.id, s.steps, s.files_touched);
+    }
+    Ok(())
+}
+
+fn cmd_plan(session: Option<String>) -> Result<()> {
+    let root = repo_root()?;
+    let session_id = match session {
+        Some(s) => s,
+        None => checkpoint::most_recent_session(&root)?
+            .ok_or_else(|| anyhow::anyhow!("no checkpoint sessions yet — they're created by `grv run`"))?,
+    };
+    match checkpoint::load_plan(&root, &session_id)? {
+        Some(plan) => println!("{}", agentic::format_plan(plan.get("steps").unwrap_or(&plan))),
+        None => println!("session {session_id} has no saved plan (the agent never called update_plan)"),
     }
     Ok(())
 }

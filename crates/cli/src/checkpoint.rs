@@ -57,6 +57,47 @@ impl Session {
         Ok(Self { id, dir, root: root.to_path_buf(), manifest_path, next_seq: 0 })
     }
 
+    /// Reopen a session by id — for `grv run --continue`, so file-change
+    /// step numbering (and thus `--to N` rollback) keeps counting up from
+    /// where the previous invocation left off instead of restarting at 0
+    /// and risking two different steps sharing a sequence number.
+    pub fn open_existing(root: &Path, id: &str) -> Result<Self> {
+        let dir = checkpoints_root(root).join(id);
+        if !dir.exists() {
+            anyhow::bail!("no checkpoint session '{id}' — run `grv checkpoints` to list sessions");
+        }
+        let manifest_path = dir.join("manifest.jsonl");
+        let next_seq = read_manifest(&dir)?.iter().map(|e| e.seq + 1).max().unwrap_or(0);
+        Ok(Self { id: id.to_string(), dir, root: root.to_path_buf(), manifest_path, next_seq })
+    }
+
+    /// Append one message to this session's conversation transcript — the
+    /// full history `grv run --continue` restores. Errors are logged, not
+    /// propagated: losing the ability to resume shouldn't abort a run that
+    /// is otherwise working.
+    pub fn append_message(&self, msg: &graviton_llm::ChatMessage) {
+        let path = self.dir.join("transcript.jsonl");
+        let line = match serde_json::to_string(msg) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("failed to serialize message for session transcript: {e}");
+                return;
+            }
+        };
+        use std::io::Write;
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// Persist the agent's latest self-reported plan (`update_plan` tool),
+    /// overwriting any previous one — this is a current-state snapshot, not
+    /// a log.
+    pub fn save_plan(&self, plan: &serde_json::Value) -> Result<()> {
+        fs::write(self.dir.join("plan.json"), serde_json::to_string_pretty(plan)?)?;
+        Ok(())
+    }
+
     /// Record the pre-change state of `rel_path` (relative to the repo
     /// root) and return the action it should be logged under, based on
     /// whether the file exists yet. Call this *before* the tool actually
@@ -111,6 +152,36 @@ pub struct SessionSummary {
     pub id: String,
     pub steps: usize,
     pub files_touched: usize,
+}
+
+/// The most recently created session id, if any — `list_sessions` already
+/// sorts by directory name, which sorts by timestamp since ids are
+/// `<unix_secs>-<hex>`.
+pub fn most_recent_session(root: &Path) -> Result<Option<String>> {
+    Ok(list_sessions(root)?.into_iter().last().map(|s| s.id))
+}
+
+/// Restore a session's full conversation history — `grv run --continue`'s
+/// entry point. Missing/corrupt lines are skipped rather than failing the
+/// whole resume, since a transcript is an append-only best-effort log, not
+/// a database with transactional guarantees.
+pub fn load_transcript(root: &Path, id: &str) -> Result<Vec<graviton_llm::ChatMessage>> {
+    let path = checkpoints_root(root).join(id).join("transcript.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path)?;
+    Ok(raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+}
+
+/// The agent's last self-reported plan for a session, if it ever called
+/// `update_plan`.
+pub fn load_plan(root: &Path, id: &str) -> Result<Option<serde_json::Value>> {
+    let path = checkpoints_root(root).join(id).join("plan.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&fs::read_to_string(&path)?)?))
 }
 
 fn read_manifest(dir: &Path) -> Result<Vec<ManifestEntry>> {

@@ -478,6 +478,57 @@ safety net for `run_shell` rather than promising a rollback the system
 can't actually guarantee — being honest about that boundary matters more
 than making the feature look more complete than it is.
 
+### Session resumability, a visible plan, and mid-task steering
+
+Three related gaps closed together, since they share the same
+infrastructure — a checkpoint session already existed per `grv run`
+invocation to track file changes, so it's the natural place to also store
+the conversation itself:
+
+- **`grv run --continue [--session <id>] ["additional instruction"]`**
+  (`checkpoint::Session::open_existing`, `append_message`/`load_transcript`)
+  restores a session's full message history — every system/user/assistant/
+  tool-result message, not just a summary — instead of starting cold.
+  `push_and_record` (a thin wrapper the loop calls instead of
+  `messages.push` directly) writes every message to `.graviton/
+  checkpoints/<id>/transcript.jsonl` as it happens, so *every* `grv run` is
+  resumable by default, not just ones a user thought to flag in advance.
+  `open_existing` also recomputes `next_seq` from the existing manifest
+  (max seq + 1) rather than restarting at 0, so file-change step numbers
+  never collide with the previous invocation's — `--to N` rollback stays
+  correct across a resume. `ChatMessage` gained `Deserialize` (previously
+  serialize-only, since it only ever went out over HTTP to Ollama) to make
+  this round-trip possible.
+- **A visible, persisted plan** (`update_plan` tool, `crates/cli/src/
+  agentic.rs`'s `format_plan`): the agent reports a list of `{text,
+  status}` steps whenever it forms or updates a plan; GRAVITON prints it as
+  a `[ ]`/`[~]`/`[x]` checklist immediately and saves the latest snapshot
+  to `plan.json` in the session dir. `grv plan [session]` shows it outside
+  a live run, and `--continue` prints it up front so resuming shows where
+  things stood before asking the model anything. This is deliberately a
+  self-reported tool call, not a structure GRAVITON infers from tool-call
+  history — inferring "the plan" from a stream of `write_file`/`run_shell`
+  calls after the fact would be guesswork; asking the model to state it
+  costs one extra tool definition and is unambiguous.
+- **Mid-task steering through existing confirmation gates**
+  (`agentic::Decision`/`require_allowed`): a confirmation prompt no longer
+  just parses y/n — anything else typed is a `Decision::Redirect(text)`
+  that declines the action *and* carries the typed text into the tool
+  result the model sees next ("user declined this write — the user says:
+  <text>"), so "no, do X instead" reaches the next turn as real guidance
+  instead of only being expressible as a blind refusal. This is
+  deliberately scoped to existing pause points, not a general interrupt: a
+  `--yolo` run has no confirmation gates to redirect at, so it remains
+  Ctrl-C-only, and there's no mechanism to interject while a model call is
+  actually in flight (mid-generation). Solving that would need racing
+  stdin against the HTTP response (`tokio::select!`) and is a reasonable
+  next step, not something this claims to already do.
+
+`grv mission` does not (yet) share this — its tree-shaped, concurrent
+execution doesn't map onto one linear transcript the way `grv run`'s
+single-agent loop does, so resuming a partially-completed mission is left
+as future work rather than half-implemented.
+
 ## What's explicitly *not* built yet (see README roadmap)
 
 - Call-graph edges (`callers`/`callees` beyond a name-match placeholder) —
