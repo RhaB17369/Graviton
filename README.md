@@ -233,7 +233,43 @@ sandbox — it runs exactly what you typed with your own permissions, same as
 typing it in the shell; the whitelist just keeps `tool run` scoped to recon
 tools rather than becoming a second shell.
 
-## Current scope (v0.6)
+### Custom tools — extend `grv run` without recompiling
+
+`agentic.rs`'s tool roster (read/write/shell/recon/web/browser) is fixed in
+the binary, but you're not limited to it: drop a TOML file in
+`~/.config/graviton/tools/` (every project) or `.graviton/tools/` (this
+project only, shareable via the repo) and it's a tool the very next
+`grv run` invocation:
+
+```sh
+grv custom new docker_ps          # scaffolds .graviton/tools/docker_ps.toml
+grv custom list                   # every loaded custom tool + where it's from
+grv custom show docker_ps         # the exact schema the model would see
+```
+
+A custom tool is a named, described, parameterized shell command
+template — `{{param}}` gets substituted with that argument's value
+(shell-quoted for you, so a value like `it's; rm -rf /` lands as one inert
+literal argument, not a second command):
+
+```toml
+name = "docker_ps"
+description = "List running Docker containers, optionally filtered by name"
+command = "docker ps {{flags}}"
+
+[[params]]
+name = "flags"
+description = "extra docker ps flags, e.g. '-a' for stopped containers too"
+required = false
+default = ""
+```
+
+Under the hood it's still a shell command, so it goes through the exact
+same confirm-before-running gate as `run_shell` (or runs straight through
+under `--yolo`) — a custom tool is a friendlier, self-documenting name and
+argument schema for the model, not a new trust boundary.
+
+## Current scope (v0.8)
 
 - **Languages with symbol extraction (17):** Rust, Python, JavaScript,
   TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity,

@@ -529,6 +529,61 @@ execution doesn't map onto one linear transcript the way `grv run`'s
 single-agent loop does, so resuming a partially-completed mission is left
 as future work rather than half-implemented.
 
+### Custom tools (`crates/cli/src/custom_tools.rs`) — extensibility without recompiling
+
+`tool_defs` in `agentic.rs` is a fixed Rust function — real extensibility
+needs a way to add a tool without touching that function or rebuilding
+the binary. The design lands on the simplest thing that's actually useful:
+a custom tool is a TOML file describing a named, described, parameterized
+**shell command template** — `{{param}}` placeholders substituted with
+that argument's value at call time.
+
+- **Why a command template instead of a richer plugin API** (WASM module,
+  dynamically loaded `.so`, subprocess-as-tool-server): a shell command is
+  the one execution primitive GRAVITON already fully trusts and has a
+  safety story for (`run_shell` already lets the model run arbitrary
+  shell, gated by `confirm`/`--yolo`) — a custom tool is a friendlier,
+  named, schema'd wrapper around exactly that trust boundary, not a new
+  one. A WASM/plugin ABI would be more powerful (real logic, not just
+  shell composition) and is a reasonable v2, but it's a materially bigger
+  surface (a sandboxing story of its own) for a feature whose actual ask
+  was "add a tool without recompiling," which a text file already solves.
+- **Loading**: `custom_tools::load_all(root)` scans `~/.config/graviton/
+  tools/*.toml` (every project) then `<root>/.graviton/tools/*.toml` (this
+  project, shareable via the repo), parsing each with the real `toml`
+  crate (added as a dependency for this specifically — unlike
+  `graviton_core::Config`'s hand-rolled flat TOML, user-authored files
+  with nested `[[params]]` tables deserve a real parser instead of a
+  hand-rolled one silently mis-parsing an edge case). A bad file is a
+  stderr warning naming the file, not a reason to abort `grv run` — one
+  broken tool definition shouldn't take down an otherwise-working session.
+  A project-local tool overrides a global one of the same name (loaded
+  second into the same by-name map).
+- **Argument substitution is shell-quoted, not string-interpolated**:
+  `render_command` wraps every substituted value in single quotes,
+  escaping embedded `'` — verified during development that a value like
+  `it's; rm -rf /` lands as one inert literal argument to the underlying
+  command instead of terminating it and injecting a second one. This
+  matters because the *value* comes from the model's tool-call arguments,
+  which is a less trusted source than the *command template* itself
+  (author-written, checked into the repo).
+- **Dispatch**: `agentic::dispatch_inner`'s final `other =>` arm (previously
+  just "unknown tool") now checks the loaded custom-tool registry before
+  giving up; a match renders the command and runs it through the same
+  `confirm`/`require_allowed` gate and subprocess execution as
+  `run_shell`, so it's confirmed before running unless `--yolo`, same as
+  everything else that acts.
+- **Discoverability**: `grv custom list` shows every loaded tool and which
+  file it came from; `grv custom new <name>` scaffolds a working example
+  (not a blank file) at `.graviton/tools/<name>.toml`; `grv custom show
+  <name>` prints the exact `ToolDef`/JSON-schema the model would be given,
+  so "will the model understand this argument" is checkable before
+  running anything.
+- **Scope**: custom tools are `grv run`-only, like the rest of the acting
+  tool roster — `mission`'s leaves stay on the read-only subset
+  (`read_only_tool_defs`) by design (§ above), and a shell-command tool is
+  definitionally not read-only.
+
 ## What's explicitly *not* built yet (see README roadmap)
 
 - Call-graph edges (`callers`/`callees` beyond a name-match placeholder) —

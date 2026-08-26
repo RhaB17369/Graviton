@@ -22,6 +22,8 @@ chromiumoxide = { version = "0.9" }
 similar = "3"
 sysinfo = { workspace = true }
 reqwest = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
 
 graviton-core = { path = "../core" }
 graviton-indexer = { path = "../indexer" }

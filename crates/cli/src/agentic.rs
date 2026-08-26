@@ -11,6 +11,7 @@
 use crate::agents::AgentSpec;
 use crate::browser::BrowserSession;
 use crate::checkpoint;
+use crate::custom_tools::{self, CustomTool};
 use crate::tools as recon_tools;
 use crate::web;
 use anyhow::{Context, Result};
@@ -33,6 +34,7 @@ struct State {
     checkpoint: checkpoint::Session,
     auto_approve: bool,
     browser: Option<BrowserSession>,
+    custom_tools: Vec<CustomTool>,
 }
 
 /// The read-only subset of the tool roster — no file writes/shell/recon,
@@ -106,7 +108,7 @@ pub(crate) async fn dispatch_read_only(root: &Path, name: &str, args: &Value) ->
     }
 }
 
-fn tool_defs(enable_browser: bool) -> Vec<ToolDef> {
+fn tool_defs(enable_browser: bool, custom: &[CustomTool]) -> Vec<ToolDef> {
     let mut tools = read_only_tool_defs();
     tools.extend(vec![
         ToolDef::new(
@@ -220,6 +222,7 @@ fn tool_defs(enable_browser: bool) -> Vec<ToolDef> {
         ));
     }
 
+    tools.extend(custom.iter().map(CustomTool::to_tool_def));
     tools
 }
 
@@ -445,7 +448,26 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
                 _ => unreachable!(),
             }
         }
-        other => anyhow::bail!("unknown tool '{other}'"),
+        other => {
+            let Some(tool) = custom_tools::find(&state.custom_tools, other).cloned() else {
+                anyhow::bail!("unknown tool '{other}'");
+            };
+            let command = tool.render_command(args)?;
+            require_allowed(
+                confirm(state.auto_approve, &format!("custom tool '{}': {command}", tool.name)),
+                &format!("user declined running custom tool '{}'", tool.name),
+            )?;
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&state.root)
+                .output()
+                .with_context(|| format!("running custom tool '{}'", tool.name))?;
+            let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+            combined.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
+            Ok(truncate(combined))
+        }
     }
 }
 
@@ -505,20 +527,24 @@ pub async fn run(
     loop_cfg: AgentLoopConfig,
     resume_session: Option<String>,
 ) -> Result<()> {
-    let tools = tool_defs(loop_cfg.enable_browser);
+    let custom = custom_tools::load_all(root);
+    if !custom.is_empty() {
+        println!("\x1b[2mcustom tools loaded: {}\x1b[0m", custom.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    let tools = tool_defs(loop_cfg.enable_browser, &custom);
 
     let (mut state, mut messages, resumed) = match &resume_session {
         Some(id) => {
             let checkpoint = checkpoint::Session::open_existing(root, id)?;
             let restored = checkpoint::load_transcript(root, id)?;
             (
-                State { root: root.to_path_buf(), checkpoint, auto_approve: loop_cfg.auto_approve, browser: None },
+                State { root: root.to_path_buf(), checkpoint, auto_approve: loop_cfg.auto_approve, browser: None, custom_tools: custom },
                 restored,
                 true,
             )
         }
         None => (
-            State { root: root.to_path_buf(), checkpoint: checkpoint::Session::new(root)?, auto_approve: loop_cfg.auto_approve, browser: None },
+            State { root: root.to_path_buf(), checkpoint: checkpoint::Session::new(root)?, auto_approve: loop_cfg.auto_approve, browser: None, custom_tools: custom },
             Vec::new(),
             false,
         ),

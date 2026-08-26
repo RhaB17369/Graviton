@@ -3,6 +3,7 @@ mod agents;
 mod browser;
 mod checkpoint;
 mod context;
+mod custom_tools;
 mod mission;
 mod resources;
 mod tools;
@@ -173,6 +174,22 @@ enum Command {
         #[command(subcommand)]
         action: ToolCommand,
     },
+    /// Manage `grv run`'s user-defined tools (TOML files, no recompiling —
+    /// see ARCHITECTURE.md for the format)
+    Custom {
+        #[command(subcommand)]
+        action: CustomCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CustomCommand {
+    /// List every loaded custom tool (global + this project) and where it came from
+    List,
+    /// Scaffold a new custom tool at .graviton/tools/<name>.toml, ready to edit
+    New { name: String },
+    /// Print one custom tool's parsed definition (schema the model would see)
+    Show { name: String },
 }
 
 #[derive(Subcommand)]
@@ -295,6 +312,7 @@ async fn main() -> Result<()> {
             cmd_config(model, model_fast, model_deep, num_ctx, host)
         }
         Command::Tool { action } => cmd_tool(&cfg, action),
+        Command::Custom { action } => cmd_custom(action),
     }
 }
 
@@ -699,6 +717,42 @@ fn cmd_tool(cfg: &Config, action: ToolCommand) -> Result<()> {
                 |r| r.get(0),
             ).with_context(|| format!("no tool run #{id}"))?;
             print!("{output}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_custom(action: CustomCommand) -> Result<()> {
+    let root = repo_root()?;
+    match action {
+        CustomCommand::List => {
+            let tools = custom_tools::load_all(&root);
+            if tools.is_empty() {
+                println!(
+                    "no custom tools loaded — put a .toml file in ~/.config/graviton/tools/ \
+                     or .graviton/tools/ (try `grv custom new <name>`)"
+                );
+            }
+            for t in tools {
+                println!("{:<20} {}\n  {}\n  ({})", t.name, t.description, t.command, t.source.display());
+            }
+        }
+        CustomCommand::New { name } => {
+            let dir = root.join(".graviton").join("tools");
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(format!("{name}.toml"));
+            if path.exists() {
+                anyhow::bail!("{} already exists", path.display());
+            }
+            std::fs::write(&path, custom_tools::scaffold(&name))?;
+            println!("wrote {} — edit it, then `grv custom show {name}` to check it loads", path.display());
+        }
+        CustomCommand::Show { name } => {
+            let tools = custom_tools::load_all(&root);
+            match custom_tools::find(&tools, &name) {
+                Some(t) => println!("{:#?}", t.to_tool_def()),
+                None => anyhow::bail!("no loaded custom tool named '{name}' — `grv custom list` to see what's loaded"),
+            }
         }
     }
     Ok(())
