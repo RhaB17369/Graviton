@@ -23,7 +23,9 @@ use graviton_core::Config;
 use graviton_llm::{ChatMessage, OllamaClient};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -32,6 +34,45 @@ use tokio::net::{TcpListener, UnixListener, UnixStream};
 /// RAM headroom -- an editor is one human's queries, not a swarm; there's
 /// no reason to let it queue up more than a handful at once.
 const DAEMON_HARD_CAP: usize = 6;
+
+/// `sockaddr_un.sun_path` is 108 bytes on Linux including the null
+/// terminator (~104 on macOS/BSD); kept well under either rather than
+/// cutting it exactly to one platform's limit.
+const MAX_SOCKET_PATH_LEN: usize = 100;
+
+/// Where the socket lives when `--socket` isn't given: a short, stable
+/// path under `$XDG_RUNTIME_DIR` (falling back to the system temp dir),
+/// named by a hash of the repo root + index dir -- not
+/// `<repo>/.graviton/grv.sock`, because a repo nested a few directories
+/// past a long home/project path routinely exceeds the ~100-byte Unix
+/// socket path limit (hit during testing, under a long scratch tmp path).
+/// One repo -> one reused name across restarts; `remove_stale_socket`
+/// still protects against a leftover file from a crashed daemon.
+fn default_socket_path(root: &Path, index_dir: &str) -> PathBuf {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    index_dir.hash(&mut hasher);
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    base.join("grv").join(format!("{:016x}.sock", hasher.finish()))
+}
+
+/// Reject a too-long socket path up front with a message that says what to
+/// do about it, instead of letting `bind` fail with the OS's bare "path
+/// must be shorter than SUN_LEN" -- which is exactly what an *explicit*
+/// `--socket` under a deep path can still hit even with the short default
+/// above.
+fn check_socket_path_len(path: &Path) -> Result<()> {
+    let len = path.as_os_str().len();
+    if len > MAX_SOCKET_PATH_LEN {
+        anyhow::bail!(
+            "socket path is {len} bytes, too long for a Unix socket (~100-byte OS limit): {}\n\
+             pass a shorter one, e.g. `grv serve --socket /tmp/grv.sock`",
+            path.display()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 struct RpcRequest {
@@ -61,7 +102,8 @@ impl DaemonCtx {
 }
 
 pub async fn serve(cfg: &Config, root: PathBuf, socket: Option<PathBuf>, tcp: Option<String>) -> Result<()> {
-    let socket_path = socket.unwrap_or_else(|| root.join(&cfg.index_dir).join("grv.sock"));
+    let socket_path = socket.unwrap_or_else(|| default_socket_path(&root, &cfg.index_dir));
+    check_socket_path_len(&socket_path)?;
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }

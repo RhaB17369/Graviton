@@ -221,7 +221,10 @@ enum Command {
     /// per request. Foreground by default, like `ollama serve` — Ctrl+C or
     /// a `shutdown` request stops it.
     Serve {
-        /// Unix socket path (default: <repo>/.graviton/grv.sock)
+        /// Unix socket path (default: a short, repo-hashed path under
+        /// $XDG_RUNTIME_DIR/grv or the system temp dir -- not under the
+        /// repo itself, since a nested repo path can exceed the ~100-byte
+        /// Unix socket path limit)
         #[arg(long)]
         socket: Option<PathBuf>,
         /// Also listen on this TCP address, e.g. 127.0.0.1:7420

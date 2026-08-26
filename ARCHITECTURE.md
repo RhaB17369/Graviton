@@ -787,11 +787,19 @@ shutdown never needs the stale-socket recovery path below).
   is listening. `remove_stale_socket` tries `UnixStream::connect` first (a
   live daemon accepts) and only unlinks the file if that fails — so it
   never removes a socket a real running daemon still owns.
-- **Unix socket path length**: `SUN_LEN` (~108 bytes on Linux) is a real OS
-  limit, not a GRAVITON one — a deeply nested repo path can exceed it. `grv
-  serve --socket <shorter-path>` sidesteps it; this surfaced during testing
-  (a scratch path under a long tmp directory hit exactly this) and is worth
-  knowing about rather than debugging fresh each time.
+- **Unix socket path length**: `sockaddr_un.sun_path` is a real OS limit
+  (~108 bytes on Linux, ~104 on macOS/BSD), not a GRAVITON one — this
+  surfaced during testing when a scratch path under a long tmp directory
+  hit it directly. Handled two ways rather than left as a thing to hit and
+  work around: (1) the **default** socket path (no `--socket` given) is no
+  longer under the repo at all — `default_socket_path` hashes the
+  canonicalized repo root + index dir into a short, stable name under
+  `$XDG_RUNTIME_DIR/grv/` (falling back to the system temp dir), so a
+  deeply nested repo path never reaches the limit in the common case; (2)
+  `check_socket_path_len` rejects an explicit `--socket` that's still too
+  long up front, with a message suggesting a short path (e.g. `/tmp/
+  grv.sock`), instead of letting `bind` fail with the OS's bare "path must
+  be shorter than SUN_LEN".
 - **No auth on `--tcp`**: fine bound to `127.0.0.1` for local editor use;
   not something to expose beyond localhost without adding one.
 

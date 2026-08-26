@@ -349,7 +349,7 @@ its stale embeddings so they never point at chunks that no longer exist.
 ### `grv serve` — a daemon for editor/IDE integrations
 
 ```sh
-grv serve                              # unix socket at .graviton/grv.sock
+grv serve                              # unix socket at a short, repo-hashed path (avoids the ~100-byte socket path limit)
 grv serve --tcp 127.0.0.1:7420         # also listen on TCP
 ```
 
