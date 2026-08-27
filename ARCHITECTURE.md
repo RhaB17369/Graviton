@@ -231,7 +231,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.2)
+## Language coverage (v0.12)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its
@@ -239,8 +239,31 @@ grammar on crates.io, pull its `node-types.json` to find the right node/field
 names for function/class/method definitions, write the query, and let the
 existing "best-effort, never fatal" machinery handle version drift.
 
-Two real constraints surfaced while adding the v0.2 batch (Java, C#, PHP,
-Ruby, Bash, Lua, Solidity, PowerShell):
+GRAVITON recognizes **66 languages total**, split into three honest tiers —
+"honest" meaning the tier a language sits in reflects what was actually
+verified, not what merely compiles:
+
+- **26 with a verified `def_query_src`** — the grammar is linked AND its
+  query was checked against a real sample file's `extract_symbols()` output,
+  not just compiled: the original 16 (Rust, Python, JavaScript, TypeScript,
+  TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity, PowerShell)
+  plus 10 added for the "at least 60 languages" push (Haskell, Fish, Dart,
+  Zig, Julia, Groovy, GraphQL, Crystal, D, and assembly — assembly's
+  "symbol" is a label, the closest thing the format has to one).
+- **24 with a grammar linked but no query written yet** — Elixir, Scala,
+  Swift, Perl, R, OCaml, Elm, Nim, Erlang, Vim, Nix, HCL/Terraform, CMake,
+  Verilog, VHDL, Fortran, Prolog, Racket, Scheme, Protobuf, Objective-C,
+  GLSL, HLSL, Ada. These files are already fully searchable; extending
+  `grv symbol` to them is "write and verify one query" work, deliberately
+  not done speculatively here (see the node/field-name pitfall below —
+  guessing produces a query that compiles and silently matches nothing).
+- **16 tagged only, no grammar at all** — Kotlin, HTML, CSS, JSON, YAML,
+  TOML, XML, Markdown, SQL, Dockerfile, INI, Makefile, plus four added
+  this round for real, verified reasons (below): Svelte, Vue, WGSL, LaTeX.
+
+Two real constraints surfaced while adding the original v0.2 batch (Java,
+C#, PHP, Ruby, Bash, Lua, Solidity, PowerShell), and both recurred, harder,
+in the 37-language push:
 
 - **Node/field names must be looked up per grammar, not assumed.** They
   don't follow one convention: Ruby's `class`/`module` nodes *do* expose a
@@ -249,18 +272,48 @@ Ruby, Bash, Lua, Solidity, PowerShell):
   field label at all (`(class_declaration (type_identifier) @name)` instead
   of `(class_declaration name: (type_identifier) @name)`). Get this wrong
   and the query still compiles — it just silently matches nothing, which is
-  why every language here was verified against a real sample file, not just
-  compiled.
+  why every language in the 26-language tier was verified two ways: real
+  `node-types.json` inspection plus a real parse (`to_sexp()` dump) of a
+  hand-written sample file in each language, then a permanent test
+  (`crates/indexer/src/lang.rs`'s `new_language_queries` module) asserting
+  `extract_symbols()` returns the expected names from that sample — not
+  "it compiled".
 - **Cargo's `links` uniqueness bites grammar crates that lag upstream.**
   `tree-sitter-kotlin` (0.3.8, the latest release on crates.io) depends on
   tree-sitter 0.21/0.22; every other grammar here depends on 0.26. Cargo
   will not link two versions of a native library that both declare `links =
   "tree-sitter"` into one binary, so Kotlin can't be added as a parsed
   language without vendoring a patched grammar crate — not worth it for one
-  language when the file is still fully searchable either way. This is the
-  actual failure mode to expect when adding more languages later, not a
-  one-off: check what tree-sitter core version a candidate grammar crate
-  pins before writing its query.
+  language when the file is still fully searchable either way.
+- **A `links` conflict isn't the only way a grammar can be unusable — a
+  type mismatch or a missing symbol can hide until final link time.**
+  Discovered the hard way with three more candidates during the 37-language
+  push:
+  - `tree-sitter-svelte`, `tree-sitter-vue`, `tree-sitter-wgsl`: no `links`
+    conflict at all — Cargo resolves and compiles each in isolation without
+    complaint. The failure only shows up when their `language()` fn's
+    return value is used somewhere expecting `tree_sitter::Language`: their
+    bindings return that type from an *old* tree-sitter core (0.20.10),
+    which is a structurally different Rust type from this workspace's 0.26,
+    even though both are named `tree_sitter::Language`. `cargo build -p
+    graviton-indexer` (lib-only) won't catch this either if the mismatched
+    arm is never reached in that crate's own code — it only surfaces as a
+    `match`-arm type error once `ts_language()` actually tries to return one.
+  - `tree-sitter-latex`: compiles fine, links its grammar fine, but its
+    external scanner (used for verbatim/raw-environment lexing, e.g. inside
+    `\verb`) references `tree_sitter_latex_external_scanner_{create,
+    destroy,scan,serialize,deserialize}` symbols that are undefined at
+    **executable** link time. A plain `cargo build -p graviton-indexer`
+    (building a library, where not every symbol needs resolving yet) won't
+    catch this — it only appears once something links the real `grv`
+    binary or a test binary. This is why the project's practice is to
+    verify every new-language batch with a full `cargo build --workspace`
+    (or `cargo test --workspace`), never a per-crate build alone.
+
+  All four are kept as `Lang` enum variants with working `from_path`/`name()`
+  (so files are still recognized, tagged, and fully searchable) but no
+  `ts_language()` arm — they fall to tagged tier, same category as Kotlin,
+  rather than being silently dropped or crashing the build.
 
 ## Tool execution (`grv tool`)
 
@@ -520,10 +573,15 @@ tool, chosen over unified-diff patches because a small local model
 produces "replace this exact block" far more reliably than a correctly
 context-lined diff), `delete_file`, `run_shell`, `recon_tool` (the
 `grv tool` whitelist, exposed as a tool so the agent can run nmap/ffuf/etc.
-itself instead of the user doing it out-of-band), and `search_code`/
+itself instead of the user doing it out-of-band), `search_code`/
 `semantic_search` (the indexed repo, mid-task — see "Semantic search"
 below for why the latter needs an embedding model configured and errors
-clearly when it isn't, rather than silently falling back). `--browser` adds
+clearly when it isn't, rather than silently falling back), and `ask_user`
+(a fixed-option clarifying question — the agent's own version of
+Claude Code's own `AskUserQuestion`: present a short, known set of sane
+answers instead of guessing or asking in free text the agent then has to
+parse back out of a reply; not for yes/no about an action, which the
+existing write/edit/delete/shell confirmation already covers). `--browser` adds
 `browser_navigate`/`browser_eval`/`browser_screenshot`/`browser_console`,
 backed by `chromiumoxide` driving the system's Chromium over CDP
 (`crates/cli/src/browser.rs`) — headless, one page kept alive for the
@@ -624,10 +682,58 @@ the conversation itself:
   stdin against the HTTP response (`tokio::select!`) and is a reasonable
   next step, not something this claims to already do.
 
-`grv mission` does not (yet) share this — its tree-shaped, concurrent
-execution doesn't map onto one linear transcript the way `grv run`'s
-single-agent loop does, so resuming a partially-completed mission is left
-as future work rather than half-implemented.
+`grv mission --continue` now exists too (see "Mission session resume"
+below), but it's a genuinely different mechanism from `grv run`'s — a
+tree-shaped, concurrent execution has no single linear transcript to
+append to, so it needed its own checkpoint format rather than reusing
+`Session`'s.
+
+### Mission session resume (`checkpoint::MissionCheckpoint`, `grv mission --continue`)
+
+`grv run`'s resumability (above) works because its execution is linear —
+one transcript, appended to in order. `grv mission`'s is a tree, executed
+*concurrently* (siblings run in parallel `tokio::spawn`ed tasks, finishing
+in whatever order the scheduler gets to them), so there's no single
+sequence to log. `MissionCheckpoint` instead keys a flat map by tree
+position — `"0"` for the root, `"0.0"`/`"0.1"` for its children, `"0.1.0"`
+for a grandchild, and so on — rewritten to `mission_tree.json` as a whole
+each time any node's status changes (`Pending`/`Done`/`Failed`, plus its
+result once `Done`). Cheap in practice: even a wide, deep mission produces
+at most a few hundred nodes, and a write only happens at node boundaries
+(once per subtask/decompose/synthesize call), never per token.
+
+Resuming (`execute_node` checks `checkpoint.get(&node_path)` before doing
+anything) has two distinct cases, both load-bearing:
+
+- **A node already `Done`** short-circuits immediately, returning its
+  cached result — no model call at all. This is what makes resume actually
+  useful: a mission that got 8 of 10 subtasks done before something failed
+  doesn't re-run those 8.
+- **An internal node that was already decomposed** (it has a recorded
+  `subtasks` list, whether or not it finished synthesizing) replays that
+  *exact* split instead of calling the planner again. This matters because
+  the planner is a live model call — asking it again on resume could
+  return a differently-shaped decomposition, which would silently orphan
+  any already-completed children's cached results under node paths that no
+  longer correspond to anything in the new split.
+
+**A real correctness bug caught before it shipped, not after**: the
+initial implementation let a resume default `--max-depth` independently of
+what the original run used. A mission started with `--max-depth 1` (so its
+depth-1 children are leaves) that got resumed with no `--max-depth` flag
+picked up `DEFAULT_MAX_DEPTH` (2) instead — meaning a node the original run
+treated as terminal would suddenly try to decompose *again* on resume,
+producing a wrong tree shape live and verified via a real failing-then-
+succeeding mock run before the fix (a resumed leaf spuriously re-decomposed
+into two fresh subtasks instead of just running). Fixed by persisting the
+resolved depth once, at the start of a fresh mission (`save_max_depth`,
+`mission_meta.json` alongside the tree file), and reusing it on resume
+unless `--max-depth` is passed explicitly (which always wins, letting a
+user deliberately widen or narrow a resumed mission).
+
+`--max-parallel`/the `LiveScheduler` aren't part of what's persisted or
+replayed — they're a live resource estimate re-sampled from the machine's
+*current* state, and always should be, resume or not.
 
 ### A pluggable confirm/output sink (`crates/cli/src/run_io.rs`) — one loop, two front ends
 
@@ -646,15 +752,17 @@ pub trait RunIo: Send + Sync {
     fn note_checkpoint_id(&self, _id: &str) {}         // default no-op
     fn confirm(&self, auto_approve: bool, action: String)
         -> Pin<Box<dyn Future<Output = Decision> + Send + '_>>;
+    fn ask_choice(&self, question: String, options: Vec<String>, multi_select: bool)
+        -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>>;
 }
 ```
 
-`confirm` is boxed by hand (`Pin<Box<dyn Future<...>>>`) rather than a plain
-`async fn` in the trait: `dyn RunIo` needs object safety (`agentic::run`
-doesn't know at compile time which implementation it has), and native
-async-fn-in-traits doesn't support dynamic dispatch without either this or
-the `async-trait` crate — hand-rolling one boxed method was less than
-pulling in a dependency for it.
+`confirm`/`ask_choice` are boxed by hand (`Pin<Box<dyn Future<...>>>`)
+rather than plain `async fn`s in the trait: `dyn RunIo` needs object safety
+(`agentic::run` doesn't know at compile time which implementation it has),
+and native async-fn-in-traits doesn't support dynamic dispatch without
+either this or the `async-trait` crate — hand-rolling two boxed methods was
+less than pulling in a dependency for it.
 
 Two implementations:
 - **`TerminalIo`** (`run_io.rs`) — the original behavior, byte for byte:
@@ -662,12 +770,15 @@ Two implementations:
   read, moved onto `tokio::task::spawn_blocking` so it's not literally
   blocking the async runtime (it always effectively blocked all other work
   in `grv run`'s single-agent CLI process anyway — this just stops relying
-  on that as an accident of scheduling).
-- **`ChannelIo`** (`daemon.rs`) — output/tokens become `RunEvent`s on a
-  `tokio::sync::broadcast` channel any number of `run_attach`ed connections
-  can subscribe to; `confirm` blocks on a per-session `mpsc` channel that
-  `run_confirm` (from any connection, not necessarily the one that called
-  `run_start`) feeds a `Decision` into.
+  on that as an accident of scheduling). `ask_choice` (the `ask_user` tool
+  — see "Tools" above) is the same pattern: prints a numbered option list,
+  reads a comma-separated pick (or `all` for a multi-select question).
+- **`ChannelIo`** (`daemon.rs`) — output/tokens/`ask_choice` questions
+  become `RunEvent`s on a `tokio::sync::broadcast` channel any number of
+  `run_attach`ed connections can subscribe to; `confirm`/`ask_choice` block
+  on their own per-session `mpsc` channel that `run_confirm`/
+  `run_answer_choice` (from any connection, not necessarily the one that
+  called `run_start`) feeds a `Decision`/chosen-option-list into.
 
 This is also why `agentic::run`/`dispatch`/`dispatch_inner` no longer take
 `&rusqlite::Connection` as a parameter at all (they used to) — `grv serve`
@@ -951,29 +1062,35 @@ confirm/output sink" above) instead of a terminal:
 - **`run_attach {session_id}`** (on any connection, including the one that
   called `run_start`) acks once, then streams that session's events as
   `run_event` notifications (`{"session_id","kind": "output"|"token"|
-  "confirm_request"|"done", ...}`) until `done` or the connection drops.
-  Multiple connections can attach to the same session independently (each
-  gets its own `broadcast::Receiver`).
+  "confirm_request"|"ask_choice"|"done", ...}`) until `done` or the
+  connection drops. Multiple connections can attach to the same session
+  independently (each gets its own `broadcast::Receiver`).
 - **`run_confirm {session_id, decision}`** (`"yes"`/`"no"`/anything else =
   a `Decision::Redirect` — same three-way semantics the terminal's y/n/
   free-text prompt has) feeds a decision into the session's confirm
   channel from *any* connection, unblocking `ChannelIo::confirm`.
+- **`run_answer_choice {session_id, selected: [...]}`** is the same idea
+  for an `ask_user` tool call (an `ask_choice` event) — `selected` is the
+  chosen option string(s), fed into `ChannelIo::ask_choice`'s channel.
 - **`run_status {session_id}`** returns a point-in-time snapshot (running?,
-  a pending confirm's text if any, the checkpoint id once known, how it
-  finished) without needing to attach — for polling, or for a client that
-  attached late and wants to know what it missed.
+  a pending confirm's text or pending `ask_user` question if any, the
+  checkpoint id once known, how it finished) without needing to attach —
+  for polling, or for a client that attached late and wants to know what
+  it missed.
 
 **The race this has to handle**: `run_start`'s spawned task can reach (and
-block on) a confirmation *before* a client manages to call `run_attach` —
-there's no ordering guarantee between "task starts running" and "client's
-next request arrives". A `ConfirmRequest` broadcast sent before a receiver
-subscribes is simply never delivered to it (`tokio::sync::broadcast`
-doesn't replay to new subscribers), which would otherwise leave an attach
+block on) a confirmation or an `ask_user` question *before* a client
+manages to call `run_attach` — there's no ordering guarantee between "task
+starts running" and "client's next request arrives". A `ConfirmRequest`/
+`AskChoice` broadcast sent before a receiver subscribes is simply never
+delivered to it (`tokio::sync::broadcast` doesn't replay to new
+subscribers), which would otherwise leave an attach
 waiting forever for an event that already happened. Fixed by having
 `handle_run_attach` check the session's status snapshot *after*
-subscribing but *before* entering the receive loop: if a confirmation was
-already pending, or the run had already finished, it synthesizes and sends
-that one event from the snapshot before continuing — subscribe-then-check
+subscribing but *before* entering the receive loop: if a confirmation or
+an `ask_user` question was already pending, or the run had already
+finished, it synthesizes and sends that one event from the snapshot before
+continuing — subscribe-then-check
 ordering means nothing sent after the subscribe can be missed by this,
 and the synthesized catch-up covers everything sent before it. Verified
 against the actual race, not just reasoned about: a mock run reaching its
@@ -1024,17 +1141,30 @@ independent connection unblocked it.
 
 ## What's explicitly *not* built yet (see README roadmap)
 
-- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other ten
-  parsed languages have no `call_query_src` yet, and none of it is
-  type/scope-resolved (name-based matching only, by design — see "Call
+- **An ANN index for `grv embed`/semantic search.** Still a linear cosine
+  scan today. This is the top open item: explicitly requested (again) on
+  the grounds that GRAVITON targets very large repos, where a linear scan
+  over every stored embedding stops being free. Not addressed in the v0.12
+  batch (mission resume, `ask_user`, the 37-language push) — called out
+  here rather than silently dropped.
+- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other 26+
+  parsed-or-linked languages have no `call_query_src` yet, and none of it
+  is type/scope-resolved (name-based matching only, by design — see "Call
   graph" above for why that's the right tradeoff at this tool's scale).
-- An ANN index for `grv embed` if a single repo's chunk count ever grows
-  large enough that the current linear cosine scan actually shows up as
-  slow — not observed at any repo size tested so far.
+- `def_query_src` (symbol extraction) for the 24 languages whose grammar
+  is linked but whose query hasn't been written+verified yet (Elixir,
+  Scala, Swift, Perl, R, OCaml, Elm, Nim, Erlang, Vim, Nix, HCL, CMake,
+  Verilog, VHDL, Fortran, Prolog, Racket, Scheme, Protobuf, Objective-C,
+  GLSL, HLSL, Ada) — see "Language coverage" above. All 24 are already
+  fully searchable; only `grv symbol` support is missing.
+- A real parse tree for Svelte, Vue, WGSL, and LaTeX — each hits a genuine
+  external blocker (old-tree-sitter-core type mismatch for the first
+  three, a broken external-scanner link for the fourth), not an oversight;
+  see "Language coverage" above for the specifics.
 - `grv serve --tcp`'s token is a stopgap (see "`--tcp` token auth" above),
   not hardened auth suitable for anything beyond `127.0.0.1`/a trusted LAN.
 - `run_attach` only streams events from the moment of attaching forward
-  (plus a synthesized catch-up for an already-pending confirm or an
-  already-finished run — see "Driving a full `grv run` session over the
-  socket" above) — not a full replay of every event since `run_start`;
-  `run_status` covers the rest of that gap.
+  (plus a synthesized catch-up for an already-pending confirm, an already-
+  pending `ask_user` question, or an already-finished run — see "Driving a
+  full `grv run` session over the socket" above) — not a full replay of
+  every event since `run_start`; `run_status` covers the rest of that gap.

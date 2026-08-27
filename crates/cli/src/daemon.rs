@@ -119,6 +119,7 @@ struct DaemonCtx {
 struct RunHandle {
     events_tx: broadcast::Sender<RunEvent>,
     confirm_tx: mpsc::UnboundedSender<Decision>,
+    choice_tx: mpsc::UnboundedSender<Vec<String>>,
     status: Arc<StdMutex<RunStatusSnapshot>>,
 }
 
@@ -126,6 +127,7 @@ struct RunHandle {
 struct RunStatusSnapshot {
     running: bool,
     pending_confirm: Option<String>,
+    pending_choice: Option<(String, Vec<String>, bool)>,
     checkpoint_id: Option<String>,
     finished_ok: Option<bool>,
     finished_message: Option<String>,
@@ -139,6 +141,7 @@ enum RunEvent {
     Output(String),
     Token(String),
     ConfirmRequest(String),
+    AskChoice(String, Vec<String>, bool),
     Done { ok: bool, message: String },
 }
 
@@ -148,17 +151,22 @@ impl RunEvent {
             RunEvent::Output(line) => json!({"jsonrpc":"2.0","method":"run_event","params":{"session_id":session_id,"kind":"output","line":line}}),
             RunEvent::Token(text) => json!({"jsonrpc":"2.0","method":"run_event","params":{"session_id":session_id,"kind":"token","text":text}}),
             RunEvent::ConfirmRequest(action) => json!({"jsonrpc":"2.0","method":"run_event","params":{"session_id":session_id,"kind":"confirm_request","action":action}}),
+            RunEvent::AskChoice(question, options, multi_select) => {
+                json!({"jsonrpc":"2.0","method":"run_event","params":{"session_id":session_id,"kind":"ask_choice","question":question,"options":options,"multi_select":multi_select}})
+            }
             RunEvent::Done { ok, message } => json!({"jsonrpc":"2.0","method":"run_event","params":{"session_id":session_id,"kind":"done","ok":ok,"message":message}}),
         }
     }
 }
 
 /// The `RunIo` a `run_start` session uses: output/tokens become broadcast
-/// events any attached connection receives; a confirmation blocks on a
-/// per-session channel that `run_confirm` (from any connection) feeds.
+/// events any attached connection receives; a confirmation or an
+/// `ask_user` choice blocks on its own per-session channel that
+/// `run_confirm`/`run_answer_choice` (from any connection) feeds.
 struct ChannelIo {
     events_tx: broadcast::Sender<RunEvent>,
     confirm_rx: AsyncMutex<mpsc::UnboundedReceiver<Decision>>,
+    choice_rx: AsyncMutex<mpsc::UnboundedReceiver<Vec<String>>>,
     status: Arc<StdMutex<RunStatusSnapshot>>,
 }
 
@@ -186,6 +194,17 @@ impl RunIo for ChannelIo {
             let decision = rx.recv().await.unwrap_or(Decision::Deny);
             self.status.lock().unwrap().pending_confirm = None;
             decision
+        })
+    }
+
+    fn ask_choice(&self, question: String, options: Vec<String>, multi_select: bool) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+        Box::pin(async move {
+            self.status.lock().unwrap().pending_choice = Some((question.clone(), options.clone(), multi_select));
+            let _ = self.events_tx.send(RunEvent::AskChoice(question, options, multi_select));
+            let mut rx = self.choice_rx.lock().await;
+            let picked = rx.recv().await.unwrap_or_default();
+            self.status.lock().unwrap().pending_choice = None;
+            picked
         })
     }
 }
@@ -541,6 +560,10 @@ async fn handle_run_attach<W: AsyncWrite + Unpin>(ctx: &DaemonCtx, req: &RpcRequ
         if let Some(action) = snapshot.pending_confirm {
             write_line(writer, &RunEvent::ConfirmRequest(action).to_notification(&session_id)).await?;
         }
+        // Same idea for an ask_user question already waiting on an answer.
+        if let Some((question, options, multi_select)) = snapshot.pending_choice {
+            write_line(writer, &RunEvent::AskChoice(question, options, multi_select).to_notification(&session_id)).await?;
+        }
         // Same idea if the run already finished before we attached.
         if !snapshot.running {
             let ok = snapshot.finished_ok.unwrap_or(false);
@@ -670,13 +693,19 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
             let session_id = generate_token()[..12].to_string();
             let (events_tx, _) = broadcast::channel::<RunEvent>(1024);
             let (confirm_tx, confirm_rx) = mpsc::unbounded_channel::<Decision>();
+            let (choice_tx, choice_rx) = mpsc::unbounded_channel::<Vec<String>>();
             let status = Arc::new(StdMutex::new(RunStatusSnapshot { running: true, ..Default::default() }));
-            let io: Arc<dyn RunIo> = Arc::new(ChannelIo { events_tx: events_tx.clone(), confirm_rx: AsyncMutex::new(confirm_rx), status: status.clone() });
+            let io: Arc<dyn RunIo> = Arc::new(ChannelIo {
+                events_tx: events_tx.clone(),
+                confirm_rx: AsyncMutex::new(confirm_rx),
+                choice_rx: AsyncMutex::new(choice_rx),
+                status: status.clone(),
+            });
 
             ctx.runs
                 .lock()
                 .await
-                .insert(session_id.clone(), RunHandle { events_tx: events_tx.clone(), confirm_tx, status: status.clone() });
+                .insert(session_id.clone(), RunHandle { events_tx: events_tx.clone(), confirm_tx, choice_tx, status: status.clone() });
 
             let cfg_owned = ctx.cfg.clone();
             let root_owned = ctx.root.clone();
@@ -729,6 +758,21 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
                 .map_err(|_| anyhow::anyhow!("this run session isn't waiting for a confirmation right now"))?;
             Ok(json!({"ok": true}))
         }
+        "run_answer_choice" => {
+            let session_id = get_str("session_id").context("missing 'session_id'")?;
+            let selected: Vec<String> = params
+                .get("selected")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .context("missing 'selected' (array of chosen option strings)")?;
+            let runs = ctx.runs.lock().await;
+            let handle = runs.get(&session_id).context("no such run session (finished or never started)")?;
+            handle
+                .choice_tx
+                .send(selected)
+                .map_err(|_| anyhow::anyhow!("this run session isn't waiting for an ask_user answer right now"))?;
+            Ok(json!({"ok": true}))
+        }
         "run_status" => {
             let session_id = get_str("session_id").context("missing 'session_id'")?;
             let runs = ctx.runs.lock().await;
@@ -738,6 +782,7 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
                 "session_id": session_id,
                 "running": snapshot.running,
                 "pending_confirm": snapshot.pending_confirm,
+                "pending_choice": snapshot.pending_choice.map(|(q, o, m)| json!({"question": q, "options": o, "multi_select": m})),
                 "checkpoint_id": snapshot.checkpoint_id,
                 "finished_ok": snapshot.finished_ok,
                 "finished_message": snapshot.finished_message,

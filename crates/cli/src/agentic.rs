@@ -391,6 +391,30 @@ fn tool_defs(enable_browser: bool, custom: &[CustomTool]) -> Vec<ToolDef> {
     let mut tools = read_only_tool_defs();
     tools.extend(vec![
         ToolDef::new(
+            "ask_user",
+            "Ask the user a clarifying question with a fixed, short set of options instead of \
+             guessing or asking in free text — use this when a task is genuinely ambiguous and \
+             the sane answers form a known set (e.g. \"which config format?\", \"overwrite or \
+             skip existing files?\", \"which of these three auth.py look-alikes did you mean?\"). \
+             Don't use it for yes/no questions about an action you're about to take — that's what \
+             the normal write/edit/delete/run_shell confirmation already covers. The user's \
+             chosen option(s) come back as this tool's result, verbatim.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string" },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 2,
+                        "maxItems": 6
+                    },
+                    "multi_select": { "type": "boolean", "description": "allow picking more than one; defaults to false" }
+                },
+                "required": ["question", "options"]
+            }),
+        ),
+        ToolDef::new(
             "update_plan",
             "Report your current step-by-step plan for this task, with a status per step \
              (pending/in_progress/done). Call this when you form a plan and again whenever it \
@@ -646,6 +670,24 @@ async fn dispatch_inner(state: &mut State, name: &str, args: &Value) -> Result<S
     };
 
     match name {
+        "ask_user" => {
+            let question = arg_str("question")?;
+            let options: Vec<String> = args
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            if options.len() < 2 {
+                anyhow::bail!("ask_user requires at least 2 options");
+            }
+            let multi_select = args.get("multi_select").and_then(|v| v.as_bool()).unwrap_or(false);
+            let picked = state.io.ask_choice(question, options, multi_select).await;
+            if picked.is_empty() {
+                Ok("(user made no selection)".to_string())
+            } else {
+                Ok(format!("user chose: {}", picked.join(", ")))
+            }
+        }
         "update_plan" => {
             let steps = args.get("steps").cloned().unwrap_or(Value::Array(vec![]));
             state.io.emit(format_plan(&steps));
@@ -1033,8 +1075,10 @@ pub async fn run(
              run tests, inspect real git state (status/diff/log) and commit, run recon \
              tools, search the web and fetch pages, search the indexed codebase (search_code \
              for exact identifiers/strings, semantic_search for concepts when it's available), \
-             report your plan, and (if offered) drive a headless browser — use them; don't \
-             just describe what you'd do. Paths are relative to the repo root. File writes/edits/deletes, commits, \
+             report your plan, ask the user a clarifying question with a fixed set of options \
+             (ask_user — use this instead of guessing when a task is genuinely ambiguous and the \
+             sane answers form a short known set), and (if offered) drive a headless browser — \
+             use them; don't just describe what you'd do. Paths are relative to the repo root. File writes/edits/deletes, commits, \
              and shell commands are confirmed with the user before they happen, so \
              propose them directly rather than asking permission in text first. Use \
              web_search/web_fetch whenever the task depends on something that could have \

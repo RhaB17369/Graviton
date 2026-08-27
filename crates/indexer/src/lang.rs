@@ -36,6 +36,55 @@ pub enum Lang {
     Lua,
     Solidity,
     PowerShell,
+    // The following all link a real tree-sitter grammar (verified: this
+    // whole batch compiles and links together with everything above, no
+    // `links = "tree-sitter"` conflicts) but only some have a *verified*
+    // `def_query_src` (checked against a real sample file, same bar as
+    // every language above) -- the rest return `None` there for now, which
+    // degrades to "recognized + fully searchable, no `grv symbol`" exactly
+    // like the tagged tier below, but with the hard part (a linkable
+    // grammar) already done. `grv callers`/`callees` needs its own
+    // `call_query_src` regardless of `def_query_src` -- currently written
+    // for none of these (see ARCHITECTURE.md's call graph section for the
+    // full list of what has one).
+    Haskell,   // def query verified
+    Fish,      // def query verified
+    Dart,      // def query verified
+    Zig,       // def query verified
+    Julia,     // def query verified
+    Groovy,    // def query verified
+    GraphQL,   // def query verified
+    Crystal,   // def query verified
+    D,         // def query verified
+    Asm,       // def query verified (label-based)
+    Elixir,
+    Scala,
+    Swift,
+    Perl,
+    R,
+    OCaml,
+    Elm,
+    Nim,
+    Erlang,
+    Vim,
+    Latex,
+    Nix,
+    Hcl,
+    CMake,
+    Verilog,
+    Vhdl,
+    Fortran,
+    Prolog,
+    Racket,
+    Scheme,
+    Proto,
+    Svelte,
+    Vue,
+    ObjC,
+    Glsl,
+    Hlsl,
+    Wgsl,
+    Ada,
     // --- tagged only: labeled + always full-text searchable ---
     // (Kotlin lives here, not in the parsed tier: the only maintained
     // tree-sitter-kotlin release compatible with crates.io is pinned to
@@ -65,6 +114,7 @@ impl Lang {
             match fname {
                 "Dockerfile" | "Containerfile" => return Lang::Dockerfile,
                 "Makefile" | "makefile" | "GNUmakefile" => return Lang::Makefile,
+                "CMakeLists.txt" => return Lang::CMake,
                 _ if fname.starts_with("Dockerfile.") => return Lang::Dockerfile,
                 _ => {}
             }
@@ -93,6 +143,50 @@ impl Lang {
             "sol" => Lang::Solidity,
             "kt" | "kts" => Lang::Kotlin,
             "ps1" | "psm1" | "psd1" => Lang::PowerShell,
+            "hs" | "lhs" => Lang::Haskell,
+            "fish" => Lang::Fish,
+            "dart" => Lang::Dart,
+            "zig" => Lang::Zig,
+            "jl" => Lang::Julia,
+            "groovy" | "gvy" | "gradle" => Lang::Groovy,
+            "graphql" | "gql" => Lang::GraphQL,
+            "cr" => Lang::Crystal,
+            "d" | "di" => Lang::D,
+            // .s/.asm are the common assembly extensions; the conventional
+            // capital-S variant (preprocessed-with-cpp assembly) lands here
+            // too since this whole match already lowercases first.
+            "asm" | "s" => Lang::Asm,
+            "ex" | "exs" => Lang::Elixir,
+            "scala" | "sc" => Lang::Scala,
+            "swift" => Lang::Swift,
+            // .pl is genuinely ambiguous between Perl and Prolog; Perl gets
+            // it as the far more common modern usage. Prolog files mostly
+            // show up as .pro/.p in practice.
+            "pl" | "pm" | "t" => Lang::Perl,
+            "r" => Lang::R,
+            "ml" | "mli" => Lang::OCaml,
+            "elm" => Lang::Elm,
+            "nim" | "nims" => Lang::Nim,
+            "erl" | "hrl" => Lang::Erlang,
+            "vim" => Lang::Vim,
+            "tex" | "latex" | "sty" | "cls" => Lang::Latex,
+            "nix" => Lang::Nix,
+            "hcl" | "tf" | "tfvars" => Lang::Hcl,
+            "cmake" => Lang::CMake,
+            "v" | "vh" => Lang::Verilog,
+            "vhd" | "vhdl" => Lang::Vhdl,
+            "f90" | "f95" | "f03" | "f08" | "f" | "for" => Lang::Fortran,
+            "pro" => Lang::Prolog,
+            "rkt" => Lang::Racket,
+            "scm" | "ss" => Lang::Scheme,
+            "proto" => Lang::Proto,
+            "svelte" => Lang::Svelte,
+            "vue" => Lang::Vue,
+            "m" | "mm" => Lang::ObjC,
+            "glsl" | "vert" | "frag" | "geom" | "comp" | "tesc" | "tese" => Lang::Glsl,
+            "hlsl" | "fx" => Lang::Hlsl,
+            "wgsl" => Lang::Wgsl,
+            "adb" | "ads" => Lang::Ada,
             "html" | "htm" => Lang::Html,
             "css" | "scss" | "sass" | "less" => Lang::Css,
             "json" | "jsonc" => Lang::Json,
@@ -124,6 +218,44 @@ impl Lang {
             Lang::Lua => "lua",
             Lang::Solidity => "solidity",
             Lang::PowerShell => "powershell",
+            Lang::Haskell => "haskell",
+            Lang::Fish => "fish",
+            Lang::Dart => "dart",
+            Lang::Zig => "zig",
+            Lang::Julia => "julia",
+            Lang::Groovy => "groovy",
+            Lang::GraphQL => "graphql",
+            Lang::Crystal => "crystal",
+            Lang::D => "d",
+            Lang::Asm => "asm",
+            Lang::Elixir => "elixir",
+            Lang::Scala => "scala",
+            Lang::Swift => "swift",
+            Lang::Perl => "perl",
+            Lang::R => "r",
+            Lang::OCaml => "ocaml",
+            Lang::Elm => "elm",
+            Lang::Nim => "nim",
+            Lang::Erlang => "erlang",
+            Lang::Vim => "vim",
+            Lang::Latex => "latex",
+            Lang::Nix => "nix",
+            Lang::Hcl => "hcl",
+            Lang::CMake => "cmake",
+            Lang::Verilog => "verilog",
+            Lang::Vhdl => "vhdl",
+            Lang::Fortran => "fortran",
+            Lang::Prolog => "prolog",
+            Lang::Racket => "racket",
+            Lang::Scheme => "scheme",
+            Lang::Proto => "proto",
+            Lang::Svelte => "svelte",
+            Lang::Vue => "vue",
+            Lang::ObjC => "objc",
+            Lang::Glsl => "glsl",
+            Lang::Hlsl => "hlsl",
+            Lang::Wgsl => "wgsl",
+            Lang::Ada => "ada",
             Lang::Kotlin => "kotlin",
             Lang::Html => "html",
             Lang::Css => "css",
@@ -158,6 +290,40 @@ impl Lang {
             Lang::Lua => tree_sitter_lua::LANGUAGE.into(),
             Lang::Solidity => tree_sitter_solidity::LANGUAGE.into(),
             Lang::PowerShell => tree_sitter_powershell::LANGUAGE.into(),
+            Lang::Haskell => tree_sitter_haskell::LANGUAGE.into(),
+            Lang::Fish => tree_sitter_fish::language(),
+            Lang::Dart => tree_sitter_dart::LANGUAGE.into(),
+            Lang::Zig => tree_sitter_zig::LANGUAGE.into(),
+            Lang::Julia => tree_sitter_julia::LANGUAGE.into(),
+            Lang::Groovy => tree_sitter_groovy::LANGUAGE.into(),
+            Lang::GraphQL => tree_sitter_graphql::LANGUAGE.into(),
+            Lang::Crystal => tree_sitter_crystal::LANGUAGE.into(),
+            Lang::D => tree_sitter_d::LANGUAGE.into(),
+            Lang::Asm => tree_sitter_asm::LANGUAGE.into(),
+            Lang::Elixir => tree_sitter_elixir::LANGUAGE.into(),
+            Lang::Scala => tree_sitter_scala::LANGUAGE.into(),
+            Lang::Swift => tree_sitter_swift::LANGUAGE.into(),
+            Lang::Perl => tree_sitter_perl::LANGUAGE.into(),
+            Lang::R => tree_sitter_r::LANGUAGE.into(),
+            Lang::OCaml => tree_sitter_ocaml::LANGUAGE_OCAML.into(),
+            Lang::Elm => tree_sitter_elm::LANGUAGE.into(),
+            Lang::Nim => tree_sitter_nim::LANGUAGE.into(),
+            Lang::Erlang => tree_sitter_erlang::LANGUAGE.into(),
+            Lang::Vim => tree_sitter_vim::language(),
+            Lang::Nix => tree_sitter_nix::LANGUAGE.into(),
+            Lang::Hcl => tree_sitter_hcl::LANGUAGE.into(),
+            Lang::CMake => tree_sitter_cmake::LANGUAGE.into(),
+            Lang::Verilog => tree_sitter_verilog::LANGUAGE.into(),
+            Lang::Vhdl => tree_sitter_vhdl::LANGUAGE.into(),
+            Lang::Fortran => tree_sitter_fortran::LANGUAGE.into(),
+            Lang::Prolog => tree_sitter_prolog::LANGUAGE.into(),
+            Lang::Racket => tree_sitter_racket::LANGUAGE.into(),
+            Lang::Scheme => tree_sitter_scheme::LANGUAGE.into(),
+            Lang::Proto => tree_sitter_proto::LANGUAGE.into(),
+            Lang::ObjC => tree_sitter_objc::LANGUAGE.into(),
+            Lang::Glsl => tree_sitter_glsl::LANGUAGE_GLSL.into(),
+            Lang::Hlsl => tree_sitter_hlsl::LANGUAGE_HLSL.into(),
+            Lang::Ada => tree_sitter_ada::LANGUAGE.into(),
             _ => return None,
         })
     }
@@ -284,6 +450,77 @@ impl Lang {
                 (class_method_definition (simple_name) @name) @def
                 "#
             }
+            // Verified against a real parse (see `dump_tree_scratch` below,
+            // or just re-run it) for each of the ten languages that follow
+            // — same bar as every language above, not a guess left
+            // unchecked because the grammar happened to link.
+            Lang::Haskell => {
+                r#"
+                (function name: (variable) @name) @def
+                (data_type name: (name) @name) @def
+                (class name: (name) @name) @def
+                "#
+            }
+            Lang::Fish => {
+                r#"
+                (function_definition name: (word) @name) @def
+                "#
+            }
+            Lang::Dart => {
+                r#"
+                (function_declaration signature: (function_signature name: (identifier) @name)) @def
+                (class_declaration name: (identifier) @name) @def
+                (method_declaration signature: (method_signature (function_signature name: (identifier) @name))) @def
+                "#
+            }
+            Lang::Zig => {
+                r#"
+                (function_declaration name: (identifier) @name) @def
+                (variable_declaration (identifier) @name (struct_declaration)) @def
+                "#
+            }
+            Lang::Julia => {
+                r#"
+                (function_definition (signature (call_expression (identifier) @name))) @def
+                (macro_definition (signature (call_expression (identifier) @name))) @def
+                (struct_definition (type_head (identifier) @name)) @def
+                "#
+            }
+            Lang::Groovy => {
+                r#"
+                (function_definition name: (identifier) @name) @def
+                (class_declaration name: (identifier) @name) @def
+                (method_declaration name: (identifier) @name) @def
+                "#
+            }
+            Lang::GraphQL => {
+                r#"
+                (object_type_definition (name) @name) @def
+                (interface_type_definition (name) @name) @def
+                (field_definition (name) @name) @def
+                (input_object_type_definition (name) @name) @def
+                "#
+            }
+            Lang::Crystal => {
+                r#"
+                (method_definition name: (identifier) @name) @def
+                (class_declaration name: (identifier) @name) @def
+                "#
+            }
+            Lang::D => {
+                r#"
+                (function_declaration (identifier) @name) @def
+                (class_declaration (identifier) @name) @def
+                (struct_declaration (identifier) @name) @def
+                "#
+            }
+            // Assembly's closest analog to a "symbol": a `label:` marking a
+            // jump/call target or data location.
+            Lang::Asm => {
+                r#"
+                (label (ident) @name) @def
+                "#
+            }
             _ => return None,
         })
     }
@@ -361,5 +598,98 @@ impl Lang {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod new_language_queries {
+    // Each `def_query_src` addition verified against a real parse of real
+    // sample code, not just "it compiles" -- same bar every existing
+    // language here was held to (see the module doc comment).
+    use super::*;
+
+    fn names(lang: Lang, src: &str) -> Vec<String> {
+        crate::extract_symbols(src, lang).into_iter().map(|s| s.name).collect()
+    }
+
+    #[test]
+    fn haskell_function_data_class() {
+        let src = "module M where\n\nfoo :: Int -> Int\nfoo x = x + 1\n\ndata Color = Red | Blue\n\nclass Show2 a where\n  show2 :: a -> String\n";
+        let found = names(Lang::Haskell, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Color".to_string()), "{found:?}");
+        assert!(found.contains(&"Show2".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn fish_function() {
+        let found = names(Lang::Fish, "function foo\n    echo hi\nend\n");
+        assert_eq!(found, vec!["foo"]);
+    }
+
+    #[test]
+    fn dart_function_class_method() {
+        let src = "int foo(int x) {\n  return x + 1;\n}\n\nclass Bar {\n  void baz() {}\n}\n";
+        let found = names(Lang::Dart, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Bar".to_string()), "{found:?}");
+        assert!(found.contains(&"baz".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn zig_function_and_struct_const() {
+        let src = "fn foo(x: i32) i32 {\n    return x + 1;\n}\n\nconst Bar = struct {\n    dummy: i32,\n};\n";
+        let found = names(Lang::Zig, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn julia_function_struct_macro() {
+        let src = "function foo(x)\n    return x + 1\nend\n\nstruct Point\n    x\n    y\nend\n\nmacro mymacro(x)\n    x\nend\n";
+        let found = names(Lang::Julia, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Point".to_string()), "{found:?}");
+        assert!(found.contains(&"mymacro".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn groovy_function_class_method() {
+        let src = "int foo(int x) {\n    return x + 1\n}\n\nclass Bar {\n    def baz() {}\n}\n";
+        let found = names(Lang::Groovy, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Bar".to_string()), "{found:?}");
+        assert!(found.contains(&"baz".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn graphql_object_and_field() {
+        let found = names(Lang::GraphQL, "type Query {\n  hello: String\n}\n");
+        assert!(found.contains(&"Query".to_string()), "{found:?}");
+        assert!(found.contains(&"hello".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn crystal_method_and_class() {
+        let src = "def foo(x)\n  x + 1\nend\n\nclass Bar\n  def baz\n  end\nend\n";
+        let found = names(Lang::Crystal, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Bar".to_string()), "{found:?}");
+        assert!(found.contains(&"baz".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn d_function_class_struct() {
+        let src = "int foo(int x) {\n    return x + 1;\n}\n\nclass Bar {\n}\n\nstruct Baz {\n}\n";
+        let found = names(Lang::D, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Bar".to_string()), "{found:?}");
+        assert!(found.contains(&"Baz".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn asm_label() {
+        let found = names(Lang::Asm, "foo:\n    mov eax, 1\n    ret\n");
+        assert_eq!(found, vec!["foo"]);
     }
 }

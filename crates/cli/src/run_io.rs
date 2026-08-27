@@ -39,6 +39,14 @@ pub trait RunIo: Send + Sync {
     /// rule). `auto_approve` is `--yolo`'s value, passed through so an
     /// implementation doesn't need its own copy.
     fn confirm(&self, auto_approve: bool, action: String) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>>;
+
+    /// Ask a clarifying question with a fixed set of options (the
+    /// `ask_user` tool) — the agent's own version of the AskUserQuestion
+    /// pattern: for an ambiguous task where the sane answers form a short,
+    /// known set, present them instead of guessing or asking in free text
+    /// the agent then has to parse back out of a text reply. Returns the
+    /// chosen option label(s) verbatim, empty if nothing was picked.
+    fn ask_choice(&self, question: String, options: Vec<String>, multi_select: bool) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>>;
 }
 
 /// The original `grv run` behavior: everything to stdout, confirmation via
@@ -82,6 +90,45 @@ impl RunIo for TerminalIo {
             })
             .await
             .unwrap_or(Decision::Deny)
+        })
+    }
+
+    fn ask_choice(&self, question: String, options: Vec<String>, multi_select: bool) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                println!("\x1b[1;36m{question}\x1b[0m");
+                for (i, opt) in options.iter().enumerate() {
+                    println!("  [{}] {opt}", i + 1);
+                }
+                if multi_select {
+                    print!("\x1b[1;33mpick one or more (comma-separated numbers, or 'all'): \x1b[0m");
+                } else {
+                    print!("\x1b[1;33mpick one (number): \x1b[0m");
+                }
+                std::io::stdout().flush().ok();
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_err() {
+                    return Vec::new();
+                }
+                let line = line.trim();
+                if multi_select && line.eq_ignore_ascii_case("all") {
+                    return options;
+                }
+                let mut picked = Vec::new();
+                for tok in line.split(',') {
+                    if let Ok(n) = tok.trim().parse::<usize>() {
+                        if n >= 1 && n <= options.len() {
+                            picked.push(options[n - 1].clone());
+                        }
+                    }
+                    if !multi_select {
+                        break;
+                    }
+                }
+                picked
+            })
+            .await
+            .unwrap_or_default()
         })
     }
 }

@@ -137,7 +137,9 @@ enum Command {
     /// synthesized back up the tree. Every model call anywhere in the tree
     /// shares one live, RAM-resampled concurrency gate (see `grv status`).
     Mission {
-        task: String,
+        /// Required unless --continue is given a session with recorded
+        /// progress to resume
+        task: Option<String>,
         #[arg(long = "file")]
         files: Vec<PathBuf>,
         /// How many levels a subtask may recurse (default 2, hard ceiling 4)
@@ -146,6 +148,14 @@ enum Command {
         /// Cap on concurrent model calls in flight at once (default: auto-detected from RAM)
         #[arg(long)]
         max_parallel: Option<usize>,
+        /// Resume a previous mission session -- already-completed subtasks
+        /// (and the decomposition of any not-yet-finished ones) are reused
+        /// from checkpoint instead of re-run
+        #[arg(long = "continue")]
+        resume: bool,
+        /// Session id to resume (with --continue) -- defaults to the most recent mission session
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Run several independent agents concurrently (no hand-off between
     /// them, unlike `crew`) — each on its own tier's model. Concurrency
@@ -367,8 +377,20 @@ async fn main() -> Result<()> {
         Command::Swarm { question, files, agents, max_parallel } => {
             cmd_swarm(&cfg, &question, files, &agents, max_parallel).await
         }
-        Command::Mission { task, files, max_depth, max_parallel } => {
-            cmd_mission(&cfg, &task, files, max_depth, max_parallel).await
+        Command::Mission { task, files, max_depth, max_parallel, resume, session } => {
+            let resume_session = if resume {
+                Some(match session {
+                    Some(id) => id,
+                    None => checkpoint::most_recent_mission_session(&repo_root()?)?
+                        .ok_or_else(|| anyhow::anyhow!("no mission checkpoint sessions to continue — run `grv mission` once first"))?,
+                })
+            } else {
+                None
+            };
+            if resume_session.is_none() && task.as_deref().unwrap_or("").trim().is_empty() {
+                anyhow::bail!("a task is required unless --continue is given");
+            }
+            cmd_mission(&cfg, task, files, max_depth, max_parallel, resume_session).await
         }
         Command::Run { task, files, agent, yolo, browser, resume, session } => {
             let spec = resolve_agent(&agent)?;
@@ -806,16 +828,31 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
     Ok(())
 }
 
-async fn cmd_mission(cfg: &Config, task: &str, files: Vec<PathBuf>, max_depth: Option<usize>, max_parallel: Option<usize>) -> Result<()> {
+async fn cmd_mission(
+    cfg: &Config,
+    task: Option<String>,
+    files: Vec<PathBuf>,
+    max_depth: Option<usize>,
+    max_parallel: Option<usize>,
+    resume_session: Option<String>,
+) -> Result<()> {
     let root = repo_root()?;
     let conn = open_repo_db(cfg, &root)?;
-    let context_text = build_context(cfg, &root, &conn, task, &files).await?;
-    let context_block = if context_text.is_empty() {
-        "(No indexed context matched — either run `grv index` first, or this task doesn't map to specific code.)".to_string()
-    } else {
-        format!("Retrieved context:\n{context_text}")
+    // With nothing new to say (a plain --continue), skip retrieval — the
+    // checkpointed context/subtask results already reflect whatever the
+    // original invocation found.
+    let context_block = match &task {
+        Some(t) if !t.trim().is_empty() => {
+            let context_text = build_context(cfg, &root, &conn, t, &files).await?;
+            if context_text.is_empty() {
+                "(No indexed context matched — either run `grv index` first, or this task doesn't map to specific code.)".to_string()
+            } else {
+                format!("Retrieved context:\n{context_text}")
+            }
+        }
+        _ => String::new(),
     };
-    mission::run(cfg, &root, context_block, task, max_depth, max_parallel).await
+    mission::run(cfg, &root, context_block, task.as_deref(), max_depth, max_parallel, resume_session).await
 }
 
 async fn cmd_run(cfg: &Config, task: &str, files: Vec<PathBuf>, agent: &AgentSpec, yolo: bool, browser: bool, resume_session: Option<String>) -> Result<()> {

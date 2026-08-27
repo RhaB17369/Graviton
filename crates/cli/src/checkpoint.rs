@@ -10,8 +10,10 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +154,130 @@ pub struct SessionSummary {
     pub id: String,
     pub steps: usize,
     pub files_touched: usize,
+}
+
+/// A `grv mission` session's persisted tree state, for `grv mission
+/// --continue`. Unlike `Session` (`grv run`'s linear file-change/transcript
+/// log), a mission's tree-shaped *concurrent* execution has no single
+/// sequence to append to — subtasks at the same depth finish in whatever
+/// order the scheduler gets to them. So this is a flat map keyed by tree
+/// position (`"0"` = root, `"0.0"`/`"0.1"` = its children, ...), rewritten
+/// as a whole to disk each time any node's status changes. Fine in
+/// practice: even a wide, deep mission produces at most a few hundred
+/// nodes, and writes only happen at node boundaries (once per subtask/
+/// decompose/synthesize call), not per token.
+#[derive(Clone)]
+pub struct MissionCheckpoint {
+    pub id: String,
+    dir: PathBuf,
+    tree: Arc<Mutex<HashMap<String, MissionNodeRecord>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MissionNodeStatus {
+    Pending,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionNodeRecord {
+    pub task: String,
+    pub agent: String,
+    pub status: MissionNodeStatus,
+    /// The finished result (leaf answer or synthesis), once `status ==
+    /// Done`.
+    pub result: Option<String>,
+    /// This node's exact `decompose()` output, if it's an internal node —
+    /// recorded so a resume replays the same tree shape instead of
+    /// re-asking the planner, which could return a different split and
+    /// orphan already-completed children's cached results. `(agent, task)`
+    /// pairs, mirroring `SubtaskSpec` without a cross-module dependency.
+    pub subtasks: Option<Vec<(String, String)>>,
+}
+
+impl MissionCheckpoint {
+    pub fn new(root: &Path) -> Result<Self> {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let id = format!("mission-{}-{:04x}", ts.as_secs(), ts.subsec_nanos() % 0xffff);
+        let dir = checkpoints_root(root).join(&id);
+        fs::create_dir_all(&dir).context("creating mission checkpoint session dir")?;
+        Ok(Self { id, dir, tree: Arc::new(Mutex::new(HashMap::new())) })
+    }
+
+    pub fn open_existing(root: &Path, id: &str) -> Result<Self> {
+        let dir = checkpoints_root(root).join(id);
+        if !dir.exists() {
+            anyhow::bail!("no checkpoint session '{id}' — run `grv checkpoints` to list sessions");
+        }
+        let tree = fs::read_to_string(dir.join("mission_tree.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Ok(Self { id: id.to_string(), dir, tree: Arc::new(Mutex::new(tree)) })
+    }
+
+    /// This node's recorded state, if any previous run (including this
+    /// one) already reached it.
+    pub fn get(&self, node_path: &str) -> Option<MissionNodeRecord> {
+        self.tree.lock().unwrap().get(node_path).cloned()
+    }
+
+    /// The tree-wide `--max-depth` this session started with, saved once at
+    /// the top so `grv mission --continue` (with no `--max-depth` of its
+    /// own) reuses it instead of silently defaulting to a *different*
+    /// depth than the original run used -- which would make an
+    /// already-terminal node decompose further on resume, or vice versa.
+    pub fn save_max_depth(&self, max_depth: usize) {
+        if let Err(e) = fs::write(self.dir.join("mission_meta.json"), format!(r#"{{"max_depth":{max_depth}}}"#)) {
+            tracing::warn!("failed to persist mission max_depth: {e}");
+        }
+    }
+
+    pub fn load_max_depth(&self) -> Option<usize> {
+        let raw = fs::read_to_string(self.dir.join("mission_meta.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        v.get("max_depth")?.as_u64().map(|n| n as usize)
+    }
+
+    /// Record (or overwrite) one node's state and persist the whole tree.
+    /// Errors are logged, not propagated — losing the ability to resume
+    /// shouldn't abort a mission that's otherwise working, same philosophy
+    /// as `Session::append_message`.
+    pub fn record(&self, node_path: &str, record: MissionNodeRecord) {
+        let snapshot = {
+            let mut map = self.tree.lock().unwrap();
+            map.insert(node_path.to_string(), record);
+            map.clone()
+        };
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(s) => {
+                if let Err(e) = fs::write(self.dir.join("mission_tree.json"), s) {
+                    tracing::warn!("failed to persist mission checkpoint: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("failed to serialize mission checkpoint: {e}"),
+        }
+    }
+}
+
+/// Like `most_recent_session`, but only among `grv mission` sessions
+/// (id prefix `"mission-"`) — the two session kinds share
+/// `.graviton/checkpoints/` but `grv run --continue`/`grv mission
+/// --continue` should never accidentally pick up each other's session.
+pub fn most_recent_mission_session(root: &Path) -> Result<Option<String>> {
+    let base = checkpoints_root(root);
+    if !base.exists() {
+        return Ok(None);
+    }
+    let mut ids: Vec<String> = fs::read_dir(&base)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("mission-"))
+        .collect();
+    ids.sort();
+    Ok(ids.into_iter().last())
 }
 
 /// The most recently created session id, if any — `list_sessions` already

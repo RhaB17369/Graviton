@@ -19,6 +19,7 @@
 
 use crate::agentic;
 use crate::agents;
+use crate::checkpoint::{MissionCheckpoint, MissionNodeRecord, MissionNodeStatus};
 use anyhow::{Context, Result};
 use graviton_core::{Config, ModelTier};
 use graviton_llm::{ChatMessage, OllamaClient};
@@ -46,12 +47,58 @@ pub async fn run(
     cfg: &Config,
     root: &Path,
     context_block: String,
-    task: &str,
+    task: Option<&str>,
     max_depth: Option<usize>,
     max_parallel: Option<usize>,
+    resume_session: Option<String>,
 ) -> Result<()> {
-    let depth = max_depth.unwrap_or(DEFAULT_MAX_DEPTH).clamp(1, HARD_DEPTH_CEILING);
     let client = OllamaClient::new(&cfg.ollama_host);
+
+    let checkpoint = match &resume_session {
+        Some(id) => {
+            let cp = MissionCheckpoint::open_existing(root, id)?;
+            println!("\x1b[2mmission checkpoint session: {} (resumed)\x1b[0m", cp.id);
+            cp
+        }
+        None => {
+            let cp = MissionCheckpoint::new(root)?;
+            println!("\x1b[2mmission checkpoint session: {}\x1b[0m", cp.id);
+            cp
+        }
+    };
+
+    // An explicit --max-depth always wins; otherwise a resume reuses the
+    // depth the original run started with (see `save_max_depth`'s doc
+    // comment for why silently defaulting to a different one on resume
+    // would be wrong), and a fresh mission uses the default.
+    let depth = match max_depth {
+        Some(d) => d.clamp(1, HARD_DEPTH_CEILING),
+        None => resume_session
+            .as_ref()
+            .and_then(|_| checkpoint.load_max_depth())
+            .unwrap_or(DEFAULT_MAX_DEPTH)
+            .clamp(1, HARD_DEPTH_CEILING),
+    };
+    if resume_session.is_none() {
+        checkpoint.save_max_depth(depth);
+    }
+
+    // A resume with no new task text reuses the root node's originally
+    // recorded task -- the whole point of --continue is not having to
+    // retype it. A resume that also passes an additional task string
+    // treats that as a fresh mission sharing the same session/checkpoint
+    // dir instead (each tree position is still keyed by node path, so an
+    // unrelated task just starts writing fresh "0", "0.0", ... entries;
+    // this is intentionally simple rather than trying to detect "same
+    // mission, refined task" vs "different mission" from text alone).
+    let task: String = match task {
+        Some(t) if !t.trim().is_empty() => t.to_string(),
+        _ => checkpoint
+            .get("0")
+            .map(|r| r.task)
+            .ok_or_else(|| anyhow::anyhow!("no task given and no prior task recorded in this session — pass one explicitly"))?,
+    };
+    let task = task.as_str();
 
     // Every model the roster could possibly call, regardless of which
     // agents the planner ends up picking — sizes the scheduler once,
@@ -80,6 +127,8 @@ pub async fn run(
         "architect".to_string(),
         depth,
         scheduler,
+        checkpoint,
+        "0".to_string(),
     )
     .await?;
 
@@ -91,6 +140,9 @@ pub async fn run(
 /// decomposition (or the top-level default) picked for this node *if* it
 /// turns out to be a leaf; if this node decomposes further, each child
 /// gets its own assignment from this node's own planner call instead.
+/// `node_path` is this node's position in the tree (`"0"` for the root,
+/// `"0.1"` for its second child, ...) — the key `checkpoint` persists
+/// results under, so `grv mission --continue` can resume by tree position.
 #[allow(clippy::too_many_arguments)]
 fn execute_node(
     cfg: Config,
@@ -101,16 +153,57 @@ fn execute_node(
     assigned_agent: String,
     depth_remaining: usize,
     scheduler: Arc<crate::resources::LiveScheduler>,
+    checkpoint: MissionCheckpoint,
+    node_path: String,
 ) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
-        if depth_remaining == 0 {
-            return run_leaf(&cfg, &client, &root, &context_block, &task, &assigned_agent, &scheduler).await;
+        // Resume short-circuit: this exact tree position already finished
+        // on a previous invocation of this session.
+        if let Some(record) = checkpoint.get(&node_path) {
+            if record.status == MissionNodeStatus::Done {
+                if let Some(result) = record.result {
+                    println!("\x1b[2m[{node_path}] resumed from checkpoint (already done)\x1b[0m");
+                    return Ok(result);
+                }
+            }
         }
 
-        let subtasks = decompose(&cfg, &client, &context_block, &task, &scheduler).await?;
+        if depth_remaining == 0 {
+            let result = run_leaf(&cfg, &client, &root, &context_block, &task, &assigned_agent, &scheduler).await;
+            record_leaf(&checkpoint, &node_path, &task, &assigned_agent, &result);
+            return result;
+        }
+
+        // If this node was already decomposed on a previous (interrupted)
+        // invocation, reuse that exact split instead of re-asking the
+        // planner -- a different split now would orphan already-completed
+        // children's cached results under stale node paths.
+        let subtasks = match checkpoint.get(&node_path).and_then(|r| r.subtasks) {
+            Some(recorded) => {
+                println!("\x1b[2m[{node_path}] resumed decomposition ({} subtask(s)) from checkpoint\x1b[0m", recorded.len());
+                recorded.into_iter().map(|(agent, task)| SubtaskSpec { agent, task }).collect()
+            }
+            None => {
+                let subtasks = decompose(&cfg, &client, &context_block, &task, &scheduler).await?;
+                checkpoint.record(
+                    &node_path,
+                    MissionNodeRecord {
+                        task: task.clone(),
+                        agent: assigned_agent.clone(),
+                        status: MissionNodeStatus::Pending,
+                        result: None,
+                        subtasks: Some(subtasks.iter().map(|s| (s.agent.clone(), s.task.clone())).collect()),
+                    },
+                );
+                subtasks
+            }
+        };
+
         if subtasks.len() <= 1 {
             let agent = subtasks.into_iter().next().map(|s| s.agent).unwrap_or(assigned_agent);
-            return run_leaf(&cfg, &client, &root, &context_block, &task, &agent, &scheduler).await;
+            let result = run_leaf(&cfg, &client, &root, &context_block, &task, &agent, &scheduler).await;
+            record_leaf(&checkpoint, &node_path, &task, &agent, &result);
+            return result;
         }
 
         println!(
@@ -123,7 +216,7 @@ fn execute_node(
         }
 
         let mut set = tokio::task::JoinSet::new();
-        for sub in subtasks {
+        for (i, sub) in subtasks.into_iter().enumerate() {
             set.spawn(execute_node(
                 cfg.clone(),
                 client.clone(),
@@ -133,6 +226,8 @@ fn execute_node(
                 sub.agent,
                 depth_remaining - 1,
                 scheduler.clone(),
+                checkpoint.clone(),
+                format!("{node_path}.{i}"),
             ));
         }
         let mut children = Vec::new();
@@ -140,8 +235,42 @@ fn execute_node(
             children.push(joined.context("mission subtask panicked")??);
         }
 
-        synthesize(&cfg, &client, &context_block, &task, &children, &scheduler).await
+        let result = synthesize(&cfg, &client, &context_block, &task, &children, &scheduler).await;
+        record_synthesis(&checkpoint, &node_path, &task, &assigned_agent, &result);
+        result
     })
+}
+
+/// Persist a leaf node's outcome — `Done` with its result, or `Failed` (no
+/// result cached, so a resume retries it rather than replaying an error).
+fn record_leaf(checkpoint: &MissionCheckpoint, node_path: &str, task: &str, agent: &str, result: &Result<String>) {
+    checkpoint.record(
+        node_path,
+        MissionNodeRecord {
+            task: task.to_string(),
+            agent: agent.to_string(),
+            status: if result.is_ok() { MissionNodeStatus::Done } else { MissionNodeStatus::Failed },
+            result: result.as_ref().ok().cloned(),
+            subtasks: None,
+        },
+    );
+}
+
+/// Same idea for an internal node's synthesis step, preserving the
+/// already-recorded `subtasks` split (so a retry after a failed synthesis
+/// still reuses the same children instead of re-decomposing).
+fn record_synthesis(checkpoint: &MissionCheckpoint, node_path: &str, task: &str, agent: &str, result: &Result<String>) {
+    let subtasks = checkpoint.get(node_path).and_then(|r| r.subtasks);
+    checkpoint.record(
+        node_path,
+        MissionNodeRecord {
+            task: task.to_string(),
+            agent: agent.to_string(),
+            status: if result.is_ok() { MissionNodeStatus::Done } else { MissionNodeStatus::Failed },
+            result: result.as_ref().ok().cloned(),
+            subtasks,
+        },
+    );
 }
 
 /// Every model call in a mission — leaf work, planning, synthesis — funnels

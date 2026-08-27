@@ -85,6 +85,28 @@ can hold resident and re-checked continuously rather than assumed once at
 startup — with CPU threads still shared across whatever's running (see
 ARCHITECTURE.md for the trade-off spelled out).
 
+**`grv mission` is resumable too**, the same idea as `grv run --continue`
+but tracking the whole task tree instead of one flat conversation — every
+node's status (pending/done/failed), its result, and the exact subtask
+split a planner call chose are checkpointed as they happen, keyed by tree
+position:
+
+```sh
+grv mission --continue                          # resume the most recent mission, no new instruction
+grv mission --continue --session <id>           # resume a specific (not the latest) mission
+```
+
+A resume never re-asks the planner for nodes that already finished — a
+`Done` leaf or synthesis short-circuits straight to its cached result, and
+a node that was already split into subtasks reuses that exact split rather
+than re-decomposing (re-decomposing could produce a differently-shaped
+tree and orphan children that already finished). Only a genuinely
+unfinished node — e.g. one that failed because a model call errored, or
+because you killed the process mid-run — actually does new work on
+resume. `--max-depth` is remembered from the original run too, so a resume
+without an explicit `--max-depth` doesn't silently fall back to the
+default and cause an already-terminal node to spuriously decompose again.
+
 ### `ask`/`crew` (read-only) vs. `run` (acts on your project)
 
 `ask`, `investigate`, and `crew` are analysis only: they retrieve context
@@ -136,6 +158,18 @@ and it's read as a redirect: the write/edit/shell call is declined *and*
 what you typed is fed back to the model as the reason, so "no, use a
 different approach" actually reaches the next turn instead of only being
 expressible as a blind refusal.
+
+**The agent can ask *you* a question, too.** Every `ask`/`run`/`crew`/
+`review`/`swarm`/`mission` agent has an `ask_user` tool: instead of
+guessing at an ambiguous instruction, it can stop and present you with a
+question plus a short list of options (single- or multi-select) — "which
+of these three auth flows should I harden first?" — and get a real answer
+back into the same turn before continuing, rather than silently picking
+one or asking you to re-run with more detail. On the terminal this is a
+numbered prompt (comma-separated picks, or `all`); over `grv serve` it's
+an `ask_choice` event a client answers via `run_answer_choice` (see
+"`grv serve`" below) — so an editor integration can render it as an actual
+checkbox/radio UI instead of a text prompt.
 
 **Every `grv run` is resumable**, not just the ones you remembered to plan
 for — the full conversation (including every tool call and result) is
@@ -406,10 +440,14 @@ startup cost.
 Methods: `status`, `agents`, `search`, `symbol`, `semantic_search`, `ask`,
 `review` (add `"stream": true` to either of the last two for live
 `token`/`tool_call` notifications instead of one final answer), `run_start`/
-`run_attach`/`run_confirm`/`run_status` (drive a full checkpointed `grv run`
-agentic session — confirm prompts included — over the socket instead of
-only from a terminal), and `shutdown`. Full request/response shapes and an
-example session (including the confirm round trip) are in ARCHITECTURE.md.
+`run_attach`/`run_confirm`/`run_answer_choice`/`run_status` (drive a full
+checkpointed `grv run` agentic session — confirm prompts and `ask_user`
+questions included — over the socket instead of only from a terminal), and
+`shutdown`. `run_attach` streams `run_event` notifications, one of which is
+`"kind": "ask_choice"` (the agent's `ask_user` tool call, with its question
+and options) — reply with `run_answer_choice {session_id, selected: [...]}`
+from any connection. Full request/response shapes and an example session
+(including the confirm and ask_choice round trips) are in ARCHITECTURE.md.
 Model-calling methods share a `LiveScheduler` (same design as `swarm`/
 `mission`), so a chatty editor firing several requests at once still can't
 out-run this machine's RAM.
@@ -422,17 +460,28 @@ socket). Not a hardened secret — enough to stop an opportunistic hit on the
 port from doing anything, for a tool meant to bind `127.0.0.1`/a trusted
 LAN, not to stand in for real auth on an internet-facing service.
 
-## Current scope (v0.11)
+## Current scope (v0.12)
 
-- **Languages with symbol extraction (17):** Rust, Python, JavaScript,
-  TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity,
-  PowerShell.
-- **Languages recognized + fully searchable, no symbol extraction (11):**
-  Kotlin (see ARCHITECTURE.md for why — tree-sitter-kotlin's crates.io
-  release is stuck on an incompatible tree-sitter core), HTML, CSS, JSON,
-  YAML, TOML, XML, Markdown, SQL, Dockerfile, INI, Makefile.
-- Any other text file is still fully searchable (line-window chunking never
-  depends on tree-sitter), it just won't show up in `grv symbol`.
+- **Languages with verified symbol extraction (26):** Rust, Python,
+  JavaScript, TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua,
+  Solidity, PowerShell, Haskell, Fish, Dart, Zig, Julia, Groovy, GraphQL,
+  Crystal, D, and assembly (label-based — the closest thing assembly has to
+  a "symbol"). Each was checked against a real sample file, not just
+  compiled — see ARCHITECTURE.md's "Language coverage" for the method.
+- **Languages with a real tree-sitter grammar linked but no verified
+  definition query yet (24):** Elixir, Scala, Swift, Perl, R, OCaml, Elm,
+  Nim, Erlang, Vim, Nix, HCL/Terraform, CMake, Verilog, VHDL, Fortran,
+  Prolog, Racket, Scheme, Protobuf, Objective-C, GLSL, HLSL, Ada — fully
+  searchable now, and adding `grv symbol` support for any of these later is
+  "write and verify one query", not "add a grammar".
+- **Recognized + fully searchable, no grammar at all (16):** Kotlin,
+  Svelte, Vue, WGSL, LaTeX (all five have a real reason a grammar can't be
+  linked here — version conflicts or a broken external scanner, see
+  ARCHITECTURE.md), HTML, CSS, JSON, YAML, TOML, XML, Markdown, SQL,
+  Dockerfile, INI, Makefile.
+- That's 66 recognized languages total, plus: any other text file is still
+  fully searchable (line-window chunking never depends on tree-sitter), it
+  just won't show up in `grv symbol`/get its own name.
 - **Retrieval:** SQLite FTS5 (bm25) for text, LIKE-based symbol name matching
   for precise jumps, plus optional embedding-based semantic search (see
   above) once `grv config --embed-model` + `grv embed` are set up — off by
@@ -447,8 +496,9 @@ LAN, not to stand in for real auth on an internet-facing service.
 
 ## Roadmap
 
-- Kotlin symbol extraction once a crates.io grammar release supports current tree-sitter
-- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go (C/C++/Java/C#/PHP/Ruby/Bash/Lua/Solidity/PowerShell have no call queries yet)
-- An ANN index for `grv embed` once a single repo's chunk count grows large enough that the current linear cosine scan actually shows up (not yet observed at any repo size tested)
+- **An ANN index for `grv embed`/semantic search** — currently a linear cosine scan. This is the top open item: GRAVITON is meant to hold up on very large repos, where a linear scan over every stored embedding stops being free.
+- `def_query_src` (i.e. `grv symbol` support) for the 24 languages that already have a grammar linked but no verified query yet — Elixir, Scala, Swift, Perl, R, OCaml, Elm, Nim, Erlang, Vim, Nix, HCL, CMake, Verilog, VHDL, Fortran, Prolog, Racket, Scheme, Protobuf, Objective-C, GLSL, HLSL, Ada. All are already fully searchable today.
+- Kotlin/Svelte/Vue/WGSL/LaTeX symbol extraction — each blocked on a real external issue (old tree-sitter core pinned by the crate, or a broken external-scanner link), not an oversight. See ARCHITECTURE.md.
+- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other 26+ parsed/linked languages have no call queries yet.
 - `grv serve --tcp`'s token is a stopgap, not hardened auth — fine bound to 127.0.0.1/a trusted LAN, not something to expose more broadly as-is
-- `grv serve run_attach` only streams events from attach time forward (plus a synthesized catch-up for a pending confirm or an already-finished run) — not a full replay of everything that happened before you attached; `run_status` fills the rest of the gap
+- `grv serve run_attach` only streams events from attach time forward (plus a synthesized catch-up for a pending confirm, a pending `ask_user` question, or an already-finished run) — not a full replay of everything that happened before you attached; `run_status` fills the rest of the gap
