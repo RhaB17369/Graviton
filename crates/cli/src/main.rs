@@ -1,5 +1,6 @@
 mod agentic;
 mod agents;
+mod ann;
 mod browser;
 mod callgraph;
 mod checkpoint;
@@ -458,7 +459,7 @@ async fn cmd_search(cfg: &Config, query: &str, limit: usize, use_semantic: bool)
         if !semantic::has_embeddings(&conn) {
             anyhow::bail!("no embeddings computed yet — run `grv embed` first");
         }
-        let hits = semantic::search(&cfg.ollama_host, &conn, model, query, limit).await?;
+        let hits = semantic::search(&cfg.ollama_host, &conn, &root, &cfg.index_dir, model, query, limit).await?;
         if hits.is_empty() {
             println!("no matches");
             return Ok(());
@@ -494,7 +495,7 @@ async fn cmd_embed(cfg: &Config, force: bool, model_override: Option<String>) ->
     let model = model_override
         .or_else(|| cfg.embed_model.clone())
         .ok_or_else(|| anyhow::anyhow!("no embedding model configured — set one with `grv config --embed-model <tag>` (e.g. nomic-embed-text, all-minilm; `ollama pull` it first) or pass `grv embed --model <tag>`"))?;
-    let stats = semantic::embed_index(&cfg.ollama_host, &mut conn, &model, force).await?;
+    let stats = semantic::embed_index(&cfg.ollama_host, &mut conn, &root, &cfg.index_dir, &model, force).await?;
     println!(
         "done: {} embedded, {} already up to date, {} failed",
         stats.embedded, stats.skipped_existing, stats.failed
@@ -575,7 +576,7 @@ pub(crate) fn build_context_sync(
     conn: &rusqlite::Connection,
     question: &str,
     files: &[PathBuf],
-) -> Result<(Vec<Vec<context::ContextBlock>>, Option<(String, Vec<semantic::EmbeddedChunk>)>)> {
+) -> Result<(Vec<Vec<context::ContextBlock>>, Option<semantic::QuerySource>)> {
     let explicit: Vec<context::ContextBlock> = files
         .iter()
         .filter_map(|f| context::read_whole_file(root, f))
@@ -585,8 +586,8 @@ pub(crate) fn build_context_sync(
     let groups = vec![explicit, symbol_hits, chunk_hits];
 
     let semantic_src = match cfg.embed_model.as_deref() {
-        Some(model) if semantic::has_embeddings(conn) => match semantic::load_embeddings(conn, model) {
-            Ok(chunks) => Some((model.to_string(), chunks)),
+        Some(model) if semantic::has_embeddings(conn) => match semantic::prepare_query_source(conn, root, &cfg.index_dir, model) {
+            Ok(source) => Some(source),
             Err(e) => {
                 eprintln!("\x1b[2msemantic retrieval skipped: {e:#}\x1b[0m");
                 None
@@ -605,10 +606,10 @@ pub(crate) async fn finish_context(
     cfg: &Config,
     question: &str,
     mut groups: Vec<Vec<context::ContextBlock>>,
-    semantic_src: Option<(String, Vec<semantic::EmbeddedChunk>)>,
+    semantic_src: Option<semantic::QuerySource>,
 ) -> Result<String> {
-    if let Some((model, chunks)) = semantic_src {
-        match semantic::rank_by_query(&cfg.ollama_host, &model, question, chunks, 8).await {
+    if let Some(source) = semantic_src {
+        match semantic::rank_by_query(&cfg.ollama_host, question, source, 8).await {
             Ok(hits) => groups.push(
                 hits.into_iter()
                     .map(|h| context::ContextBlock {

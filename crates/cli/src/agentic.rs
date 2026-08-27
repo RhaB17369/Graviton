@@ -158,7 +158,7 @@ pub(crate) fn read_only_tool_defs() -> Vec<ToolDef> {
 /// that path may take `&Connection` — see `semantic::EmbeddedChunk`.
 enum SearchOutcome {
     Done(Result<String>),
-    Rank { model: String, query: String, limit: usize, chunks: Vec<semantic::EmbeddedChunk> },
+    Rank { query: String, limit: usize, source: semantic::QuerySource },
 }
 
 /// `search_code`/`semantic_search` logic, shared between `dispatch_inner`
@@ -166,7 +166,14 @@ enum SearchOutcome {
 /// (which opens a short-lived one per call — fine under WAL, and mission's
 /// leaves calling this concurrently is exactly the case WAL mode is for).
 /// Plain sync fn — see `SearchOutcome`.
-fn prepare_search_tool(conn: &rusqlite::Connection, embed_model: Option<&str>, name: &str, args: &Value) -> Option<SearchOutcome> {
+fn prepare_search_tool(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    index_dir: &str,
+    embed_model: Option<&str>,
+    name: &str,
+    args: &Value,
+) -> Option<SearchOutcome> {
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
     match name {
@@ -186,8 +193,8 @@ fn prepare_search_tool(conn: &rusqlite::Connection, embed_model: Option<&str>, n
             if !semantic::has_embeddings(conn) {
                 return Some(SearchOutcome::Done(Err(anyhow::anyhow!("no embeddings computed yet — run `grv embed` first"))));
             }
-            match semantic::load_embeddings(conn, model) {
-                Ok(chunks) => Some(SearchOutcome::Rank { model: model.to_string(), query, limit, chunks }),
+            match semantic::prepare_query_source(conn, root, index_dir, model) {
+                Ok(source) => Some(SearchOutcome::Rank { query, limit, source }),
                 Err(e) => Some(SearchOutcome::Done(Err(e))),
             }
         }
@@ -200,8 +207,8 @@ fn prepare_search_tool(conn: &rusqlite::Connection, embed_model: Option<&str>, n
 async fn finish_search_outcome(ollama_host: &str, outcome: SearchOutcome) -> Result<String> {
     match outcome {
         SearchOutcome::Done(r) => r,
-        SearchOutcome::Rank { model, query, limit, chunks } => {
-            let hits = semantic::rank_by_query(ollama_host, &model, &query, chunks, limit).await?;
+        SearchOutcome::Rank { query, limit, source } => {
+            let hits = semantic::rank_by_query(ollama_host, &query, source, limit).await?;
             if hits.is_empty() {
                 return Ok("no matches".to_string());
             }
@@ -287,7 +294,7 @@ pub(crate) async fn dispatch_read_only(cfg: &Config, root: &Path, name: &str, ar
                     anyhow::bail!("no index found — run `grv index` first");
                 }
                 let conn = graviton_core::open_db(&db_path)?;
-                let outcome = prepare_search_tool(&conn, cfg.embed_model.as_deref(), name, args);
+                let outcome = prepare_search_tool(&conn, root, &cfg.index_dir, cfg.embed_model.as_deref(), name, args);
                 drop(conn); // done with the connection before the async ranking step below
                 match outcome {
                     Some(outcome) => finish_search_outcome(&cfg.ollama_host, outcome).await,
@@ -850,7 +857,7 @@ async fn dispatch_inner(state: &mut State, name: &str, args: &Value) -> Result<S
                 anyhow::bail!("no index found — run `grv index` first");
             }
             let conn = graviton_core::open_db(&db_path)?;
-            let outcome = prepare_search_tool(&conn, state.embed_model.as_deref(), name, args);
+            let outcome = prepare_search_tool(&conn, &state.root, &state.index_dir, state.embed_model.as_deref(), name, args);
             drop(conn); // done with the connection before the async ranking step below
             match outcome {
                 Some(outcome) => finish_search_outcome(&state.ollama_host, outcome).await,

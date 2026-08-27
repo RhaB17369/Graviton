@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use graviton_llm::OllamaClient;
 use rusqlite::Connection;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct SemanticHit {
@@ -33,11 +34,41 @@ pub struct SemanticHit {
 /// take `&Connection` — all DB reads happen in a plain sync fn first
 /// (`load_embeddings`), and only owned data crosses into async code.
 pub struct EmbeddedChunk {
+    /// `content_fts` rowid — needed by `ann::rebuild` to store a compact
+    /// (id, vector) pair without duplicating path/body text into the ANN
+    /// index file (see `ann.rs`'s module doc).
+    pub chunk_id: i64,
     pub path: String,
     pub start_line: i64,
     pub end_line: i64,
     pub body: String,
     pub vector: Vec<f32>,
+}
+
+/// What a query ranks against, decided synchronously before any embedding
+/// call. `Ann` is the fast path — used whenever `grv embed` has left a
+/// fresh index on disk for `model` (see `ann::rebuild`), so the expensive
+/// full `load_embeddings` scan is skipped entirely. `Linear` is the
+/// always-correct fallback: every embedded chunk, loaded up front and
+/// exact-scanned, exactly how this module worked before it gained ANN
+/// support. Owned/`Send` throughout — no `Connection` — for the same
+/// reason as `EmbeddedChunk` (see its doc comment).
+pub enum QuerySource {
+    Ann { root: PathBuf, index_dir: String, model: String },
+    Linear { model: String, chunks: Vec<EmbeddedChunk> },
+}
+
+/// Sync prep, safe to call with a live `&Connection`: pick `Ann` if a
+/// fresh index exists for `model` (the whole payoff for a large repo —
+/// see `ann.rs`), otherwise fall back to `load_embeddings`. Callers that
+/// already check `has_embeddings` first (existing convention throughout
+/// this codebase) call this in place of `load_embeddings` directly.
+pub fn prepare_query_source(conn: &Connection, root: &Path, index_dir: &str, model: &str) -> Result<QuerySource> {
+    if crate::ann::exists(root, index_dir, model) {
+        Ok(QuerySource::Ann { root: root.to_path_buf(), index_dir: index_dir.to_string(), model: model.to_string() })
+    } else {
+        Ok(QuerySource::Linear { model: model.to_string(), chunks: load_embeddings(conn, model)? })
+    }
 }
 
 #[derive(Default, Debug)]
@@ -84,7 +115,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// but still serializes somewhat against one resident model in Ollama, so
 /// this is a real-but-modest pipeline rather than either one-at-a-time or
 /// an unbounded flood).
-pub async fn embed_index(ollama_host: &str, conn: &mut Connection, model: &str, force: bool) -> Result<EmbedStats> {
+pub async fn embed_index(ollama_host: &str, conn: &mut Connection, root: &Path, index_dir: &str, model: &str, force: bool) -> Result<EmbedStats> {
     let rows: Vec<(i64, String)> = {
         let mut stmt = conn.prepare("SELECT rowid, body FROM content_fts WHERE kind = 'chunk'")?;
         let out: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.filter_map(|r| r.ok()).collect();
@@ -155,6 +186,25 @@ pub async fn embed_index(ollama_host: &str, conn: &mut Connection, model: &str, 
             println!("\x1b[2m  {done}/{total}\x1b[0m");
         }
     }
+
+    // Refresh the ANN index over *every* currently stored embedding for
+    // this model (not just what was just embedded) -- see `ann.rs`'s
+    // module doc for why a full rebuild here, rather than incremental
+    // maintenance, is the deliberately simple invariant. Never fatal: a
+    // failure here only means semantic search stays on its always-correct
+    // linear-scan fallback, so it's reported, not propagated.
+    match load_embeddings(conn, model) {
+        Ok(all) => {
+            let count = all.len();
+            match crate::ann::rebuild(root, index_dir, model, &all) {
+                Ok(()) if count > 0 => println!("\x1b[2mANN index rebuilt ({count} vector(s))\x1b[0m"),
+                Ok(()) => {}
+                Err(e) => eprintln!("\x1b[2mwarning: ANN index rebuild failed (semantic search will fall back to a linear scan): {e:#}\x1b[0m"),
+            }
+        }
+        Err(e) => eprintln!("\x1b[2mwarning: could not reload embeddings to rebuild the ANN index: {e:#}\x1b[0m"),
+    }
+
     Ok(stats)
 }
 
@@ -163,45 +213,118 @@ pub async fn embed_index(ollama_host: &str, conn: &mut Connection, model: &str, 
 /// first, then hand the result to `rank_by_query`.
 pub fn load_embeddings(conn: &Connection, model: &str) -> Result<Vec<EmbeddedChunk>> {
     let mut stmt = conn.prepare(
-        "SELECT c.path, c.start_line, c.end_line, c.body, e.vector \
+        "SELECT e.chunk_id, c.path, c.start_line, c.end_line, c.body, e.vector \
          FROM embeddings e JOIN content_fts c ON c.rowid = e.chunk_id \
          WHERE e.model = ?1",
     )?;
     let mapped = stmt.query_map([model], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?, r.get::<_, Vec<u8>>(4)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, Vec<u8>>(5)?,
+        ))
     })?;
     Ok(mapped
         .filter_map(|r| r.ok())
-        .map(|(path, start_line, end_line, body, raw)| EmbeddedChunk { path, start_line, end_line, body, vector: bytes_to_f32(&raw) })
+        .map(|(chunk_id, path, start_line, end_line, body, raw)| EmbeddedChunk {
+            chunk_id,
+            path,
+            start_line,
+            end_line,
+            body,
+            vector: bytes_to_f32(&raw),
+        })
         .collect())
 }
 
-/// Embed `query` and rank the given (already-loaded) chunks by cosine
-/// similarity. O(n) over however many chunks are embedded — no ANN index —
-/// which is plenty fast (single-digit ms) up to the tens-of-thousands-of-
-/// chunks range a local single-repo index actually reaches. No `Connection`
-/// anywhere in this signature — see `EmbeddedChunk`'s doc comment.
-pub async fn rank_by_query(ollama_host: &str, model: &str, query: &str, chunks: Vec<EmbeddedChunk>, limit: usize) -> Result<Vec<SemanticHit>> {
-    let client = OllamaClient::new(ollama_host);
-    let qvec = client.embed(model, query).await.context("embedding query")?;
+/// One `SELECT ... WHERE rowid IN (...)` to hydrate ANN search results
+/// (`(chunk_id, score)` pairs with no text yet) into full `SemanticHit`s.
+/// The only place this module opens a `Connection` after the async embed
+/// call has already finished — never held across an `.await`, matching
+/// the discipline documented on `EmbeddedChunk`. Building the `IN (...)`
+/// list via plain integer formatting (not string interpolation of
+/// anything user-supplied) is safe: every id here came from our own
+/// `ann::search`, never from the query text.
+fn hydrate(conn: &Connection, mut scored: Vec<(i64, f32)>) -> Result<Vec<SemanticHit>> {
+    if scored.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = scored.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT rowid, path, start_line, end_line, body FROM content_fts WHERE rowid IN ({ids})");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut by_id: std::collections::HashMap<i64, (String, i64, i64, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))?
+        .filter_map(|r| r.ok())
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(scored
+        .into_iter()
+        .filter_map(|(id, score)| by_id.remove(&id).map(|(path, start_line, end_line, body)| SemanticHit { path, start_line, end_line, body, score }))
+        .collect())
+}
 
+/// Exact cosine scan over already-loaded chunks — the `Linear` path, and
+/// the fallback an `Ann` search degrades to if the index turns out to be
+/// missing/corrupt/empty at query time.
+fn score_linear(qvec: &[f32], chunks: Vec<EmbeddedChunk>, limit: usize) -> Vec<SemanticHit> {
     let mut hits: Vec<SemanticHit> = chunks
         .into_iter()
         .map(|c| {
-            let score = cosine(&qvec, &c.vector);
+            let score = cosine(qvec, &c.vector);
             SemanticHit { path: c.path, start_line: c.start_line, end_line: c.end_line, body: c.body, score }
         })
         .collect();
     hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     hits.truncate(limit);
-    Ok(hits)
+    hits
+}
+
+/// Embed `query` and rank against `source` — either an ANN index lookup
+/// (fast path, falls back to `Linear` scoring on any index problem) or an
+/// exact cosine scan over already-loaded chunks. No `Connection` anywhere
+/// in this signature — see `EmbeddedChunk`'s doc comment — any DB access
+/// needed for ANN hydration opens its own short-lived connection, after
+/// the only `.await` in this function has already completed.
+pub async fn rank_by_query(ollama_host: &str, query: &str, source: QuerySource, limit: usize) -> Result<Vec<SemanticHit>> {
+    let model = match &source {
+        QuerySource::Ann { model, .. } => model.clone(),
+        QuerySource::Linear { model, .. } => model.clone(),
+    };
+    let client = OllamaClient::new(ollama_host);
+    let qvec = client.embed(&model, query).await.context("embedding query")?;
+
+    match source {
+        QuerySource::Linear { chunks, .. } => Ok(score_linear(&qvec, chunks, limit)),
+        QuerySource::Ann { root, index_dir, model } => {
+            match crate::ann::search(&root, &index_dir, &model, &qvec, limit)? {
+                Some(scored) if !scored.is_empty() => {
+                    let db_path = graviton_core::db_path_for(&root, &index_dir)?;
+                    let conn = graviton_core::open_db(&db_path)?;
+                    hydrate(&conn, scored)
+                }
+                // No usable index (missing/corrupt/foreign/empty) --
+                // degrade to the exact linear scan rather than returning
+                // nothing. This is the ANN feature's whole design promise:
+                // it can only make a search faster, never wrong.
+                _ => {
+                    let db_path = graviton_core::db_path_for(&root, &index_dir)?;
+                    let conn = graviton_core::open_db(&db_path)?;
+                    let chunks = load_embeddings(&conn, &model)?;
+                    Ok(score_linear(&qvec, chunks, limit))
+                }
+            }
+        }
+    }
 }
 
 /// Convenience wrapper for callers with no `Send` constraint on the
 /// resulting future (i.e. not spawned via `tokio::spawn`/`Box::pin(... +
 /// Send)`) — `grv search --semantic` is a plain top-level `.await`, not a
 /// spawned task, so the `&Connection` in this signature is harmless here.
-pub async fn search(ollama_host: &str, conn: &Connection, model: &str, query: &str, limit: usize) -> Result<Vec<SemanticHit>> {
-    let chunks = load_embeddings(conn, model)?;
-    rank_by_query(ollama_host, model, query, chunks, limit).await
+pub async fn search(ollama_host: &str, conn: &Connection, root: &Path, index_dir: &str, model: &str, query: &str, limit: usize) -> Result<Vec<SemanticHit>> {
+    let source = prepare_query_source(conn, root, index_dir, model)?;
+    rank_by_query(ollama_host, query, source, limit).await
 }

@@ -231,7 +231,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.12)
+## Language coverage (v0.13)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its
@@ -239,31 +239,31 @@ grammar on crates.io, pull its `node-types.json` to find the right node/field
 names for function/class/method definitions, write the query, and let the
 existing "best-effort, never fatal" machinery handle version drift.
 
-GRAVITON recognizes **66 languages total**, split into three honest tiers —
+GRAVITON recognizes **66 languages total**, split into two honest tiers —
 "honest" meaning the tier a language sits in reflects what was actually
 verified, not what merely compiles:
 
-- **26 with a verified `def_query_src`** — the grammar is linked AND its
+- **50 with a verified `def_query_src`** — the grammar is linked AND its
   query was checked against a real sample file's `extract_symbols()` output,
   not just compiled: the original 16 (Rust, Python, JavaScript, TypeScript,
-  TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity, PowerShell)
-  plus 10 added for the "at least 60 languages" push (Haskell, Fish, Dart,
-  Zig, Julia, Groovy, GraphQL, Crystal, D, and assembly — assembly's
-  "symbol" is a label, the closest thing the format has to one).
-- **24 with a grammar linked but no query written yet** — Elixir, Scala,
-  Swift, Perl, R, OCaml, Elm, Nim, Erlang, Vim, Nix, HCL/Terraform, CMake,
-  Verilog, VHDL, Fortran, Prolog, Racket, Scheme, Protobuf, Objective-C,
-  GLSL, HLSL, Ada. These files are already fully searchable; extending
-  `grv symbol` to them is "write and verify one query" work, deliberately
-  not done speculatively here (see the node/field-name pitfall below —
-  guessing produces a query that compiles and silently matches nothing).
+  TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity, PowerShell),
+  10 added for the "at least 60 languages" push (Haskell, Fish, Dart, Zig,
+  Julia, Groovy, GraphQL, Crystal, D, and assembly — assembly's "symbol" is
+  a label, the closest thing the format has to one), and 24 more added in
+  a follow-up pass (Elixir, Scala, Swift, Perl, R, OCaml, Elm, Nim, Erlang,
+  Vim, Nix, HCL/Terraform, CMake, Verilog, VHDL, Fortran, Prolog, Racket,
+  Scheme, Protobuf, Objective-C, GLSL, HLSL, Ada) once each one's queries
+  had been checked the same way — see "Text-predicate-based queries"
+  below for the subset of these (Elixir, Racket, Scheme) that needed more
+  than a structural query to get right.
 - **16 tagged only, no grammar at all** — Kotlin, HTML, CSS, JSON, YAML,
   TOML, XML, Markdown, SQL, Dockerfile, INI, Makefile, plus four added
-  this round for real, verified reasons (below): Svelte, Vue, WGSL, LaTeX.
+  in the same push for real, verified reasons (below): Svelte, Vue, WGSL,
+  LaTeX.
 
 Two real constraints surfaced while adding the original v0.2 batch (Java,
 C#, PHP, Ruby, Bash, Lua, Solidity, PowerShell), and both recurred, harder,
-in the 37-language push:
+in the two later, much bigger language pushes:
 
 - **Node/field names must be looked up per grammar, not assumed.** They
   don't follow one convention: Ruby's `class`/`module` nodes *do* expose a
@@ -272,7 +272,7 @@ in the 37-language push:
   field label at all (`(class_declaration (type_identifier) @name)` instead
   of `(class_declaration name: (type_identifier) @name)`). Get this wrong
   and the query still compiles — it just silently matches nothing, which is
-  why every language in the 26-language tier was verified two ways: real
+  why every language in the 50-language tier was verified two ways: real
   `node-types.json` inspection plus a real parse (`to_sexp()` dump) of a
   hand-written sample file in each language, then a permanent test
   (`crates/indexer/src/lang.rs`'s `new_language_queries` module) asserting
@@ -314,6 +314,63 @@ in the 37-language push:
   (so files are still recognized, tagged, and fully searchable) but no
   `ts_language()` arm — they fall to tagged tier, same category as Kotlin,
   rather than being silently dropped or crashing the build.
+
+### Text-predicate-based queries (Elixir, Racket, Scheme)
+
+A tree-sitter grammar node-type mapping is enough for most languages
+because a function/class/struct is a genuinely distinct node type. Three
+grammars break that assumption in a way no amount of query cleverness on
+node *shape* alone can fix:
+
+- **Elixir** compiles `def`/`defp`/`defmacro`/`defmodule` — and, just as
+  importantly, `if`/`case`/`unless`/`receive`/every other control-flow
+  form — down to the exact same `call` node with a `do_block` child. The
+  grammar has no "this call is special" bit.
+- **Racket and Scheme** are generic S-expression grammars: `(define (foo
+  x) ...)` and an ordinary function call like `(+ x 1)` are both just a
+  `list` of children. `define` isn't a keyword to the grammar at all.
+
+A query that matches on shape alone (`(call ... (do_block))`, `(list
+(symbol) (list ...))`) would therefore also match every `if` block or
+every function call — not a minor imprecision, a query that flags most of
+an ordinary source file as "definitions". Tree-sitter's query language has
+an answer for exactly this: `#eq?`/`#any-of?` predicates that constrain a
+capture's *text*, not just its shape (e.g. `(#eq? @kw "defmodule")`).
+
+The catch: predicates are parsed by `Query::new` but **not enforced by
+`QueryCursor` on its own** — the tree-sitter Rust crate deliberately leaves
+evaluating them to the caller (`QueryMatch::satisfies_text_predicates`),
+since it doesn't want to force a specific text-lookup strategy on every
+consumer. Nothing in this codebase called that method before this batch,
+so a predicate in a query string would previously have been silently
+inert — parsed, never checked, every match kept regardless. Fixed once, in
+`extract_symbols` (`crates/indexer/src/lib.rs`), for every language at
+once:
+
+```rust
+let mut pred_buf1 = Vec::new();
+let mut pred_buf2 = Vec::new();
+let mut bytes_provider = bytes;
+let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+while let Some(m) = matches.next() {
+    if !m.satisfies_text_predicates(&query, &mut pred_buf1, &mut pred_buf2, &mut bytes_provider) {
+        continue;
+    }
+    // ... existing capture-extraction logic, unchanged
+}
+```
+
+This is a no-op for every one of the other 47 parsed languages — none of
+their queries declare a predicate, and `satisfies_text_predicates` returns
+`true` when a pattern has none. Elixir's query combines this with `.`
+anchors (`(list . (symbol) @kw . (symbol) @name)`) to pin a capture to an
+exact child position — needed because an unanchored pattern can match a
+node's *later* children just as validly as its first ones, which for
+`(define (foo x) (+ x 1))` could otherwise capture `+` (from the body)
+as if it were the name being defined. `lang::new_language_queries`'s
+`racket_define_and_struct` test asserts exactly that failure mode doesn't
+happen (`assert!(!found.contains(&"+".to_string()))`), not just that the
+real names are found.
 
 ## Tool execution (`grv tool`)
 
@@ -935,18 +992,61 @@ automatically. Nothing here changes behavior for a repo that never opts in.
   incremental — it only embeds chunks missing a *current-model* embedding,
   so switching `--embed-model` doesn't require `--force` to notice (the old
   model's rows just sit unused, matched by a `WHERE model = ?` on read).
-- **Ranking**: cosine similarity, computed in Rust over every stored vector
-  for the query's model — no ANN index. At the scale of chunks a single
-  repo actually produces (thousands, each ~KB of `f32`s) this is
-  single-digit milliseconds; an ANN index would be solving a problem this
-  hasn't hit yet.
+- **Ranking**: cosine similarity — either an exact linear scan over every
+  stored vector for the query's model, or, once `grv embed` has built one,
+  an ANN (approximate nearest neighbor) index lookup. See "ANN index"
+  below for when each path is taken and why both still exist.
 - **Concurrency**: `grv embed`'s requests run concurrently, bounded by CPU
   thread count (2-8) via a plain `tokio::Semaphore` — embedding a short
   chunk is light but still contends for one resident model in Ollama, so
   this pipelines latency without pretending it's independent CPU-bound work
   (same honesty `resources.rs` applies to `swarm`/`mission`).
 
-### A real `Send` constraint shaped this module's API
+### ANN index (`crates/cli/src/ann.rs`)
+
+The linear cosine scan is fine at the chunk counts a normal repo reaches —
+single-digit milliseconds — but this tool is explicitly meant to hold up on
+much larger ones, where an O(n) SQL load of every stored embedding's full
+body text *and* an O(n) exact distance computation both stop being free.
+`grv embed` now also builds a real ANN index: an HNSW graph via
+[`instant-distance`](https://docs.rs/instant-distance), a pure-Rust
+implementation with no FFI — deliberately chosen after this session's
+tree-sitter grammar-linking pain (see "Language coverage"): one fewer
+native library that can mismatch or fail to link later. It's serialized
+(bincode) to `<index_dir>/ann_<model>.bin`, one file per embedding model.
+
+- **The index is purely an accelerator, never a source of truth.** Every
+  code path that reads it (`semantic::rank_by_query`) falls back to the
+  exact linear scan on *any* problem — file missing, wrong dimensions
+  (stale model switch), corrupt bincode — via `ann::search` returning
+  `Ok(None)` rather than an error. Nothing here can make a search *wrong*,
+  only faster when it's available. `crates/cli/src/ann.rs`'s own unit
+  tests build a real 3-vector index and assert the correct nearest match
+  comes back, plus that a missing file and a dimension mismatch both
+  degrade to `None` instead of panicking.
+- **Rebuilt fully, every time `grv embed` runs — not incrementally.**
+  `instant-distance` has no incremental-insert API; building means handing
+  it the complete point set at once. Rather than track a separate
+  version/hash to decide when a partial rebuild is safe, the invariant is
+  kept deliberately simple: `ann::rebuild` runs at the end of every
+  `embed_index` call over *every* currently-stored embedding for that
+  model (not just what was newly embedded), so the file on disk, if
+  present, is always an exact snapshot of `embeddings` as of the last
+  successful `grv embed` — a query never needs to ask "is this stale?".
+  Written to a sibling `.bin.tmp` then renamed into place, so a crash or a
+  concurrent reader never sees a half-written index.
+- **Only vectors + `chunk_id`s live in the index file — no duplicated body
+  text.** This is the actual memory win for a huge repo: without it,
+  ranking has to hold every chunk's full text in RAM to score it; with it,
+  the HNSW walk only touches compact `(chunk_id, vector)` pairs, and a
+  final `SELECT ... WHERE rowid IN (...)` hydrates just the handful of
+  winning chunks' text — see `semantic::hydrate`.
+- **`instant_distance::Point` is implemented on a small `CosinePoint`
+  wrapper** using `1.0 - cosine_similarity` as the distance (HNSW is
+  defined in terms of "smaller = nearer"), converted back to a familiar
+  score when reporting hits.
+
+### A real `Send` constraint shaped this module's (and `ann.rs`'s) API
 
 `rusqlite::Connection` is `Send` but not `Sync`. Empirically (regardless of
 *where* inside a function body the reference is actually used — before or
@@ -960,16 +1060,26 @@ too.
 
 The fix, applied consistently: split any operation that needs both a DB
 read and a model call into a plain **sync** function that does the DB read
-and returns owned data (`EmbeddedChunk { path, start_line, end_line, body,
-vector }` — all `Send`), and a separate **async** function that takes that
+and returns owned data, and a separate **async** function that takes that
 owned data and does the model call, with no `Connection`-shaped type
-anywhere in its signature:
+anywhere in its signature. Adding the ANN fast path meant widening what
+counts as "prepared, owned data" from just `Vec<EmbeddedChunk>` to a small
+`QuerySource` enum (`Ann { root, index_dir, model }` — cheap enough to
+build without touching the DB at all, since it only needs a file-exists
+check — or `Linear { model, chunks }`, the pre-ANN behavior unchanged):
 
 ```rust
-pub fn load_embeddings(conn: &Connection, model: &str) -> Result<Vec<EmbeddedChunk>>          // sync
-pub async fn rank_by_query(ollama_host: &str, model: &str, query: &str,
-                            chunks: Vec<EmbeddedChunk>, limit: usize) -> Result<Vec<SemanticHit>>  // no Connection
+pub fn prepare_query_source(conn: &Connection, root: &Path, index_dir: &str, model: &str) -> Result<QuerySource>  // sync
+pub async fn rank_by_query(ollama_host: &str, query: &str,
+                            source: QuerySource, limit: usize) -> Result<Vec<SemanticHit>>  // no Connection
 ```
+
+`rank_by_query`'s `Ann` arm still needs a `Connection` to hydrate the
+winning chunk ids' text — it opens its own short-lived one (via
+`graviton_core::open_db`) *after* the one `.await` in the function (the
+query-embedding call) has already completed, never holding it across an
+`.await`. This is the same already-established idiom used by `agentic.rs`'s
+`search_code`/`semantic_search` tool arms, not a new pattern.
 
 The same split appears in `agentic.rs` (`prepare_search_tool` sync /
 `finish_search_outcome` async, backing the `search_code`/`semantic_search`
@@ -1141,22 +1251,10 @@ independent connection unblocked it.
 
 ## What's explicitly *not* built yet (see README roadmap)
 
-- **An ANN index for `grv embed`/semantic search.** Still a linear cosine
-  scan today. This is the top open item: explicitly requested (again) on
-  the grounds that GRAVITON targets very large repos, where a linear scan
-  over every stored embedding stops being free. Not addressed in the v0.12
-  batch (mission resume, `ask_user`, the 37-language push) — called out
-  here rather than silently dropped.
-- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other 26+
-  parsed-or-linked languages have no `call_query_src` yet, and none of it
-  is type/scope-resolved (name-based matching only, by design — see "Call
+- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other 44+
+  parsed languages have no `call_query_src` yet, and none of it is
+  type/scope-resolved (name-based matching only, by design — see "Call
   graph" above for why that's the right tradeoff at this tool's scale).
-- `def_query_src` (symbol extraction) for the 24 languages whose grammar
-  is linked but whose query hasn't been written+verified yet (Elixir,
-  Scala, Swift, Perl, R, OCaml, Elm, Nim, Erlang, Vim, Nix, HCL, CMake,
-  Verilog, VHDL, Fortran, Prolog, Racket, Scheme, Protobuf, Objective-C,
-  GLSL, HLSL, Ada) — see "Language coverage" above. All 24 are already
-  fully searchable; only `grv symbol` support is missing.
 - A real parse tree for Svelte, Vue, WGSL, and LaTeX — each hits a genuine
   external blocker (old-tree-sitter-core type mismatch for the first
   three, a broken external-scanner link for the fourth), not an oversight;

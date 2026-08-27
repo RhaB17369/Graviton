@@ -647,14 +647,14 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
             if !semantic::has_embeddings(&conn) {
                 anyhow::bail!("no embeddings computed yet -- run `grv embed` first");
             }
-            // Load synchronously and drop the connection *before* the
+            // Decide synchronously and drop the connection *before* the
             // await below -- see `semantic::EmbeddedChunk`'s doc comment
             // for why `&Connection` can never cross an await on this path
             // (this handler runs inside a `tokio::spawn`ed connection task).
-            let chunks = semantic::load_embeddings(&conn, model)?;
+            let source = semantic::prepare_query_source(&conn, &ctx.root, &ctx.cfg.index_dir, model)?;
             drop(conn);
             let _permit = ctx.scheduler.acquire().await;
-            let hits = semantic::rank_by_query(&ctx.cfg.ollama_host, model, &query, chunks, limit(8)).await?;
+            let hits = semantic::rank_by_query(&ctx.cfg.ollama_host, &query, source, limit(8)).await?;
             Ok(json!(hits
                 .into_iter()
                 .map(|h| json!({"path": h.path, "start_line": h.start_line, "end_line": h.end_line, "body": h.body, "score": h.score}))

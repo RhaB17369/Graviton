@@ -376,12 +376,23 @@ embed`. `grv run`'s agent also gets `search_code`/`semantic_search` as
 tools it can call mid-task instead of only being handed context up front.
 
 Vectors are stored as BLOBs in `.graviton/index.db` (one `embeddings` row
-per FTS chunk) and ranked by cosine similarity in-process — no ANN index,
-no vector database; at the scale of chunks a single repo actually produces
-this is a non-issue (single-digit milliseconds), and it's one less moving
-part to run locally. `grv embed --force` recomputes everything (e.g. after
-switching embedding models); re-indexing a changed file automatically drops
-its stale embeddings so they never point at chunks that no longer exist.
+per FTS chunk) and ranked by cosine similarity — a linear scan for a
+freshly-configured repo, or a real ANN index once one exists (see below).
+`grv embed --force` recomputes everything (e.g. after switching embedding
+models); re-indexing a changed file automatically drops its stale
+embeddings so they never point at chunks that no longer exist.
+
+**`grv embed` also builds/refreshes a real ANN index** (`.graviton/ann_<model>.bin`
+— an HNSW graph, no FFI, no vector database, no server to run — see
+ARCHITECTURE.md for the `instant-distance` crate and design). This is the
+actual answer to "does this scale to a huge repo": without it, a semantic
+query loads every stored embedding's full text into memory and scores it
+one by one; with it, ranking is a compact on-disk graph walk that only
+touches full text for the handful of winning chunks. It's purely an
+accelerator — every retrieval path falls back to the exact linear scan
+automatically if the index is missing, stale (a model/dimension mismatch),
+or unreadable, so this can never make a search *wrong*, only faster once
+it's there.
 
 ### Call graph — `grv callers`/`grv callees`
 
@@ -460,20 +471,21 @@ socket). Not a hardened secret — enough to stop an opportunistic hit on the
 port from doing anything, for a tool meant to bind `127.0.0.1`/a trusted
 LAN, not to stand in for real auth on an internet-facing service.
 
-## Current scope (v0.12)
+## Current scope (v0.13)
 
-- **Languages with verified symbol extraction (26):** Rust, Python,
+- **Languages with verified symbol extraction (50):** Rust, Python,
   JavaScript, TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua,
   Solidity, PowerShell, Haskell, Fish, Dart, Zig, Julia, Groovy, GraphQL,
-  Crystal, D, and assembly (label-based — the closest thing assembly has to
-  a "symbol"). Each was checked against a real sample file, not just
-  compiled — see ARCHITECTURE.md's "Language coverage" for the method.
-- **Languages with a real tree-sitter grammar linked but no verified
-  definition query yet (24):** Elixir, Scala, Swift, Perl, R, OCaml, Elm,
-  Nim, Erlang, Vim, Nix, HCL/Terraform, CMake, Verilog, VHDL, Fortran,
-  Prolog, Racket, Scheme, Protobuf, Objective-C, GLSL, HLSL, Ada — fully
-  searchable now, and adding `grv symbol` support for any of these later is
-  "write and verify one query", not "add a grammar".
+  Crystal, D, assembly (label-based — the closest thing assembly has to a
+  "symbol"), Elixir, Scala, Swift, Perl, R, OCaml, Elm, Nim, Erlang, Vim,
+  Nix, HCL/Terraform, CMake, Verilog, VHDL, Fortran, Prolog, Racket,
+  Scheme, Protobuf, Objective-C, GLSL, HLSL, and Ada. Every one of these
+  was checked against a real sample file's actual `grv symbol` output, not
+  just compiled — see ARCHITECTURE.md's "Language coverage" for the method,
+  including the handful (Elixir, Racket, Scheme) whose grammar has no
+  dedicated "this is a definition" node at all and needed a text-predicate
+  check on top of the tree shape to avoid mistaking an ordinary function
+  call for one.
 - **Recognized + fully searchable, no grammar at all (16):** Kotlin,
   Svelte, Vue, WGSL, LaTeX (all five have a real reason a grammar can't be
   linked here — version conflicts or a broken external scanner, see
@@ -496,9 +508,7 @@ LAN, not to stand in for real auth on an internet-facing service.
 
 ## Roadmap
 
-- **An ANN index for `grv embed`/semantic search** — currently a linear cosine scan. This is the top open item: GRAVITON is meant to hold up on very large repos, where a linear scan over every stored embedding stops being free.
-- `def_query_src` (i.e. `grv symbol` support) for the 24 languages that already have a grammar linked but no verified query yet — Elixir, Scala, Swift, Perl, R, OCaml, Elm, Nim, Erlang, Vim, Nix, HCL, CMake, Verilog, VHDL, Fortran, Prolog, Racket, Scheme, Protobuf, Objective-C, GLSL, HLSL, Ada. All are already fully searchable today.
 - Kotlin/Svelte/Vue/WGSL/LaTeX symbol extraction — each blocked on a real external issue (old tree-sitter core pinned by the crate, or a broken external-scanner link), not an oversight. See ARCHITECTURE.md.
-- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other 26+ parsed/linked languages have no call queries yet.
+- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other 44+ parsed languages have no call queries yet.
 - `grv serve --tcp`'s token is a stopgap, not hardened auth — fine bound to 127.0.0.1/a trusted LAN, not something to expose more broadly as-is
 - `grv serve run_attach` only streams events from attach time forward (plus a synthesized catch-up for a pending confirm, a pending `ask_user` question, or an already-finished run) — not a full replay of everything that happened before you attached; `run_status` fills the rest of the gap

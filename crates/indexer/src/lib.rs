@@ -267,8 +267,24 @@ pub fn extract_symbols(content: &str, language: Lang) -> Vec<ExtractedSymbol> {
     let mut out = Vec::new();
     let mut cursor = QueryCursor::new();
     let bytes = content.as_bytes();
+    // Scratch buffers for `satisfies_text_predicates` -- reused across
+    // matches to avoid reallocating per match. Needed by languages whose
+    // grammar has no dedicated node for "this is a definition" (Elixir's
+    // `def`/`defmodule`, Racket/Scheme's `define` are all just generic
+    // `call`/`list` nodes at the tree-sitter level) -- their queries use
+    // `#eq?`/`#match?` predicates on a captured node's *text* to tell a
+    // real definition apart from an ordinary call/form with the same
+    // shape. Every other language's query has no predicates, so this is a
+    // no-op there (`satisfies_text_predicates` returns `true` when a
+    // pattern declares none).
+    let mut pred_buf1 = Vec::new();
+    let mut pred_buf2 = Vec::new();
+    let mut bytes_provider = bytes;
     let mut matches = cursor.matches(&query, tree.root_node(), bytes);
     while let Some(m) = matches.next() {
+        if !m.satisfies_text_predicates(&query, &mut pred_buf1, &mut pred_buf2, &mut bytes_provider) {
+            continue;
+        }
         let mut name_text = None;
         let mut def_node = None;
         for cap in m.captures {

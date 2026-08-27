@@ -521,6 +521,236 @@ impl Lang {
                 (label (ident) @name) @def
                 "#
             }
+            // Elixir's macro system means `defmodule`/`def`/`defp`/etc. are
+            // all plain `call` nodes at the grammar level -- there's no
+            // dedicated node for "this is a definition" the way `def
+            // foo` is a `function_item` in Rust. Same is true of `if`,
+            // `case`, `receive`, and every other control-flow macro, all
+            // of which are *also* `call`s with a `do_block` -- so a query
+            // that just matched "any call with a do_block" would wrongly
+            // treat every `if ... do ... end` as a symbol definition. The
+            // `#eq?`/`#any-of?` predicates below (checked in Rust via
+            // `QueryMatch::satisfies_text_predicates` -- see
+            // `extract_symbols` in lib.rs) are what make this reliable
+            // instead of a guess: only a call whose target identifier's
+            // *text* is literally one of the def-like keywords counts.
+            Lang::Elixir => {
+                r#"
+                (call target: (identifier) @kw (arguments (alias) @name) (do_block)) @def
+                (#eq? @kw "defmodule")
+
+                (call target: (identifier) @kw (arguments (call target: (identifier) @name (arguments _))) (do_block)) @def
+                (#any-of? @kw "def" "defp" "defmacro" "defmacrop")
+
+                (call target: (identifier) @kw (arguments (call target: (identifier) @name (arguments _)) (keywords))) @def
+                (#any-of? @kw "def" "defp" "defmacro" "defmacrop")
+
+                (call target: (identifier) @kw (arguments (identifier) @name) (do_block)) @def
+                (#any-of? @kw "def" "defp" "defmacro" "defmacrop")
+                "#
+            }
+            Lang::Scala => {
+                r#"
+                (function_definition name: (identifier) @name) @def
+                (function_declaration name: (identifier) @name) @def
+                (class_definition name: (identifier) @name) @def
+                (object_definition name: (identifier) @name) @def
+                (trait_definition name: (identifier) @name) @def
+                "#
+            }
+            // Swift's grammar has one `class_declaration` node for
+            // `class`/`struct`/`protocol`/`actor` alike (the keyword
+            // itself is an anonymous token, invisible to a query) -- so a
+            // struct shows up here with `kind = "class_declaration"` too.
+            // Harmless for a symbol *list*; just not a place to expect
+            // struct-vs-class precision.
+            Lang::Swift => {
+                r#"
+                (function_declaration name: (simple_identifier) @name) @def
+                (class_declaration name: (type_identifier) @name) @def
+                "#
+            }
+            Lang::Perl => {
+                r#"
+                (function_definition name: (identifier) @name) @def
+                (package_statement (package_name (identifier) @name)) @def
+                "#
+            }
+            // R has no dedicated "function definition" node -- `foo <-
+            // function(x) ...` is just an assignment whose right-hand side
+            // happens to be a `function_definition`. The name is the
+            // assignment target, one level up.
+            Lang::R => {
+                r#"
+                (binary_operator lhs: (identifier) @name rhs: (function_definition)) @def
+                "#
+            }
+            Lang::OCaml => {
+                r#"
+                (let_binding pattern: (value_name) @name) @def
+                (module_binding (module_name) @name) @def
+                (type_binding name: (type_constructor) @name) @def
+                "#
+            }
+            Lang::Elm => {
+                r#"
+                (value_declaration functionDeclarationLeft: (function_declaration_left (lower_case_identifier) @name)) @def
+                (type_alias_declaration name: (upper_case_identifier) @name) @def
+                "#
+            }
+            Lang::Nim => {
+                r#"
+                (proc_declaration name: (identifier) @name) @def
+                (func_declaration name: (identifier) @name) @def
+                "#
+            }
+            Lang::Erlang => {
+                r#"
+                (function_clause name: (atom) @name) @def
+                (module_attribute name: (atom) @name) @def
+                "#
+            }
+            Lang::Vim => {
+                r#"
+                (function_definition (function_declaration name: (identifier) @name)) @def
+                "#
+            }
+            // Same shape as R: `foo = x: x + 1` is an attribute binding
+            // whose value happens to be a lambda -- the structural
+            // distinguisher is the binding's `expression:` field being a
+            // `function_expression`, no predicate needed.
+            Lang::Nix => {
+                r#"
+                (binding attrpath: (attrpath attr: (identifier) @name) expression: (function_expression)) @def
+                "#
+            }
+            // HCL blocks (`resource "type" "name" { ... }`, `variable
+            // "name" { ... }`) carry 0-2 string labels depending on block
+            // kind, in a fixed but kind-dependent order with no field name
+            // distinguishing "the label that names *this* declaration"
+            // from "the label that names its *type*". This captures
+            // whichever label comes first -- exactly the name for a
+            // single-labeled block (`variable`/`output`/...), the type
+            // rather than the specific instance name for a two-labeled
+            // block (`resource`/`data`) -- good enough to make every block
+            // searchable by `grv symbol`, not a precise per-resource name.
+            Lang::Hcl => {
+                r#"
+                (block (identifier) (string_lit (template_literal) @name)) @def
+                "#
+            }
+            Lang::CMake => {
+                r#"
+                (function_def (function_command (argument_list . (argument (unquoted_argument) @name)))) @def
+                (macro_def (macro_command (argument_list . (argument (unquoted_argument) @name)))) @def
+                "#
+            }
+            Lang::Verilog => {
+                r#"
+                (module_header (simple_identifier) @name) @def
+                (function_declaration (function_body_declaration (function_identifier (function_identifier (simple_identifier) @name)))) @def
+                "#
+            }
+            Lang::Vhdl => {
+                r#"
+                (entity_declaration entity: (identifier) @name) @def
+                (architecture_definition architecture: (identifier) @name) @def
+                "#
+            }
+            Lang::Fortran => {
+                r#"
+                (function (function_statement name: (name) @name)) @def
+                (subroutine (subroutine_statement name: (name) @name)) @def
+                (module (module_statement (name) @name)) @def
+                "#
+            }
+            // Prolog has no separate "function definition" node either --
+            // every fact/rule is just a `clause`, whose head is either the
+            // clause's whole term (a fact, e.g. `foo(a).`) or the left
+            // side of a `:-` rule (parsed generically as a
+            // `binary_operation`, since `:-` is lexed as an operator, not
+            // special-cased). Either way, the clause's *functor* name is a
+            // real, structural definition point -- no predicates needed.
+            Lang::Prolog => {
+                r#"
+                (clause term: (compound_term functor: (atom) @name)) @def
+                (clause term: (binary_operation left: (compound_term functor: (atom) @name))) @def
+                "#
+            }
+            // Racket and Scheme are generic S-expression grammars -- `define`
+            // is not a distinct node type, just a `list` whose first symbol
+            // happens to be the text "define" (indistinguishable at the
+            // grammar level from a `list` that's an ordinary function call
+            // like `(+ x 1)`). Same predicate technique as Elixir above:
+            // `#eq?`/`#any-of?` on the leading symbol's text, checked by
+            // `satisfies_text_predicates` in `extract_symbols`. `.` anchors
+            // pin each captured child to an exact position so e.g. `(define
+            // (foo x) (+ x 1))`'s *body* `(+ x 1)` can't also match the
+            // "name is the second child" shape.
+            Lang::Racket => {
+                r#"
+                (list . (symbol) @kw . (symbol) @name) @def
+                (#any-of? @kw "define" "struct" "define-struct")
+
+                (list . (symbol) @kw . (list . (symbol) @name)) @def
+                (#eq? @kw "define")
+                "#
+            }
+            Lang::Scheme => {
+                r#"
+                (list . (symbol) @kw . (symbol) @name) @def
+                (#eq? @kw "define")
+
+                (list . (symbol) @kw . (list . (symbol) @name)) @def
+                (#eq? @kw "define")
+                "#
+            }
+            Lang::Proto => {
+                r#"
+                (message (message_name (identifier) @name)) @def
+                (service (service_name (identifier) @name)) @def
+                (rpc (rpc_name (identifier) @name)) @def
+                "#
+            }
+            // `class_interface`/`class_implementation`'s own name is a
+            // bare (unlabeled) leading child, immediately before the
+            // (also unlabeled but position-2) `superclass:`-field sibling
+            // -- `.` anchors it to specifically the first child so this
+            // doesn't also match the superclass name.
+            Lang::ObjC => {
+                r#"
+                (class_interface . (identifier) @name) @def
+                (class_implementation . (identifier) @name) @def
+                (method_declaration (identifier) @name) @def
+                (method_definition (identifier) @name) @def
+                (function_definition declarator: (function_declarator declarator: (identifier) @name)) @def
+                "#
+            }
+            // GLSL/HLSL are C-family grammars for shader code -- same
+            // node shapes as `Lang::C` (verified against a real parse,
+            // not assumed from the family resemblance alone).
+            Lang::Glsl => {
+                r#"
+                (function_definition declarator: (function_declarator declarator: (identifier) @name)) @def
+                (struct_specifier name: (type_identifier) @name) @def
+                "#
+            }
+            Lang::Hlsl => {
+                r#"
+                (function_definition declarator: (function_declarator declarator: (identifier) @name)) @def
+                (struct_specifier name: (type_identifier) @name) @def
+                "#
+            }
+            Lang::Ada => {
+                r#"
+                (package_declaration name: (identifier) @name) @def
+                (package_body name: (identifier) @name) @def
+                (subprogram_body (function_specification name: (identifier) @name)) @def
+                (subprogram_body (procedure_specification name: (identifier) @name)) @def
+                (subprogram_declaration (function_specification name: (identifier) @name)) @def
+                (subprogram_declaration (procedure_specification name: (identifier) @name)) @def
+                "#
+            }
             _ => return None,
         })
     }
@@ -692,4 +922,214 @@ mod new_language_queries {
         let found = names(Lang::Asm, "foo:\n    mov eax, 1\n    ret\n");
         assert_eq!(found, vec!["foo"]);
     }
+
+    #[test]
+    fn elixir_defmodule_def_defp() {
+        let src = "defmodule MyModule do\n  def foo(x) do\n    x + 1\n  end\n\n  defp bar(y), do: y * 2\nend\n";
+        let found = names(Lang::Elixir, src);
+        assert!(found.contains(&"MyModule".to_string()), "{found:?}");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn scala_function_class_object_trait() {
+        let src = "object Main {\n  def foo(x: Int): Int = x + 1\n}\n\nclass Greeter(name: String) {\n  def greet(): String = name\n}\n\ntrait Shape {\n  def area(): Double\n}\n";
+        let found = names(Lang::Scala, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Main".to_string()), "{found:?}");
+        assert!(found.contains(&"Greeter".to_string()), "{found:?}");
+        assert!(found.contains(&"greet".to_string()), "{found:?}");
+        assert!(found.contains(&"Shape".to_string()), "{found:?}");
+        assert!(found.contains(&"area".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn swift_function_and_class() {
+        let src = "func foo(x: Int) -> Int {\n    return x + 1\n}\n\nclass Greeter {\n    func greet() -> String {\n        return \"hi\"\n    }\n}\n\nstruct Point {\n    var x: Int\n}\n";
+        let found = names(Lang::Swift, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Greeter".to_string()), "{found:?}");
+        assert!(found.contains(&"greet".to_string()), "{found:?}");
+        assert!(found.contains(&"Point".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn perl_sub_and_package() {
+        let src = "package MyPackage;\n\nsub foo {\n    my ($x) = @_;\n    return $x + 1;\n}\n\n1;\n";
+        let found = names(Lang::Perl, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"MyPackage".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn r_function_assignment() {
+        let found = names(Lang::R, "foo <- function(x) {\n  x + 1\n}\n\nbar = function(y) y * 2\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn ocaml_let_module_type() {
+        let src = "let foo x = x + 1\n\nmodule MyModule = struct\n  let bar y = y * 2\nend\n\ntype point = { x : int; y : int }\n";
+        let found = names(Lang::OCaml, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"MyModule".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+        assert!(found.contains(&"point".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn elm_function_and_type_alias() {
+        let src = "module Main exposing (..)\n\nfoo : Int -> Int\nfoo x = x + 1\n\ntype alias Point = { x : Int, y : Int }\n";
+        let found = names(Lang::Elm, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Point".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn nim_proc_and_func() {
+        let found = names(Lang::Nim, "proc foo(x: int): int =\n  x + 1\n\nfunc bar(y: int): int =\n  y * 2\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn erlang_function_clause_and_module() {
+        let src = "-module(my_module).\n\nfoo(X) ->\n    X + 1.\n\nbar(Y) ->\n    Y * 2.\n";
+        let found = names(Lang::Erlang, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+        assert!(found.contains(&"my_module".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn vim_function() {
+        let found = names(Lang::Vim, "function! Foo(x)\n  return a:x + 1\nendfunction\n");
+        assert!(found.contains(&"Foo".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn nix_function_bindings() {
+        let found = names(Lang::Nix, "{\n  foo = x: x + 1;\n  bar = { a, b }: a + b;\n}\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn hcl_blocks() {
+        let src = "resource \"aws_instance\" \"web\" {\n  ami = \"abc\"\n}\n\nvariable \"name\" {\n  default = \"x\"\n}\n";
+        let found = names(Lang::Hcl, src);
+        // Documented simplification (see Lang::Hcl's def_query_src comment):
+        // the *first* label is captured -- the resource's type, not its
+        // specific instance name -- and the variable's own name (its only
+        // label) for the single-labeled block.
+        assert!(found.contains(&"aws_instance".to_string()), "{found:?}");
+        assert!(found.contains(&"name".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn cmake_function_and_macro() {
+        let src = "function(my_func arg1)\n  message(${arg1})\nendfunction()\n\nmacro(my_macro arg1)\n  message(${arg1})\nendmacro()\n";
+        let found = names(Lang::CMake, src);
+        assert!(found.contains(&"my_func".to_string()), "{found:?}");
+        assert!(found.contains(&"my_macro".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn verilog_module_and_function() {
+        let src = "module counter(input clk, output reg [3:0] q);\n  always @(posedge clk) begin\n    q <= q + 1;\n  end\nendmodule\n\nfunction [3:0] add_one;\n  input [3:0] a;\n  add_one = a + 1;\nendfunction\n";
+        let found = names(Lang::Verilog, src);
+        assert!(found.contains(&"counter".to_string()), "{found:?}");
+        assert!(found.contains(&"add_one".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn vhdl_entity_and_architecture() {
+        let src = "entity counter is\n  port (clk : in std_logic);\nend entity counter;\n\narchitecture behavior of counter is\nbegin\nend architecture behavior;\n";
+        let found = names(Lang::Vhdl, src);
+        assert!(found.contains(&"counter".to_string()), "{found:?}");
+        assert!(found.contains(&"behavior".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn fortran_function_subroutine_module() {
+        let src = "module my_module\ncontains\n  function foo(x) result(y)\n    integer :: x, y\n    y = x + 1\n  end function foo\n\n  subroutine bar(z)\n    integer :: z\n    z = z * 2\n  end subroutine bar\nend module my_module\n";
+        let found = names(Lang::Fortran, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+        assert!(found.contains(&"my_module".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn prolog_facts_and_rules() {
+        let found = names(Lang::Prolog, "foo(X, Y) :- Y is X + 1.\n\nbar(X) :- foo(X, _).\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn racket_define_and_struct() {
+        let src = "#lang racket\n(define (foo x) (+ x 1))\n(define bar 42)\n(struct point (x y))\n";
+        let found = names(Lang::Racket, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+        assert!(found.contains(&"point".to_string()), "{found:?}");
+        // The real bar this predicate machinery has to clear: an ordinary
+        // call like `(+ x 1)` must NOT be mistaken for a definition.
+        assert!(!found.contains(&"+".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn scheme_define() {
+        let found = names(Lang::Scheme, "(define (foo x) (+ x 1))\n(define bar 42)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+        assert!(!found.contains(&"+".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn proto_message_service_rpc() {
+        let src = "syntax = \"proto3\";\n\nmessage Person {\n  string name = 1;\n  int32 id = 2;\n}\n\nservice Greeter {\n  rpc SayHello (Person) returns (Person);\n}\n";
+        let found = names(Lang::Proto, src);
+        assert!(found.contains(&"Person".to_string()), "{found:?}");
+        assert!(found.contains(&"Greeter".to_string()), "{found:?}");
+        assert!(found.contains(&"SayHello".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn objc_interface_impl_function() {
+        let src = "@interface Greeter : NSObject\n- (NSString *)greet;\n@end\n\n@implementation Greeter\n- (NSString *)greet {\n    return @\"hi\";\n}\n@end\n\nint foo(int x) {\n    return x + 1;\n}\n";
+        let found = names(Lang::ObjC, src);
+        assert!(found.contains(&"Greeter".to_string()), "{found:?}");
+        assert!(found.contains(&"greet".to_string()), "{found:?}");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn glsl_function_and_struct() {
+        let src = "float foo(float x) {\n    return x + 1.0;\n}\n\nstruct Point {\n    float x;\n    float y;\n};\n\nvoid main() {\n    foo(1.0);\n}\n";
+        let found = names(Lang::Glsl, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Point".to_string()), "{found:?}");
+        assert!(found.contains(&"main".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn hlsl_function_and_struct() {
+        let src = "float foo(float x) {\n    return x + 1.0;\n}\n\nstruct Point {\n    float x;\n    float y;\n};\n";
+        let found = names(Lang::Hlsl, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Point".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn ada_package_function_procedure() {
+        let src = "package My_Package is\n   function Foo (X : Integer) return Integer;\n   procedure Bar (Y : Integer);\nend My_Package;\n\npackage body My_Package is\n   function Foo (X : Integer) return Integer is\n   begin\n      return X + 1;\n   end Foo;\n\n   procedure Bar (Y : Integer) is\n   begin\n      null;\n   end Bar;\nend My_Package;\n";
+        let found = names(Lang::Ada, src);
+        assert!(found.contains(&"My_Package".to_string()), "{found:?}");
+        assert!(found.contains(&"Foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Bar".to_string()), "{found:?}");
+    }
 }
+
