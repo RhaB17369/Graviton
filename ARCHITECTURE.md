@@ -198,7 +198,8 @@ kind, name, parent, line }`) instead of being a bare label:
   resolved `use`/`import` naming exactly this definition's file (see
   "Import resolution" below) — genuine resolution via an actual import
   statement, not a co-location heuristic. Only produced for the languages
-  with an import resolver (Rust/Python/JS/TS/TSX/Go as of this writing).
+  with an import resolver (31 languages as of this writing — see "Import
+  resolution" below for the full list).
 - `Ambiguous(Vec<DefinitionRef>)` — multiple same-named definitions exist,
   none local, and either this language has no import resolver yet or none
   of its resolved imports narrowed things down to one candidate. Rather
@@ -283,6 +284,88 @@ deliberately separate passes:
    An import that resolves to nothing means exactly that: external
    dependency, stdlib, or a shape this heuristic doesn't cover — never a
    wrong guess presented as a real one.
+
+**25 more languages** got real import extraction + resolution in a
+follow-up batch, after the first six proved the two-pass design out. Import
+syntax for these is structurally simpler than Rust's brace-list nesting —
+almost always one dedicated grammar node, no aliasing tree to walk — so
+extraction here is `tree-sitter` queries (`@import`+`@target` captures,
+mirroring `def_query_src`/`call_query_src`'s own style) rather than bespoke
+walkers, grouped by mechanism instead of duplicated 25 times:
+
+- **A dedicated grammar node exists, unambiguous, no predicate needed**
+  (`crates/indexer/src/imports.rs`'s `query_based` module): C/C++/
+  Objective-C/GLSL/HLSL (`preproc_include` — `#include "x"` resolved,
+  `#include <x>` skipped at extraction time since a system header is
+  never repo-local, never even recorded as a doomed edge), Vim
+  (`source_statement`), Proto (`import`), Solidity (`import_directive`),
+  Verilog (`` `include ``), Nix (`import ./x` — an ordinary builtin call,
+  checked by text since Nix has no dedicated import node, but the
+  argument's `path_expression` node is unambiguous), and the hierarchical/
+  dotted-module languages Java, Kotlin, Groovy, Scala, C#, Elm (see below).
+- **An ordinary command/function call at the grammar level** (`imports.rs`'s
+  `command_style` module): Bash (`source`/`.`), Fish (`source`), Ruby
+  (`require`/`require_relative`/`load`), R (`source(...)`), Racket
+  (`(require "path")` — only the string form; `(require racket/base)`'s
+  bare-symbol form names a library collection, not a repo file, and is
+  correctly left unextracted), CMake (`include()`/`add_subdirectory()`,
+  case-folded since CMake command names are case-insensitive). Filtering
+  to the right command name happens as a plain Rust string comparison
+  *after* the query runs, deliberately not a `#eq?`/`#any-of?` text
+  predicate — this project has already been burned once by a predicate
+  silently not applying (see the query-safety-net story in "Language
+  coverage" below); for these lower-traffic languages, a straightforward
+  `==`/`matches!` check in Rust is the safer bet, not just a shorter one.
+
+Resolution reuses two generic functions rather than one per language:
+
+- **`resolve_relative_literal`**: used by every quoted/relative-path
+  language above (C-family, Vim, Proto, Solidity, Verilog, Nix, Bash,
+  Fish, Ruby, R, Racket, CMake). Resolves against the importing file's own
+  directory *regardless of a leading `./`* — correct C/C++ `#include "x"`
+  search-path semantics (the including file's own directory is checked
+  first even without one), and harmless for the others: a bare name that
+  doesn't happen to match a real repo-relative file just stays unresolved.
+  An optional extension list lets a language that can omit the extension
+  (Bash's `source helper` meaning `helper.sh`) still resolve.
+- **`resolve_dotted_module`**: used by Java, Kotlin, Groovy, Scala (wildcard
+  marker `_` instead of `*`), and C# (no wildcard, and namespaces don't
+  reliably mirror directories the way Java's package convention does, so
+  lower-confidence). `a.b.C` is tried as `<root>/a/b/C.<ext>` against a
+  candidate root list — repo root, a handful of real, *present-in-this-repo*
+  conventional Maven/Gradle source roots (`src/main/java`, `src/main/kotlin`,
+  ...), and every immediate subdirectory as a generic fallback. `a.b.*`
+  (`a.b._` for Scala) is a whole-package wildcard, resolved to every
+  same-extension file in that directory — the same multi-file honesty as
+  Go's package resolution. Elm's `exposing (...)` list is captured
+  precisely (each exposed name becomes its own `imported_name`, same as
+  Python's `from X import a, b`), with `exposing (..)` treated as the
+  wildcard case.
+
+**Deliberately not attempted**, named rather than silently skipped:
+D/Haskell/Julia's plain (non-`qualified`) import brings a whole module's
+exports into *unqualified* scope — semantically closer to a wildcard than
+to Java's "import one class", and different enough that reusing
+`resolve_dotted_module`'s "last segment is the imported name" assumption
+would produce a confidently wrong signal (the module's own name is rarely
+a callable) without a way to tell the `qualified`/aliased form apart from
+the plain one yet. Left unresolved rather than guessed, consistent with
+every other honest gap in this section. The remaining ~15 parsed languages
+without an import resolver at all (Elixir, Erlang, Perl, Nim, OCaml,
+Fortran, VHDL, Prolog, Scheme, Crystal, Lua, Zig, PowerShell, LaTeX, Dart,
+PHP, Ada) are future work, not attempted this batch.
+
+Verified per-language against real samples (`imports.rs`'s `tests` module —
+22 tests, one or more per language/family), plus end-to-end resolution
+integration tests through `index_repo` for a representative case of each
+resolver mechanism (`lib.rs`'s `index_repo_tests`: a real C `#include`
+resolving to a local header while a system header stays unrecorded, a
+real cross-file Java import resolving via a conventional Maven source
+root, and a Java wildcard import resolving to every file in its package
+directory) — plus a live dogfood against a real synthetic multi-language
+scratch repo (Java cross-file class import, C local-header include, and a
+Bash `source` all resolving correctly through the actual `grv` binary, not
+just Rust unit tests).
 
 A real bug this project's own dogfooding against its own repo caught
 (and a useful example of why "run it on yourself" stays part of this
@@ -397,7 +480,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.18)
+## Language coverage (v0.19)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its

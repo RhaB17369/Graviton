@@ -667,4 +667,90 @@ mod index_repo_tests {
         let paths: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
         assert_eq!(paths, vec!["pkg/utils/a.go".to_string(), "pkg/utils/b.go".to_string()]);
     }
+
+    /// Proves the generic `resolve_relative_literal` mechanism (shared by
+    /// C/C++/ObjC/GLSL/HLSL/Vim/Proto/Solidity/Verilog/Nix/Bash/Fish/Ruby/
+    /// R/Racket/CMake) actually works end-to-end for a real case, not just
+    /// in extraction isolation -- and specifically that a *quoted*
+    /// `#include "x.h"` with no leading `./` still resolves against the
+    /// including file's own directory (real C search-path semantics),
+    /// while `#include <...>` never does.
+    #[test]
+    fn resolve_c_include_finds_local_header_but_not_system_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.h"), "void helper(void);\n").unwrap();
+        std::fs::write(dir.path().join("main.c"), "#include \"helper.h\"\n#include <stdio.h>\nint main(void) { helper(); return 0; }\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut stmt = conn.prepare("SELECT i.raw_path, f2.path FROM imports i LEFT JOIN import_resolutions r ON r.import_id = i.id LEFT JOIN files f2 ON f2.id = r.file_id").unwrap();
+        let rows: Vec<(String, Option<String>)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(|r| r.ok()).collect();
+        assert!(rows.contains(&("helper.h".to_string(), Some("helper.h".to_string()))), "{rows:?}");
+        // A `<...>` system include is skipped entirely at extraction time
+        // (see `imports.rs::query_based::preproc_include`) -- stronger
+        // than merely "unresolved", so it shouldn't appear as a row at all.
+        assert!(!rows.iter().any(|(p, _)| p.contains("stdio")), "a system header must never even be recorded: {rows:?}");
+    }
+
+    /// Proves the generic `resolve_dotted_module` mechanism (shared by
+    /// Java/Kotlin/Groovy/Scala/C#) resolves a real cross-file class
+    /// import against a conventional Maven-style source root -- not just
+    /// the repo root itself.
+    #[test]
+    fn java_import_resolves_via_conventional_maven_source_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/main/java/com/example/util")).unwrap();
+        std::fs::write(dir.path().join("src/main/java/com/example/util/Helper.java"), "package com.example.util;\npublic class Helper { public static void run() {} }\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src/main/java/com/example")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main/java/com/example/Main.java"),
+            "package com.example;\nimport com.example.util.Helper;\npublic class Main { public static void main(String[] a) { Helper.run(); } }\n",
+        )
+        .unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let resolved_path: String = conn
+            .query_row(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'com.example.util.Helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_path, "src/main/java/com/example/util/Helper.java");
+    }
+
+    /// Proves a JVM-family wildcard import (`import a.b.*;`) resolves to
+    /// *every* file in the target package directory, the same
+    /// multi-candidate honesty Go's package-level resolution already has.
+    #[test]
+    fn java_wildcard_import_resolves_to_every_file_in_the_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("com/example/util")).unwrap();
+        std::fs::write(dir.path().join("com/example/util/A.java"), "package com.example.util;\npublic class A {}\n").unwrap();
+        std::fs::write(dir.path().join("com/example/util/B.java"), "package com.example.util;\npublic class B {}\n").unwrap();
+        std::fs::write(dir.path().join("com/example/util/Main.java"), "package com.example.util;\nimport com.example.util.*;\npublic class Main {}\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'com.example.util.*' ORDER BY f2.path",
+            )
+            .unwrap();
+        let paths: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        assert_eq!(paths, vec!["com/example/util/A.java".to_string(), "com/example/util/B.java".to_string(), "com/example/util/Main.java".to_string()]);
+    }
 }

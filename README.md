@@ -436,19 +436,30 @@ import resolver, not just a heuristic, for the languages it covers.
 
 ### Import resolution
 
-`grv index` also extracts every `use`/`import`/`require` statement
-(`crates/indexer/src/imports.rs`) and, for Rust/Python/JavaScript/
-TypeScript/TSX/Go, resolves it to an actual file in the repo where
-possible (`crates/indexer/src/resolve.rs`) — Rust via the crate/module
-tree (discovered from every `Cargo.toml`'s package name), Python via
-relative-import directory resolution plus a bounded source-root guess,
-JS/TS/TSX via relative-path + extension resolution, Go via `go.mod`'s
-module path. An import that can't be resolved (an external crate/package,
-the stdlib, a `tsconfig.json` path alias, a non-standard Rust `#[path]`
-layout) is left unresolved — never a wrong guess. This is what powers
-`ResolutionHint::ImportResolved` above; see ARCHITECTURE.md's "Import
-resolution" section for exactly what each language's resolver can and
-can't do.
+`grv index` also extracts every `use`/`import`/`require`/`#include`
+statement (`crates/indexer/src/imports.rs`) and resolves it to an actual
+file in the repo where possible (`crates/indexer/src/resolve.rs`), for
+**31 languages**: Rust (crate/module tree, discovered from every
+`Cargo.toml`'s package name), Python (relative-import directory resolution
+plus a bounded source-root guess), JavaScript/TypeScript/TSX (relative-path
++ extension resolution), Go (`go.mod`'s module path — an import can
+legitimately resolve to several files, since it names a whole package),
+C/C++/Objective-C/GLSL/HLSL/Verilog (`#include "x"` resolved against the
+including file's own directory — real search-path semantics — while
+`#include <x>` is always a system header, correctly never even recorded),
+Vim/Proto/Solidity/Nix/Bash/Fish/Ruby/R/Racket/CMake (relative/literal
+path resolution), and Java/Kotlin/Groovy/Scala/C#/Elm (hierarchical
+module-name resolution against conventional Maven/Gradle-style source
+roots, with `import a.b.*`-style wildcards resolving to every file in the
+target package directory — same multi-file honesty as Go). An import that
+can't be resolved (an external crate/package/system header, the stdlib, a
+`tsconfig.json` path alias, a non-standard Rust `#[path]` layout, D/
+Haskell/Julia's whole-module-unqualified-exposure imports which this
+project deliberately doesn't guess at) is left unresolved — never a wrong
+guess. This is what powers `ResolutionHint::ImportResolved` above; see
+ARCHITECTURE.md's "Import resolution" section for exactly what each
+language's resolver can and can't do, and which ~15 parsed languages don't
+have one yet.
 
 ### Watch mode — `grv index --watch`
 
@@ -528,7 +539,7 @@ an internet-facing service — but a passive listener on the wire can no
 longer read the token off it, which is the specific gap this
 closes.
 
-## Current scope (v0.18)
+## Current scope (v0.19)
 
 Run `grv languages` any time for the live version of this list.
 
@@ -577,5 +588,5 @@ Run `grv languages` any time for the live version of this list.
 
 ## Roadmap
 
-- Call-graph *type/full scope* resolution — still name-based by design; a real import resolver now exists for Rust/Python/JS/TS/TSX/Go (see "Import resolution" above, and `ResolutionHint::ImportResolved`), but true type resolution (knowing exactly which overload/trait impl a call targets) and import resolution for the other 40+ parsed languages are a different order of engineering effort, on par with what a language server spends its whole existence on.
+- Call-graph *type/full scope* resolution — still name-based by design; a real import resolver now exists for 31 languages (Rust/Python/JS/TS/TSX/Go plus C/C++/Objective-C/GLSL/HLSL/Vim/Proto/Solidity/Verilog/Nix/Bash/Fish/Ruby/R/Racket/CMake/Java/Kotlin/Groovy/Scala/C#/Elm — see "Import resolution" above, and `ResolutionHint::ImportResolved`), but true type resolution (knowing exactly which overload/trait impl a call targets) and import resolution for the remaining ~15 parsed languages (Elixir, Erlang, Perl, Nim, OCaml, Fortran, VHDL, Prolog, Scheme, Crystal, Lua, Zig, PowerShell, LaTeX, Dart, PHP, Ada) are a different order of engineering effort, on par with what a language server spends its whole existence on.
 - Svelte/Vue symbol extraction would need a second, injection-based parse of their `<script>` block's embedded JS/TS — the grammars themselves only expose it as opaque text.
