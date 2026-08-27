@@ -173,24 +173,57 @@ matching already makes.
 
 **`ResolutionHint`** is the honest middle ground: not real resolution, but
 a real signal beyond the bare name match, computed from one extra query
-(`SELECT DISTINCT path FROM symbols JOIN files WHERE name = ?`, once per
+(`SELECT path, kind, name, parent, start_line FROM symbols JOIN files
+WHERE name = ?`, capped at `MAX_DEFINITIONS_CONSIDERED` = 50, once per
 `find_callers` call, not once per hit) rather than per-row lookups.
-Comparing that set of "files that define this name" against each hit's own
-file gives four honestly-labeled outcomes: `LikelySameFile` (a same-named
-definition lives right there — true far more often than not in real code,
-since deliberately shadowing a name across modules is the rare case, not
-the common one), `UniqueElsewhere` (exactly one definition exists anywhere,
-just not in this file — still unambiguous, only not local),
-`Ambiguous` (multiple same-named definitions exist, none local — genuinely
-can't narrow further without real resolution), and `NoDefinitionIndexed`
-(stdlib/external/dynamic-dispatch call, or simply unindexed code). Covered
-by real unit tests against a synthetic in-memory index
-(`crates/cli/src/callgraph.rs`'s `tests` module) exercising each of the
-four outcomes, plus dogfooded against this repo's own index (`grv callers
-open_db` correctly shows `[unique definition elsewhere]` for every call
-site of the one real `open_db` in `graviton-core`; `grv callers
-count_capture_token` shows `[likely: same-file definition]` for a call
-from within the same test module its private helper is defined in).
+Comparing that list of real definitions against each hit's own file gives
+four outcomes, and — unlike the first version of this design — each
+variant now *carries the actual candidate data* (`DefinitionRef { path,
+kind, name, parent, line }`) instead of being a bare label:
+
+- `LikelySameFile(Vec<DefinitionRef>)` — one or more same-named
+  definitions live in the call site's own file. When there's exactly one,
+  that's still the strongest signal available without real scope
+  resolution (deliberately shadowing a name across modules is the rare
+  case, not the common one). When there's more than one — e.g. two
+  `impl` blocks each defining `new` in the same file — both are listed,
+  distinguished by `parent` (the enclosing `impl`/`class`, populated at
+  index time from `ExtractedSymbol::parent` via the same
+  smallest-enclosing-span technique `caller_symbol_id` uses), instead of
+  collapsing into one confident-sounding label that would have hidden the
+  very ambiguity it was supposed to flag.
+- `UniqueElsewhere(DefinitionRef)` — exactly one definition exists
+  anywhere, just not in this file — still unambiguous, only not local.
+- `Ambiguous(Vec<DefinitionRef>)` — multiple same-named definitions exist,
+  none local. GRAVITON has no notion of imports/visibility, so it can't
+  know which one a given call site actually resolves to — but rather than
+  stop at "ambiguous" and leave a human to grep the name back up
+  themselves, every real candidate's file and enclosing scope is listed,
+  so a human's own knowledge of the codebase's imports has real material
+  to finish the disambiguation with.
+- `NoDefinitionIndexed` — no definition found anywhere in the index. This
+  does *not* mean "this function doesn't exist" — only "not in what `grv
+  index` walked" (a stdlib/external-crate call, a trait method whose
+  implementor lives outside the repo, or dynamic dispatch). The CLI
+  renderer (`format_resolution_hint` in `crates/cli/src/main.rs`) states
+  this explicitly (`[not indexed anywhere -- external/stdlib call,
+  dynamic dispatch, or just not part of this repo]`) rather than printing
+  nothing, which the first version of this design did — a bare
+  unlabeled hit could otherwise be misread as "resolved cleanly."
+
+Covered by real unit tests against a synthetic in-memory index
+(`crates/cli/src/callgraph.rs`'s `tests` module) exercising all four
+outcomes, including one written specifically to prove the same-file
+scope fix (`likely_same_file_lists_every_candidate_when_the_same_file_defines_it_twice`:
+two `impl` blocks' `new()` in one file, asserting both surface as distinct
+candidates rather than one blanket label) — plus dogfooded against this
+repo's own index: `grv callers new` shows `crates/cli/src/checkpoint.rs`'s
+real `Session::new`/`MissionCheckpoint::new` collision as `[this file
+defines it 2x, still ambiguous locally: Session::new (line 53),
+MissionCheckpoint::new (line 200)]` instead of a blanket "likely" label,
+and `grv callers println` shows `[not indexed anywhere -- external/stdlib
+call, dynamic dispatch, or just not part of this repo]` for every call
+site of the (external, `std`) `println!` macro.
 
 `calls` rows are cleaned up the same way `symbols`/`embeddings` rows are:
 `ON DELETE CASCADE` from `files`, so a file re-index (which deletes and
@@ -285,7 +318,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.16)
+## Language coverage (v0.17)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its

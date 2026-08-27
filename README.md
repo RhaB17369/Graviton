@@ -411,12 +411,22 @@ extract); a language with no call query just yields no call edges (never a
 hard failure, same graceful-degradation contract as symbol extraction).
 `grv index` reports call sites found alongside symbols/chunks.
 
-Each `grv callers` hit also carries a `ResolutionHint`, shown inline:
-`[likely: same-file definition]` when a same-named definition lives in
-that call site's own file (true far more often than not in real code),
-`[unique definition elsewhere]` when there's only one candidate anywhere
-even though it's not local, or `[ambiguous: ...]` when several same-named
-definitions exist and none are local. Not type resolution — just the
+Each `grv callers` hit also carries a `ResolutionHint`, shown inline —
+listing real candidates (file, enclosing `impl`/`class`, line), not just a
+label: `[likely: Foo::bar in this file]` when one same-named definition
+lives in that call site's own file (true far more often than not in real
+code); `[this file defines it Nx, still ambiguous locally: ...]` when the
+same file defines it more than once (e.g. two `impl` blocks each with
+`new()`) — surfaced explicitly rather than papered over with one
+confident label; `[unique: path:line Foo::bar]` when there's only one
+candidate anywhere even though it's not local; `[ambiguous -- N
+candidates, none in this file: ...]` listing every real definition's file
+and scope when several same-named definitions exist and none are local
+(GRAVITON doesn't know your imports, but it hands over enough for you to);
+and `[not indexed anywhere -- external/stdlib call, dynamic dispatch, or
+just not part of this repo]` — never silence — when nothing defines the
+name anywhere in the index (which does *not* mean the function doesn't
+exist, only that it wasn't indexed). Not type resolution — just the
 cheapest real signal available without it.
 
 ### Watch mode — `grv index --watch`
@@ -497,7 +507,7 @@ an internet-facing service — but a passive listener on the wire can no
 longer read the token off it, which is the specific gap this
 closes.
 
-## Current scope (v0.16)
+## Current scope (v0.17)
 
 Run `grv languages` any time for the live version of this list.
 

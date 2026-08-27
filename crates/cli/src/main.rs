@@ -532,21 +532,73 @@ fn cmd_callers(cfg: &Config, name: &str, limit: usize) -> Result<()> {
     }
     for h in hits {
         // Resolution hint: a real signal on top of the name-based match
-        // (see callgraph.rs's module doc) -- not shown at all when it
-        // can't say anything useful (no definition indexed anywhere), so
-        // the common, unambiguous case stays a clean one-liner.
-        let hint = match h.resolution {
-            callgraph::ResolutionHint::LikelySameFile => " \x1b[2m[likely: same-file definition]\x1b[0m",
-            callgraph::ResolutionHint::UniqueElsewhere => " \x1b[2m[unique definition elsewhere]\x1b[0m",
-            callgraph::ResolutionHint::Ambiguous => " \x1b[2m[ambiguous: multiple definitions, none here]\x1b[0m",
-            callgraph::ResolutionHint::NoDefinitionIndexed => "",
-        };
+        // (see callgraph.rs's module doc). Every branch prints something
+        // now -- including `NoDefinitionIndexed`, which used to print
+        // nothing at all and so could read as "resolved cleanly" rather
+        // than "not indexed anywhere" (insufficiency #3).
+        let hint = format_resolution_hint(&h.resolution);
         match &h.caller_symbol {
             Some((kind, caller_name)) => println!("{}:{}  from {kind} {caller_name}{hint}", h.caller_path, h.line),
             None => println!("{}:{}  (top-level, not inside an extracted symbol){hint}", h.caller_path, h.line),
         }
     }
     Ok(())
+}
+
+/// `<parent>::<name>`, or just `<name>` for a top-level definition with no
+/// enclosing `impl`/`class` (`DefinitionRef::parent` is `None` there).
+fn def_label(d: &callgraph::DefinitionRef) -> String {
+    match &d.parent {
+        Some(p) => format!("{p}::{}", d.name),
+        None => d.name.clone(),
+    }
+}
+
+/// Renders a `ResolutionHint` as dim, bracketed trailing text for
+/// `grv callers` output. Addresses all three insufficiencies named
+/// against the original design (see `callgraph.rs`'s module doc): same-
+/// file candidates are listed individually via `parent` rather than
+/// collapsed into one label (#1); `Ambiguous`/`UniqueElsewhere` print
+/// every real candidate's file and scope so a human's own knowledge of
+/// imports can finish the disambiguation GRAVITON can't (#2);
+/// `NoDefinitionIndexed` states its meaning explicitly instead of
+/// printing nothing (#3).
+fn format_resolution_hint(hint: &callgraph::ResolutionHint) -> String {
+    // Ambiguous/same-file candidate lists are capped for display -- a
+    // common name can have dozens of real hits (see
+    // `MAX_DEFINITIONS_CONSIDERED`), and dumping all of them into one
+    // terminal line would defeat the point of a quick hint.
+    const MAX_SHOWN: usize = 4;
+    fn joined(defs: &[callgraph::DefinitionRef], show_path: bool) -> String {
+        let items: Vec<String> = defs
+            .iter()
+            .take(MAX_SHOWN)
+            .map(|d| if show_path { format!("{}:{} {}", d.path, d.line, def_label(d)) } else { format!("{} (line {})", def_label(d), d.line) })
+            .collect();
+        let mut s = items.join(", ");
+        if defs.len() > MAX_SHOWN {
+            s.push_str(&format!(", +{} more", defs.len() - MAX_SHOWN));
+        }
+        s
+    }
+
+    match hint {
+        callgraph::ResolutionHint::LikelySameFile(defs) if defs.len() == 1 => {
+            format!(" \x1b[2m[likely: {} in this file]\x1b[0m", joined(defs, false))
+        }
+        callgraph::ResolutionHint::LikelySameFile(defs) => {
+            format!(" \x1b[2m[this file defines it {}x, still ambiguous locally: {}]\x1b[0m", defs.len(), joined(defs, false))
+        }
+        callgraph::ResolutionHint::UniqueElsewhere(def) => {
+            format!(" \x1b[2m[unique: {}:{} {}]\x1b[0m", def.path, def.line, def_label(def))
+        }
+        callgraph::ResolutionHint::Ambiguous(defs) => {
+            format!(" \x1b[2m[ambiguous -- {} candidates, none in this file: {}]\x1b[0m", defs.len(), joined(defs, true))
+        }
+        callgraph::ResolutionHint::NoDefinitionIndexed => {
+            " \x1b[2m[not indexed anywhere -- external/stdlib call, dynamic dispatch, or just not part of this repo]\x1b[0m".to_string()
+        }
+    }
 }
 
 fn cmd_callees(cfg: &Config, name: &str, limit: usize) -> Result<()> {

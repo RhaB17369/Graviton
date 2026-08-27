@@ -137,7 +137,28 @@ pub fn index_repo(conn: &mut Connection, root: &Path) -> Result<IndexStats> {
         )?;
         let file_id = tx.last_insert_rowid();
 
-        let symbols = extract_symbols(&content, language);
+        let mut symbols = extract_symbols(&content, language);
+        // Each symbol's innermost enclosing symbol -- e.g. a method's
+        // containing impl/class -- via the same smallest-enclosing-span
+        // trick used below for call sites, applied to symbols themselves
+        // (`ExtractedSymbol.parent` existed as a field long before
+        // anything ever set it to `Some`). This is what lets
+        // `grv symbol`'s output, and `ResolutionHint::LikelySameFile`'s
+        // candidate list (`crates/cli/src/callgraph.rs`), distinguish two
+        // same-named methods in two different `impl`/`class` blocks
+        // within one file instead of only knowing "a `new` exists
+        // somewhere in this file" -- a real, if still file-local (not
+        // full-scope), precision gain.
+        for i in 0..symbols.len() {
+            let (start_i, end_i) = (symbols[i].start_line, symbols[i].end_line);
+            let parent_idx = symbols
+                .iter()
+                .enumerate()
+                .filter(|(j, s)| *j != i && s.start_line <= start_i && end_i <= s.end_line)
+                .min_by_key(|(_, s)| s.end_line - s.start_line)
+                .map(|(j, _)| j);
+            symbols[i].parent = parent_idx.map(|j| symbols[j].name.clone());
+        }
         // (symbol row id, start_line, end_line) for every symbol just
         // inserted -- used below to find each call site's innermost
         // enclosing symbol without a second query.
@@ -370,4 +391,55 @@ pub fn extract_calls(content: &str, language: Lang) -> Vec<CallSite> {
         out.push(CallSite { line: node.start_position().row as i64 + 1, callee_name });
     }
     out
+}
+
+/// `index_repo` had never had a real integration test at all before this
+/// batch — every other test in this crate exercises `extract_symbols`/
+/// `extract_calls` directly on an in-memory string, never the actual
+/// filesystem-walking, SQLite-writing entry point every `grv index`
+/// invocation goes through.
+#[cfg(test)]
+mod index_repo_tests {
+    use super::*;
+
+    /// `ExtractedSymbol.parent` existed as a field since this project's
+    /// first version but was hardcoded to `None` -- nothing ever computed
+    /// it. Populated now via the same smallest-enclosing-span technique
+    /// already used for call-site-to-symbol resolution, so that e.g. two
+    /// same-named methods in two different `impl` blocks in one file are
+    /// distinguishable (`grv symbol`'s output, and
+    /// `callgraph::ResolutionHint`'s candidate list, both read this).
+    #[test]
+    fn parent_distinguishes_same_named_methods_in_different_impls() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("shapes.rs"),
+            "struct Point { x: i32 }\nimpl Point {\n    fn new() -> Point { Point { x: 0 } }\n}\n\nstruct Circle { r: i32 }\nimpl Circle {\n    fn new() -> Circle { Circle { r: 0 } }\n}\n",
+        )
+        .unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut stmt = conn.prepare("SELECT name, parent FROM symbols WHERE name = 'new' ORDER BY parent").unwrap();
+        let rows: Vec<(String, Option<String>)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(|r| r.ok()).collect();
+
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], ("new".to_string(), Some("Circle".to_string())));
+        assert_eq!(rows[1], ("new".to_string(), Some("Point".to_string())));
+    }
+
+    #[test]
+    fn top_level_symbols_have_no_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn free_function() {}\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let parent: Option<String> = conn.query_row("SELECT parent FROM symbols WHERE name = 'free_function'", [], |r| r.get(0)).unwrap();
+        assert_eq!(parent, None);
+    }
 }
