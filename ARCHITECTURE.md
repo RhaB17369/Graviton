@@ -285,7 +285,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.15)
+## Language coverage (v0.16)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its
@@ -1230,17 +1230,34 @@ body text *and* an O(n) exact distance computation both stop being free.
 implementation with no FFI — deliberately chosen after this session's
 tree-sitter grammar-linking pain (see "Language coverage"): one fewer
 native library that can mismatch or fail to link later. It's serialized
-(bincode) to `<index_dir>/ann_<model>.bin`, one file per embedding model.
+(`postcard`) to `<index_dir>/ann_<model>.bin`, one file per embedding
+model. Originally `bincode`, swapped after `cargo audit` flagged it
+unmaintained (RUSTSEC-2025-0141 — the bincode team stopped all
+development after a doxxing/harassment incident, and explicitly call
+1.3.3 "complete" rather than defective; not exploitable as actually used
+here either, since this file is only ever written and read by GRAVITON
+itself, never untrusted input) — moved off it anyway while the swap was
+still cheap (one file, one format, both sides already `serde`-based, no
+other code changes needed) rather than waiting for a real bug nobody
+would ever fix. `postcard` (56M+ downloads, actively maintained) is
+pulled in with `default-features = false` — its default `heapless-cas`
+feature (relevant only to embedded/no-atomics targets) would have quietly
+added its own now-unmaintained transitive dependency
+(`atomic-polyfill`, RUSTSEC-2023-0089) right back in.
 
 - **The index is purely an accelerator, never a source of truth.** Every
   code path that reads it (`semantic::rank_by_query`) falls back to the
   exact linear scan on *any* problem — file missing, wrong dimensions
-  (stale model switch), corrupt bincode — via `ann::search` returning
-  `Ok(None)` rather than an error. Nothing here can make a search *wrong*,
-  only faster when it's available. `crates/cli/src/ann.rs`'s own unit
-  tests build a real 3-vector index and assert the correct nearest match
-  comes back, plus that a missing file and a dimension mismatch both
-  degrade to `None` instead of panicking.
+  (stale model switch), corrupt/unreadable encoding — via `ann::search`
+  returning `Ok(None)` rather than an error. Nothing here can make a
+  search *wrong*, only faster when it's available.
+  `crates/cli/src/ann.rs`'s own unit tests build a real 3-vector index and
+  assert the correct nearest match comes back, plus that a missing file
+  and a dimension mismatch both degrade to `None` instead of panicking;
+  re-verified live end-to-end after the `postcard` migration (a real mock
+  embedding server, `grv embed`, `grv search --semantic`) since a
+  serialization format swap is exactly the kind of change a passing unit
+  test suite alone doesn't fully vouch for.
 - **Rebuilt fully, every time `grv embed` runs — not incrementally.**
   `instant-distance` has no incremental-insert API; building means handing
   it the complete point set at once. Rather than track a separate
@@ -1450,6 +1467,25 @@ connection) still passes under the new mechanism too.
   is listening. `remove_stale_socket` tries `UnixStream::connect` first (a
   live daemon accepts) and only unlinks the file if that fails — so it
   never removes a socket a real running daemon still owns.
+- **Unix socket permissions, explicitly**: `bind_unix_socket_locked_down`
+  chmods the socket to `0600` right after binding, rather than trusting
+  `bind`'s default (mode `0777` masked by the calling process's *umask*,
+  not a fixed value). Every method reachable over this socket includes
+  `write_file`/`run_shell`/`recon_tool` via `run_start` — so "filesystem
+  permissions are the trust boundary" (asserted throughout this doc) is
+  only actually true if that boundary is unconditional. A typical umask
+  (022) happens to leave the socket non-writable — and therefore
+  non-connectable, under Linux's Unix-socket permission model — for
+  group/other anyway, which is exactly why this had gone unnoticed: the
+  common case was already accidentally safe. An unusual umask (0, or a
+  shared directory's inherited ACL) would not be, silently, with no
+  symptom until someone actually tried connecting from another local
+  account. Verified directly, not just reasoned about:
+  `unix_socket_is_locked_down_even_under_a_permissive_umask` binds under
+  a real `umask(0)` (via a small direct `libc` `extern "C"` declaration —
+  not worth a whole crate for one syscall) and asserts the resulting mode
+  is `0600` regardless; a live daemon started under `umask 000` was
+  additionally confirmed to produce a `0600` socket on disk.
 - **Unix socket path length**: `sockaddr_un.sun_path` is a real OS limit
   (~108 bytes on Linux, ~104 on macOS/BSD), not a GRAVITON one — this
   surfaced during testing when a scratch path under a long tmp directory

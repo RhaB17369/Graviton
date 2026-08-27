@@ -487,14 +487,17 @@ real 256-bit value from the OS's CSPRNG (auto-generated and printed once
 at startup unless `--tcp-token` sets one), checked with a fixed-time
 comparison (not `==`, which leaks timing info byte-by-byte) and a flat
 delay on a wrong guess — that every request over it must echo back in
-`params.token`. The Unix socket never needs a token or TLS (filesystem
-permissions are that boundary instead, same as `ollama serve`'s own
-socket). This is still a `127.0.0.1`/trusted-LAN mechanism, not hardened
-auth for an internet-facing service — but a passive listener on the wire
-can no longer read the token off it, which is the specific gap this
+`params.token`. The Unix socket never needs a token or TLS — filesystem
+permissions are that boundary instead (mode `0600`, set explicitly right
+after `bind` rather than left to whatever the process's umask happens to
+produce — verified this actually holds under a permissive `umask 000`,
+not just assumed), same trust model `ollama serve`'s own socket uses.
+This is still a `127.0.0.1`/trusted-LAN mechanism, not hardened auth for
+an internet-facing service — but a passive listener on the wire can no
+longer read the token off it, which is the specific gap this
 closes.
 
-## Current scope (v0.15)
+## Current scope (v0.16)
 
 Run `grv languages` any time for the live version of this list.
 

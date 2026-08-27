@@ -1,9 +1,13 @@
 //! ANN (approximate nearest neighbor) acceleration for semantic search,
 //! built on `instant-distance`'s pure-Rust HNSW implementation — no FFI, no
-//! external index server, one bincode blob on disk per embedding model.
-//! Chosen deliberately after this session's tree-sitter grammar-linking
-//! pain (see ARCHITECTURE.md's "Language coverage"): a pure-Rust crate with
-//! no native library to mismatch or fail to link at some later point.
+//! external index server, one `postcard`-encoded blob on disk per
+//! embedding model. `instant-distance` chosen deliberately after this
+//! session's tree-sitter grammar-linking pain (see ARCHITECTURE.md's
+//! "Language coverage"): a pure-Rust crate with no native library to
+//! mismatch or fail to link at some later point. `postcard` (not
+//! `bincode`, the original choice here) for the same "avoid a dependency
+//! that can quietly become a liability" reasoning applied to the
+//! serialization format itself — see `rebuild`/`search`'s doc comments.
 //!
 //! This is purely an accelerator layered on top of `semantic.rs`'s exact
 //! linear cosine scan, which stays the source of truth and the automatic
@@ -109,6 +113,23 @@ pub fn exists(root: &Path, index_dir: &str, model: &str) -> bool {
 /// *every* currently-embedded chunk for that model, not a delta — see
 /// module doc), replacing whatever was there before. An empty `chunks`
 /// removes the file rather than writing an empty, useless index.
+///
+/// Serialized with `postcard`, not the originally-chosen `bincode`:
+/// `cargo audit` flagged `bincode` as unmaintained (RUSTSEC-2025-0141 —
+/// the bincode team stopped all development after a doxxing/harassment
+/// incident, and explicitly call 1.3.3 "complete", not a security defect
+/// in that version specifically). Not exploitable as actually used here —
+/// this file is only ever written and read by this same tool, never
+/// untrusted network/user input, so there's no meaningfully separate
+/// trust boundary being crossed — but "permanently unmaintained, by the
+/// maintainers' own statement, with no one who will ever fix a future
+/// bug" is real enough reason to move off it while the swap is still
+/// cheap (one file, one format, both sides already going through
+/// `serde`), rather than wait for it to become a real bug and a
+/// migration under pressure. `postcard` (postcard-org, 56M+ downloads,
+/// actively maintained) needed no other code changes: same
+/// serde-`Serialize`/`Deserialize` derive on `StoredIndex`/`CosinePoint`,
+/// same "whole struct in, whole struct out" shape as before.
 pub fn rebuild(root: &Path, index_dir: &str, model: &str, chunks: &[EmbeddedChunk]) -> Result<()> {
     let path = index_path(root, index_dir, model);
     if chunks.is_empty() {
@@ -126,8 +147,8 @@ pub fn rebuild(root: &Path, index_dir: &str, model: &str, chunks: &[EmbeddedChun
     // the same filesystem, which a sibling temp file in the same
     // directory guarantees).
     let tmp_path = path.with_extension("bin.tmp");
-    let file = std::fs::File::create(&tmp_path).with_context(|| format!("creating {}", tmp_path.display()))?;
-    bincode::serialize_into(std::io::BufWriter::new(file), &stored).context("serializing ANN index")?;
+    let bytes = postcard::to_allocvec(&stored).context("serializing ANN index")?;
+    std::fs::write(&tmp_path, &bytes).with_context(|| format!("writing {}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, &path).with_context(|| format!("renaming into place: {}", path.display()))?;
     Ok(())
 }
@@ -143,11 +164,11 @@ pub fn search(root: &Path, index_dir: &str, model: &str, qvec: &[f32], limit: us
     if !path.is_file() {
         return Ok(None);
     }
-    let file = match std::fs::File::open(&path) {
-        Ok(f) => f,
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
         Err(_) => return Ok(None),
     };
-    let stored: StoredIndex = match bincode::deserialize_from(std::io::BufReader::new(file)) {
+    let stored: StoredIndex = match postcard::from_bytes(&bytes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("\x1b[2mANN index at {} is unreadable ({e:#}), falling back to a linear scan\x1b[0m", path.display());

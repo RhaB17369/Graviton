@@ -342,8 +342,7 @@ pub async fn serve(cfg: &Config, root: PathBuf, socket: Option<PathBuf>, tcp: Op
         runs: AsyncMutex::new(HashMap::new()),
     });
 
-    let unix_listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("binding unix socket {} (another `grv serve` already running here?)", socket_path.display()))?;
+    let unix_listener = bind_unix_socket_locked_down(&socket_path)?;
     println!("GRAVITON daemon listening on unix:{}", socket_path.display());
 
     let unix_ctx = ctx.clone();
@@ -410,6 +409,58 @@ pub async fn serve(cfg: &Config, root: PathBuf, socket: Option<PathBuf>, tcp: Op
     }
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
+}
+
+/// Bind the Unix socket and force its mode to `0600` (owner read/write
+/// only) explicitly, rather than trusting whatever the process's umask
+/// happens to leave it at. Every method reachable over this socket
+/// (`write_file`/`run_shell`/`recon_tool` included, via `run_start`) is
+/// only as private as this file's permissions — a freshly bound Unix
+/// socket is created at mode `0777` masked by the *caller's* umask, not a
+/// fixed value, so with a common umask (022) it happens to end up
+/// non-writable (and therefore non-connectable, per Linux's socket
+/// permission model) for group/other, but that's incidental, not
+/// guaranteed: an unusual umask (0, or a shared directory's default ACL)
+/// would leave it connectable by any other local user on the machine,
+/// silently, with no symptom until it's actually exploited. Verified
+/// directly against that exact scenario (`unix_socket_is_locked_down_even_under_a_permissive_umask`
+/// binds under a real `umask(0)`), not just reasoned about.
+fn bind_unix_socket_locked_down(path: &Path) -> Result<UnixListener> {
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("binding unix socket {} (another `grv serve` already running here?)", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| format!("restricting permissions on {}", path.display()))?;
+    }
+    Ok(listener)
+}
+
+#[cfg(all(test, unix))]
+mod socket_permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // A tiny direct libc binding instead of pulling in the `libc` crate
+    // for the one syscall this test needs and nothing else does.
+    unsafe extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
+
+    #[tokio::test]
+    async fn unix_socket_is_locked_down_even_under_a_permissive_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sock");
+        // SAFETY: umask is process-global state, not memory -- this just
+        // reads/restores it around the one bind call being tested.
+        let old_umask = unsafe { umask(0) };
+        let result = bind_unix_socket_locked_down(&path);
+        unsafe { umask(old_umask) };
+        let _listener = result.expect("bind should succeed");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket should be owner-only regardless of umask, got {mode:o}");
+    }
 }
 
 /// A socket file left behind by a crashed daemon makes `bind` fail with
