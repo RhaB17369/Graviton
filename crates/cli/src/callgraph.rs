@@ -28,13 +28,26 @@
 //!    `ExtractedSymbol::parent`) instead of a single confident-sounding
 //!    label, so a same-file collision is *shown*, not hidden behind
 //!    `LikelySameFile`.
-//! 2. No notion of imports/visibility: GRAVITON can't know that a call
+//! 2. No notion of imports/visibility: GRAVITON couldn't know that a call
 //!    site's file specifically imports the `foo` from `b.rs` and not the
-//!    one in `c.rs`. Not resolvable without real per-language import
-//!    resolution — but `Ambiguous`'s candidate list at least hands over
-//!    every real definition's file and enclosing scope, so a human's own
-//!    knowledge of the codebase's imports can finish what the name match
-//!    couldn't.
+//!    one in `c.rs`. Now partially fixed by a real, per-language import
+//!    resolver (`crates/indexer/src/imports.rs`/`resolve.rs`): every
+//!    `use`/`import`/`require` edge is parsed and, where the target can be
+//!    identified as an actual file in the repo (Rust/Python/JS/TS/TSX/Go —
+//!    see `resolve.rs`'s module doc for exactly what each language's
+//!    resolver can and can't do), recorded in `import_resolutions`.
+//!    `find_callers` uses this to promote a same-named `Ambiguous`
+//!    candidate to `ImportResolved` when the call site's own file actually
+//!    imports it — real resolution, not a heuristic guess, for the cases
+//!    those five languages' import syntax makes identifiable. Still
+//!    genuinely partial: no import resolver exists yet for the other 40+
+//!    parsed languages, `tsconfig.json` path aliases and non-standard Rust
+//!    `#[path]` layouts aren't modeled, and even a resolved import doesn't
+//!    account for shadowing/visibility rules a real compiler enforces —
+//!    `Ambiguous`'s candidate list is still there as a fallback, now
+//!    narrowed to import-corroborated candidates when any exist, so a
+//!    human's own knowledge of the codebase can finish what neither the
+//!    name match nor the import resolver could.
 //! 3. `NoDefinitionIndexed` never meant "this doesn't exist" — only "not
 //!    in what `grv index` walked" — but a bare unlabeled hit used to say
 //!    nothing at all, leaving that reading available by omission. Now
@@ -77,11 +90,21 @@ pub enum ResolutionHint {
     /// index, and it isn't in this file — still unambiguous (there's only
     /// one candidate), just not local.
     UniqueElsewhere(DefinitionRef),
+    /// The call site's own file has a real, resolved `use`/`import`
+    /// statement naming exactly this definition's file (see
+    /// `crates/indexer/src/resolve.rs`) — real import resolution, not a
+    /// file-co-location heuristic. Only produced for the languages that
+    /// have an import resolver (currently Rust/Python/JS/TS/TSX/Go).
+    ImportResolved(DefinitionRef),
     /// Multiple same-named definitions exist, none in this call site's
-    /// file — genuinely ambiguous without real resolution. Every
-    /// candidate is listed (capped — see `find_callers`) rather than just
-    /// counted, so a human's own knowledge of the codebase's imports can
-    /// narrow it down GRAVITON can't.
+    /// file, and either no import resolver exists for this language yet or
+    /// none of its imports narrow things down to one candidate. Every
+    /// remaining candidate is listed (capped — see `find_callers`; narrowed
+    /// to only the import-corroborated ones when at least one import
+    /// matched, even without narrowing all the way to a single answer)
+    /// rather than just counted, so a human's own knowledge of the
+    /// codebase's imports can finish what neither the name match nor the
+    /// import resolver could.
     Ambiguous(Vec<DefinitionRef>),
     /// No definition named `callee_name` was found anywhere in the index
     /// — a stdlib/external call, a trait method on a type defined
@@ -129,6 +152,26 @@ pub fn find_callers(conn: &Connection, callee_name: &str, limit: usize) -> Resul
         .filter_map(|r| r.ok())
         .collect();
 
+    // Real import resolution (see the module doc and `resolve.rs`): for
+    // every already-resolved import edge that either names `callee_name`
+    // specifically or is a wildcard (brings an unknown set of names into
+    // reach — see `ImportEdge::is_wildcard`), map the importing file to
+    // the set of files it actually resolves to. One query, up front, same
+    // rationale as `definitions` above.
+    let mut import_stmt = conn.prepare(
+        "SELECT f_importer.path, f_target.path \
+         FROM imports im \
+         JOIN import_resolutions ir ON ir.import_id = im.id \
+         JOIN files f_importer ON f_importer.id = im.file_id \
+         JOIN files f_target ON f_target.id = ir.file_id \
+         WHERE im.imported_name = ?1 OR im.is_wildcard = 1",
+    )?;
+    let mut imports_by_file: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    let import_rows = import_stmt.query_map([callee_name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in import_rows.filter_map(|r| r.ok()) {
+        imports_by_file.entry(row.0).or_default().insert(row.1);
+    }
+
     let mut stmt = conn.prepare(
         "SELECT f.path, s.kind, s.name, c.line \
          FROM calls c \
@@ -157,7 +200,19 @@ pub fn find_callers(conn: &Connection, callee_name: &str, limit: usize) -> Resul
             } else if definitions.len() == 1 {
                 ResolutionHint::UniqueElsewhere(definitions[0].clone())
             } else {
-                ResolutionHint::Ambiguous(definitions.clone())
+                let imported_targets = imports_by_file.get(&path);
+                let corroborated: Vec<DefinitionRef> = definitions
+                    .iter()
+                    .filter(|d| imported_targets.is_some_and(|targets| targets.contains(&d.path)))
+                    .cloned()
+                    .collect();
+                if corroborated.len() == 1 {
+                    ResolutionHint::ImportResolved(corroborated.into_iter().next().unwrap())
+                } else if !corroborated.is_empty() {
+                    ResolutionHint::Ambiguous(corroborated)
+                } else {
+                    ResolutionHint::Ambiguous(definitions.clone())
+                }
             };
             CallerHit { caller_path: path, caller_symbol: kind.zip(name), line, resolution }
         })
@@ -272,6 +327,61 @@ mod tests {
                 assert_eq!(paths, std::collections::HashSet::from(["a.rs".to_string(), "b.rs".to_string()]));
             }
             other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    /// Insufficiency #2, the real-import-resolution half of it: when the
+    /// call site's own file has an actual resolved `import` naming one of
+    /// the otherwise-ambiguous candidates, that's real evidence -- not a
+    /// heuristic guess -- and should promote the hit past `Ambiguous`.
+    #[test]
+    fn import_resolved_when_the_call_sites_file_imports_one_candidate_by_name() {
+        let conn = test_db();
+        // Two different `run`s, defined in a.rs and b.rs; called from c.rs,
+        // which has a real import resolved to a.rs naming `run` specifically.
+        conn.execute("INSERT INTO symbols (id, file_id, kind, name, start_line, end_line) VALUES (1, 1, 'function', 'run', 1, 3)", []).unwrap();
+        conn.execute("INSERT INTO symbols (id, file_id, kind, name, start_line, end_line) VALUES (2, 2, 'function', 'run', 1, 3)", []).unwrap();
+        conn.execute("INSERT INTO calls (file_id, caller_symbol_id, callee_name, line) VALUES (3, NULL, 'run', 1)", []).unwrap();
+        conn.execute("INSERT INTO imports (id, file_id, raw_path, imported_name, is_wildcard, line) VALUES (1, 3, 'a::run', 'run', 0, 1)", []).unwrap();
+        conn.execute("INSERT INTO import_resolutions (import_id, file_id) VALUES (1, 1)", []).unwrap();
+
+        let hits = find_callers(&conn, "run", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        match &hits[0].resolution {
+            ResolutionHint::ImportResolved(def) => assert_eq!(def.path, "a.rs"),
+            other => panic!("expected ImportResolved, got {other:?}"),
+        }
+    }
+
+    /// A resolved import that doesn't single out exactly one candidate
+    /// (here: a wildcard import matching both same-named definitions)
+    /// still narrows `Ambiguous`'s candidate list rather than resolving
+    /// all the way -- real evidence, honestly reported as partial when
+    /// it's only partial.
+    #[test]
+    fn ambiguous_list_narrows_to_import_corroborated_candidates() {
+        let conn = test_db();
+        conn.execute("INSERT INTO symbols (id, file_id, kind, name, start_line, end_line) VALUES (1, 1, 'function', 'run', 1, 3)", []).unwrap();
+        conn.execute("INSERT INTO symbols (id, file_id, kind, name, start_line, end_line) VALUES (2, 2, 'function', 'run', 1, 3)", []).unwrap();
+        conn.execute("INSERT INTO files (id, path, lang, size, mtime, hash) VALUES (4, 'd.rs', 'rust', 0, 0, '')", []).unwrap();
+        conn.execute("INSERT INTO symbols (id, file_id, kind, name, start_line, end_line) VALUES (3, 4, 'function', 'run', 1, 3)", []).unwrap();
+        conn.execute("INSERT INTO calls (file_id, caller_symbol_id, callee_name, line) VALUES (3, NULL, 'run', 1)", []).unwrap();
+        // c.rs has a wildcard import resolved to BOTH a.rs and d.rs (but
+        // not b.rs) -- e.g. a glob that matched a re-exporting module
+        // spanning two files. Two corroborated candidates out of three
+        // still narrows the list without collapsing to one answer.
+        conn.execute("INSERT INTO imports (id, file_id, raw_path, imported_name, is_wildcard, line) VALUES (1, 3, 'a::*', NULL, 1, 1)", []).unwrap();
+        conn.execute("INSERT INTO import_resolutions (import_id, file_id) VALUES (1, 1)", []).unwrap();
+        conn.execute("INSERT INTO import_resolutions (import_id, file_id) VALUES (1, 4)", []).unwrap();
+
+        let hits = find_callers(&conn, "run", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        match &hits[0].resolution {
+            ResolutionHint::Ambiguous(defs) => {
+                let paths: std::collections::HashSet<_> = defs.iter().map(|d| d.path.clone()).collect();
+                assert_eq!(paths, std::collections::HashSet::from(["a.rs".to_string(), "d.rs".to_string()]), "must narrow to only the import-corroborated candidates, excluding b.rs: {defs:?}");
+            }
+            other => panic!("expected a narrowed Ambiguous, got {other:?}"),
         }
     }
 

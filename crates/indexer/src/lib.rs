@@ -1,6 +1,10 @@
+mod imports;
 mod lang;
+mod resolve;
 
+pub use imports::{ImportEdge, extract_imports};
 pub use lang::{ALL_LANGS, Lang};
+pub use resolve::resolve_all_imports;
 
 use anyhow::Result;
 use ignore::WalkBuilder;
@@ -30,6 +34,8 @@ pub struct IndexStats {
     pub files_removed: usize,
     pub symbols_extracted: usize,
     pub calls_extracted: usize,
+    pub imports_extracted: usize,
+    pub imports_resolved: usize,
     pub chunks_written: usize,
 }
 
@@ -189,6 +195,22 @@ pub fn index_repo(conn: &mut Connection, root: &Path) -> Result<IndexStats> {
         }
         stats.calls_extracted += calls.len();
 
+        let file_imports = extract_imports(&content, language);
+        for imp in &file_imports {
+            tx.execute(
+                "INSERT INTO imports (file_id, raw_path, imported_name, is_wildcard, module_prefix, line) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    file_id,
+                    imp.raw_path,
+                    imp.imported_name,
+                    imp.is_wildcard,
+                    (!imp.module_prefix.is_empty()).then(|| imp.module_prefix.join("::")),
+                    imp.line
+                ],
+            )?;
+        }
+        stats.imports_extracted += file_imports.len();
+
         let chunks = chunk_lines(&content, CHUNK_LINES, CHUNK_OVERLAP);
         for (start, end, body) in &chunks {
             tx.execute(
@@ -221,6 +243,14 @@ pub fn index_repo(conn: &mut Connection, root: &Path) -> Result<IndexStats> {
         tx.commit()?;
         stats.files_removed = gone.len();
     }
+
+    // A separate, repo-wide pass (see `resolve.rs`'s module doc): turning
+    // a raw `use`/`import`/`require` edge into an actual file needs the
+    // *complete* current file set (a target added/removed elsewhere this
+    // same run must be reflected), not just the one file it was extracted
+    // from -- so this always runs after every file above has been
+    // processed, never per-file.
+    stats.imports_resolved = resolve_all_imports(conn, root)?;
 
     Ok(stats)
 }
@@ -441,5 +471,200 @@ mod index_repo_tests {
 
         let parent: Option<String> = conn.query_row("SELECT parent FROM symbols WHERE name = 'free_function'", [], |r| r.get(0)).unwrap();
         assert_eq!(parent, None);
+    }
+
+    /// A real per-language import resolver (`resolve.rs`), exercised
+    /// end-to-end through `index_repo` rather than just its internal
+    /// path-matching functions -- these are the concrete scenarios
+    /// `ResolutionHint::ImportResolved` (`crates/cli/src/callgraph.rs`)
+    /// depends on to actually narrow an ambiguous call site down to the
+    /// one definition the call site's own file really imports.
+    #[test]
+    fn rust_use_crate_resolves_across_modules_in_one_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "mod helpers;\nuse crate::helpers::run;\nfn go() { run(); }\n").unwrap();
+        std::fs::write(dir.path().join("src/helpers.rs"), "pub fn run() {}\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        let stats = index_repo(&mut conn, dir.path()).unwrap();
+        assert!(stats.imports_resolved >= 1, "{stats:?}");
+
+        let resolved_path: String = conn
+            .query_row(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'crate::helpers::run'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_path, "src/helpers.rs");
+    }
+
+    #[test]
+    fn rust_cross_crate_use_resolves_via_cargo_toml_package_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/core/src")).unwrap();
+        std::fs::write(dir.path().join("crates/core/Cargo.toml"), "[package]\nname = \"my-core\"\n").unwrap();
+        std::fs::write(dir.path().join("crates/core/src/lib.rs"), "pub fn shared() {}\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/app/src")).unwrap();
+        std::fs::write(dir.path().join("crates/app/Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(dir.path().join("crates/app/src/main.rs"), "use my_core::shared;\nfn main() { shared(); }\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let resolved_path: String = conn
+            .query_row(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'my_core::shared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_path, "crates/core/src/lib.rs");
+    }
+
+    /// A real bug this project's own dogfooding caught: `use super::x;`
+    /// inside an *inline* `#[cfg(test)] mod tests { ... }` block was
+    /// resolved as if the whole file were one flat module, jumping
+    /// `super` straight past the file's own top level to the crate root
+    /// -- a confidently WRONG cross-file answer, not an honest "don't
+    /// know" (this project holds its heuristics to a stricter bar than
+    /// that -- see `resolve.rs`'s module doc). Fixed via
+    /// `ImportEdge::module_prefix` tracking inline `mod` nesting.
+    #[test]
+    fn super_inside_an_inline_test_module_resolves_back_to_its_own_file_not_the_crate_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/permissions.rs"),
+            "fn glob_match(_p: &str, _t: &str) -> bool { true }\n\n#[cfg(test)]\nmod tests {\n    use super::glob_match;\n\n    #[test]\n    fn it_works() { assert!(glob_match(\"*\", \"x\")); }\n}\n",
+        )
+        .unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'super::glob_match'",
+            )
+            .unwrap();
+        let paths: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        assert_eq!(paths, vec!["src/permissions.rs".to_string()], "must resolve back to its own file, never main.rs");
+    }
+
+    #[test]
+    fn rust_external_crate_use_stays_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "use serde::Deserialize;\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM imports i JOIN import_resolutions r ON r.import_id = i.id WHERE i.raw_path = 'serde::Deserialize'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "an external crate must never be guessed as resolved");
+    }
+
+    #[test]
+    fn python_relative_import_resolves_to_sibling_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.path().join("pkg/models.py"), "class User: pass\n").unwrap();
+        std::fs::write(dir.path().join("pkg/views.py"), "from . import models\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        // `from . import models` is genuinely ambiguous between "models is
+        // an attribute of `pkg/__init__.py` itself" and "models is the
+        // submodule `pkg/models.py`" from a pure path-based heuristic with
+        // no access to `__init__.py`'s actual contents -- both are real,
+        // honestly recorded candidates (the same multi-candidate honesty
+        // as Go's whole-package case below), not a single guess. The
+        // submodule file must be among them.
+        let mut stmt = conn
+            .prepare(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = '.' ORDER BY f2.path",
+            )
+            .unwrap();
+        let paths: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        assert!(paths.contains(&"pkg/models.py".to_string()), "{paths:?}");
+    }
+
+    #[test]
+    fn js_relative_import_resolves_with_extension_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.ts"), "export function helper() {}\n").unwrap();
+        std::fs::write(dir.path().join("main.ts"), "import { helper } from './utils';\nhelper();\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let resolved_path: String = conn
+            .query_row(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = './utils'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_path, "utils.ts");
+    }
+
+    #[test]
+    fn go_import_resolves_to_every_file_in_the_target_package_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module myproject\n\ngo 1.22\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("pkg/utils")).unwrap();
+        std::fs::write(dir.path().join("pkg/utils/a.go"), "package utils\nfunc Run() {}\n").unwrap();
+        std::fs::write(dir.path().join("pkg/utils/b.go"), "package utils\nfunc Helper() {}\n").unwrap();
+        std::fs::write(dir.path().join("main.go"), "package main\n\nimport \"myproject/pkg/utils\"\n\nfunc main() { utils.Run() }\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'myproject/pkg/utils' ORDER BY f2.path",
+            )
+            .unwrap();
+        let paths: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        assert_eq!(paths, vec!["pkg/utils/a.go".to_string(), "pkg/utils/b.go".to_string()]);
     }
 }

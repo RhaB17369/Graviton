@@ -277,6 +277,64 @@ pub fn open_db(path: &Path) -> Result<Connection> {
         -- file, clear_index) are responsible for deleting the matching
         -- embeddings rows too, so this table never silently points at rows
         -- that no longer exist.
+        -- Real per-file import edges (`use`/`import`/`require`/Go `import`
+        -- statements), extracted via a dedicated AST walker per language
+        -- (`crates/indexer/src/imports.rs` -- import syntax nests and
+        -- aliases too much for the flat single-capture query style
+        -- `def`/`call` queries use, so this is bespoke code per language,
+        -- same as any real import resolver). `imported_name` is the
+        -- specific name imported, if any -- NULL for a whole-module import
+        -- (`import foo`) or a glob (`use foo::*`, `from foo import *`).
+        -- `is_wildcard`: true for an import that brings an unknown set of
+        -- names into (at least attribute-style) reach as a whole -- a real
+        -- glob (`use foo::*`, `from foo import *`) or a Go import (Go has
+        -- no per-name import syntax at all; a package import makes every
+        -- one of its exported names reachable via `pkg.Name()`, which this
+        -- project's call queries do capture, selector name only). False
+        -- for a plain whole-module bind (Python `import os`, a JS default/
+        -- namespace import) -- those need attribute access to reach a
+        -- name inside, which isn't what a bare-identifier `callee_name`
+        -- match represents, so they deliberately do NOT count as
+        -- corroborating evidence for an arbitrary call (see
+        -- `callgraph::find_callers`) -- being conservative there beats a
+        -- false-positive "resolved".
+        -- `module_prefix`: for Rust, the `::`-joined names of every
+        -- *inline* `mod name { ... }` block this import is textually
+        -- nested inside (e.g. "tests" for a `use` inside `#[cfg(test)] mod
+        -- tests { ... }`) -- NULL/empty for the common top-level case.
+        -- Needed so `self`/`super` resolve relative to where the `use`
+        -- actually sits, not just the file as a whole (see
+        -- `resolve.rs`'s Rust resolver) -- a file with an inline test
+        -- module is not one flat module.
+        CREATE TABLE IF NOT EXISTS imports (
+            id             INTEGER PRIMARY KEY,
+            file_id        INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            raw_path       TEXT NOT NULL,
+            imported_name  TEXT,
+            is_wildcard    INTEGER NOT NULL DEFAULT 0,
+            module_prefix  TEXT,
+            line           INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(file_id);
+
+        -- Which real indexed file(s) an import edge was resolved to, via
+        -- `crates/indexer/src/resolve.rs`'s per-language path-based
+        -- resolution (Rust crate/mod-tree, Python package tree, JS/TS
+        -- relative-path resolution, Go module path) -- run as a second
+        -- pass once the full file set for a repo is known. Usually exactly
+        -- one row (a `use`/`import` names one module file); sometimes
+        -- several (a Go import names a whole package directory, which can
+        -- span multiple files). No rows for an import means "not
+        -- resolved" -- an external crate/package/stdlib import, or a
+        -- shape this project's heuristic doesn't cover -- a real, honest
+        -- "don't know", never a wrong guess.
+        CREATE TABLE IF NOT EXISTS import_resolutions (
+            import_id  INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
+            file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            PRIMARY KEY (import_id, file_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_import_resolutions_file ON import_resolutions(file_id);
+
         CREATE TABLE IF NOT EXISTS embeddings (
             chunk_id    INTEGER PRIMARY KEY,
             model       TEXT NOT NULL,
@@ -308,6 +366,7 @@ pub fn clear_index(conn: &Connection) -> Result<()> {
         DELETE FROM embeddings WHERE chunk_id IN (SELECT rowid FROM content_fts WHERE kind != 'tool_output');
         DELETE FROM content_fts WHERE kind != 'tool_output';
         DELETE FROM calls;
+        DELETE FROM imports;
         DELETE FROM symbols;
         DELETE FROM files;
         "#,

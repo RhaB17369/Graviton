@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 rusqlite = { workspace = true }
 ignore = { workspace = true }
 tracing = { workspace = true }
+toml = { workspace = true }
 graviton-core = { path = "../core" }
 
 tree-sitter = { workspace = true }

@@ -194,13 +194,20 @@ kind, name, parent, line }`) instead of being a bare label:
   very ambiguity it was supposed to flag.
 - `UniqueElsewhere(DefinitionRef)` — exactly one definition exists
   anywhere, just not in this file — still unambiguous, only not local.
+- `ImportResolved(DefinitionRef)` — the call site's own file has a real,
+  resolved `use`/`import` naming exactly this definition's file (see
+  "Import resolution" below) — genuine resolution via an actual import
+  statement, not a co-location heuristic. Only produced for the languages
+  with an import resolver (Rust/Python/JS/TS/TSX/Go as of this writing).
 - `Ambiguous(Vec<DefinitionRef>)` — multiple same-named definitions exist,
-  none local. GRAVITON has no notion of imports/visibility, so it can't
-  know which one a given call site actually resolves to — but rather than
-  stop at "ambiguous" and leave a human to grep the name back up
-  themselves, every real candidate's file and enclosing scope is listed,
-  so a human's own knowledge of the codebase's imports has real material
-  to finish the disambiguation with.
+  none local, and either this language has no import resolver yet or none
+  of its resolved imports narrowed things down to one candidate. Rather
+  than stop at "ambiguous" and leave a human to grep the name back up
+  themselves, every remaining real candidate's file and enclosing scope is
+  listed (narrowed to just the import-corroborated ones when at least one
+  matched, even without narrowing all the way to a single answer), so a
+  human's own knowledge of the codebase's imports has real material to
+  finish the disambiguation with.
 - `NoDefinitionIndexed` — no definition found anywhere in the index. This
   does *not* mean "this function doesn't exist" — only "not in what `grv
   index` walked" (a stdlib/external-crate call, a trait method whose
@@ -224,6 +231,78 @@ MissionCheckpoint::new (line 200)]` instead of a blanket "likely" label,
 and `grv callers println` shows `[not indexed anywhere -- external/stdlib
 call, dynamic dispatch, or just not part of this repo]` for every call
 site of the (external, `std`) `println!` macro.
+
+### Import resolution (`crates/indexer/src/imports.rs`/`resolve.rs`)
+
+A real, per-language import resolver — not a heuristic guess dressed up as
+one, and not a symbol table or type checker either. It runs in two
+deliberately separate passes:
+
+1. **Extraction** (`imports.rs`, per file, during the same walk that
+   extracts symbols/calls): a bespoke AST walker per language, not a
+   `def`/`call`-style flat query — import syntax nests and aliases too
+   much for one capture pattern (`use a::{b::{c, d as e}, f::*}` is a
+   recursive tree of brace lists, renames, and glob markers). Produces
+   `ImportEdge { raw_path, imported_name, is_wildcard, module_prefix,
+   line }` rows into a new `imports` table. `imported_name` is `None` for
+   a whole-module bind (Python `import os`, a JS default/namespace
+   import); `is_wildcard` is true only for a *real* glob (`use foo::*`,
+   `from foo import *`) or any Go import (Go has no per-name import syntax
+   at all — a package import makes every exported name reachable via
+   `pkg.Name()`, which this project's call queries do capture, selector
+   name only) — the distinction matters for step 3 below.
+2. **Resolution** (`resolve.rs`, one pass over the whole repo, run once
+   after every file has been (re)indexed): turns a raw edge into an actual
+   file — or files, for Go, since an import there names a whole package
+   directory, which can span several — via a real per-language algorithm,
+   never a fuzzy match:
+   - **Rust**: `crate::`/`self::`/`super::` resolve against the owning
+     crate's module tree (crates discovered from every `Cargo.toml` in the
+     repo, `[package] name` mapped to its `src/` directory); a leading
+     segment matching another discovered crate's name resolves
+     cross-crate. Assumes the standard `cargo new` layout (module path
+     segments = directory/file segments) — `#[path = "..."]` isn't
+     modeled. A first segment matching neither `crate`/`self`/`super` nor
+     a known local crate is external (std/a dependency) and stays
+     unresolved, correctly.
+   - **Python**: relative imports (`from . import x`, `from ..pkg import
+     y`) resolve unambiguously against the importing file's own directory.
+     Absolute imports (`import a.b.c`) are tried against the repo root and
+     every one of its immediate subdirectories as candidate source roots —
+     a bounded heuristic, not a real `sys.path`.
+   - **JavaScript/TypeScript/TSX**: only relative imports (`./x`, `../x`)
+     resolve, directly against the importing file's directory, tried
+     against real extensions and `index.*`. Bare specifiers are external
+     packages in practice and stay unresolved; `tsconfig.json` path
+     aliases are a named, real gap, not modeled.
+   - **Go**: resolves against the owning module's declared path (`go.mod`'s
+     `module` line) plus the directory tree; an import can legitimately
+     resolve to several files (every `.go` file in the target package
+     directory), unlike the single-file resolution the other three give.
+
+   An import that resolves to nothing means exactly that: external
+   dependency, stdlib, or a shape this heuristic doesn't cover — never a
+   wrong guess presented as a real one.
+
+A real bug this project's own dogfooding against its own repo caught
+(and a useful example of why "run it on yourself" stays part of this
+project's verification discipline, not just unit tests in isolation):
+`use super::glob_match;` inside `crates/cli/src/permissions.rs`'s
+`#[cfg(test)] mod tests { ... }` block — an *inline* module, not a
+separate file — was resolved as if the whole file were one flat module,
+so `super` jumped straight past `permissions.rs`'s own top level to the
+crate root (`main.rs`), a confidently WRONG cross-file answer, not an
+honest "don't know". Fixed by tracking `module_prefix` — the names of
+every inline `mod name { ... }` block an import is textually nested
+inside (found by walking up the AST from the `use_declaration`, collecting
+`mod_item` ancestors — a `mod name;` with no body can never be an
+ancestor of anything, so every `mod_item` found this way is inherently
+inline) — and folding it into the effective module path before applying
+`self`/`super`. Verified live: `grv index .` on this repo, then a direct
+query, now shows `super::glob_match` resolving to
+`crates/cli/src/permissions.rs` itself; a dedicated regression test
+(`super_inside_an_inline_test_module_resolves_back_to_its_own_file_not_the_crate_root`
+in `crates/indexer/src/lib.rs`) locks this in.
 
 `calls` rows are cleaned up the same way `symbols`/`embeddings` rows are:
 `ON DELETE CASCADE` from `files`, so a file re-index (which deletes and
@@ -318,7 +397,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.17)
+## Language coverage (v0.18)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its
@@ -1579,11 +1658,15 @@ connection) still passes under the new mechanism too.
 
 ## What's explicitly *not* built yet (see README roadmap)
 
-- Call-graph type/scope resolution — still deliberately name-based, not
-  type-resolved (see "Call graph" above for `ResolutionHint`, the honest
-  middle ground this tool does have); a real per-language scope/import
-  resolver is on par with what a language server spends its whole
-  existence on, not a query tweak.
+- Call-graph *full* type/scope resolution — still deliberately name-based
+  for the call match itself; a real import resolver exists now for Rust/
+  Python/JS/TS/TSX/Go (see "Import resolution" above,
+  `ResolutionHint::ImportResolved`), but it's path-based, not a symbol
+  table or type checker — it can't model shadowing, visibility, or
+  re-exports, and 40+ other parsed languages have no import resolver yet.
+  True type resolution (which overload/trait impl a call targets) remains
+  on par with what a language server spends its whole existence on, not a
+  query tweak.
 - Svelte/Vue symbol extraction — both are now genuinely parsed (see
   "Previously-blocked grammars" above), but their own grammars expose a
   `<script>` block as one opaque text node; recovering real definitions

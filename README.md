@@ -419,15 +419,36 @@ code); `[this file defines it Nx, still ambiguous locally: ...]` when the
 same file defines it more than once (e.g. two `impl` blocks each with
 `new()`) — surfaced explicitly rather than papered over with one
 confident label; `[unique: path:line Foo::bar]` when there's only one
-candidate anywhere even though it's not local; `[ambiguous -- N
-candidates, none in this file: ...]` listing every real definition's file
-and scope when several same-named definitions exist and none are local
-(GRAVITON doesn't know your imports, but it hands over enough for you to);
+candidate anywhere even though it's not local; `[import-resolved:
+path:line Foo::bar]` when the call site's own file has a **real, resolved
+`use`/`import` statement** naming that exact definition (Rust/Python/JS/
+TS/TSX/Go — see "Import resolution" below) — genuine resolution via an
+actual import, not a heuristic; `[ambiguous -- N candidates, none in this
+file: ...]` listing every remaining real candidate's file and scope when
+several same-named definitions exist, none are local, and no resolved
+import narrows it to one (narrowed to just the import-corroborated
+candidates when at least one matched, even without narrowing all the way);
 and `[not indexed anywhere -- external/stdlib call, dynamic dispatch, or
 just not part of this repo]` — never silence — when nothing defines the
 name anywhere in the index (which does *not* mean the function doesn't
-exist, only that it wasn't indexed). Not type resolution — just the
-cheapest real signal available without it.
+exist, only that it wasn't indexed). Not full type resolution — but a real
+import resolver, not just a heuristic, for the languages it covers.
+
+### Import resolution
+
+`grv index` also extracts every `use`/`import`/`require` statement
+(`crates/indexer/src/imports.rs`) and, for Rust/Python/JavaScript/
+TypeScript/TSX/Go, resolves it to an actual file in the repo where
+possible (`crates/indexer/src/resolve.rs`) — Rust via the crate/module
+tree (discovered from every `Cargo.toml`'s package name), Python via
+relative-import directory resolution plus a bounded source-root guess,
+JS/TS/TSX via relative-path + extension resolution, Go via `go.mod`'s
+module path. An import that can't be resolved (an external crate/package,
+the stdlib, a `tsconfig.json` path alias, a non-standard Rust `#[path]`
+layout) is left unresolved — never a wrong guess. This is what powers
+`ResolutionHint::ImportResolved` above; see ARCHITECTURE.md's "Import
+resolution" section for exactly what each language's resolver can and
+can't do.
 
 ### Watch mode — `grv index --watch`
 
@@ -507,7 +528,7 @@ an internet-facing service — but a passive listener on the wire can no
 longer read the token off it, which is the specific gap this
 closes.
 
-## Current scope (v0.17)
+## Current scope (v0.18)
 
 Run `grv languages` any time for the live version of this list.
 
@@ -556,5 +577,5 @@ Run `grv languages` any time for the live version of this list.
 
 ## Roadmap
 
-- Call-graph *type resolution* — still name-based by design, `ResolutionHint` notwithstanding (see above); a real per-language scope/import resolver is a different order of engineering effort, on par with what a language server spends its whole existence on.
+- Call-graph *type/full scope* resolution — still name-based by design; a real import resolver now exists for Rust/Python/JS/TS/TSX/Go (see "Import resolution" above, and `ResolutionHint::ImportResolved`), but true type resolution (knowing exactly which overload/trait impl a call targets) and import resolution for the other 40+ parsed languages are a different order of engineering effort, on par with what a language server spends its whole existence on.
 - Svelte/Vue symbol extraction would need a second, injection-based parse of their `<script>` block's embedded JS/TS — the grammars themselves only expose it as opaque text.

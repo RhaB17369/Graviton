@@ -437,13 +437,15 @@ fn cmd_index(cfg: &Config, path: Option<PathBuf>, force: bool, do_watch: bool) -
     println!("Indexing {} ...", root.display());
     let stats = graviton_indexer::index_repo(&mut conn, &root)?;
     println!(
-        "done: {} files scanned, {} indexed, {} unchanged, {} removed, {} symbols, {} call sites, {} chunks",
+        "done: {} files scanned, {} indexed, {} unchanged, {} removed, {} symbols, {} call sites, {} imports ({} resolved to a real file), {} chunks",
         stats.files_scanned,
         stats.files_indexed,
         stats.files_skipped_unchanged,
         stats.files_removed,
         stats.symbols_extracted,
         stats.calls_extracted,
+        stats.imports_extracted,
+        stats.imports_resolved,
         stats.chunks_written
     );
     if do_watch {
@@ -591,6 +593,9 @@ fn format_resolution_hint(hint: &callgraph::ResolutionHint) -> String {
         }
         callgraph::ResolutionHint::UniqueElsewhere(def) => {
             format!(" \x1b[2m[unique: {}:{} {}]\x1b[0m", def.path, def.line, def_label(def))
+        }
+        callgraph::ResolutionHint::ImportResolved(def) => {
+            format!(" \x1b[2m[import-resolved: {}:{} {}]\x1b[0m", def.path, def.line, def_label(def))
         }
         callgraph::ResolutionHint::Ambiguous(defs) => {
             format!(" \x1b[2m[ambiguous -- {} candidates, none in this file: {}]\x1b[0m", defs.len(), joined(defs, true))
