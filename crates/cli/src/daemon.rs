@@ -362,18 +362,36 @@ pub async fn serve(cfg: &Config, root: PathBuf, socket: Option<PathBuf>, tcp: Op
     let tcp_task = match &tcp {
         Some(addr) => {
             let listener = TcpListener::bind(addr).await.with_context(|| format!("binding tcp {addr}"))?;
-            println!("GRAVITON daemon also listening on tcp:{addr}");
+            // TLS is not optional for --tcp: the token above is a real
+            // secret now (see generate_token's doc comment), and a secret
+            // sent in cleartext over the wire is only as safe as the
+            // network segment it crosses. A self-signed cert generated
+            // fresh for this run is the only certificate a LAN-bound
+            // daemon can reasonably have -- there's no CA to get one from
+            // for a private IP -- so it's trust-on-first-use, same model
+            // as an SSH host key: print the fingerprint, let the operator
+            // hand it to whoever connects out of band.
+            let tls = crate::tls::ephemeral_server_tls().context("setting up TLS for --tcp")?;
+            println!("GRAVITON daemon also listening on tcps:{addr} (TLS required)");
+            println!("\x1b[1;33mTLS certificate fingerprint (sha256): {}\x1b[0m", tls.fingerprint_sha256);
             println!(
                 "\x1b[1;33mtoken required for every tcp request (params.token): {}\x1b[0m",
                 tcp_token.as_deref().unwrap_or("")
             );
             let tcp_ctx = ctx.clone();
+            let acceptor = tls.acceptor;
             Some(tokio::spawn(async move {
                 loop {
                     match listener.accept().await {
-                        Ok((stream, _)) => {
+                        Ok((stream, peer)) => {
                             let ctx = tcp_ctx.clone();
-                            tokio::spawn(handle_conn(stream, ctx, true));
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => handle_conn(tls_stream, ctx, true).await,
+                                    Err(e) => eprintln!("\x1b[2mTLS handshake failed ({peer}): {e}\x1b[0m"),
+                                }
+                            });
                         }
                         Err(e) => eprintln!("\x1b[2maccept error (tcp): {e}\x1b[0m"),
                     }

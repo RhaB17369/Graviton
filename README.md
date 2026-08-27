@@ -277,6 +277,7 @@ grv mission "harden this API service end to end" --max-depth 2    # recursive pl
 grv review                                                        # crew review of your actual uncommitted diff
 
 grv status                         # index stats + Ollama connectivity + live capacity/top-consumers
+grv languages                      # every recognized language + what grv can do with it
 grv config --model qwen3:8b --num-ctx 8192 --host http://127.0.0.1:11434
 grv config --model-fast qwen2.5:1.5b --model-deep qwen3:14b        # opt into real multi-model
 grv config --embed-model nomic-embed-text && grv embed             # opt into semantic search
@@ -404,11 +405,19 @@ grv callees dispatch_inner        # every call made from within dispatch_inner
 Text-based, not type-resolved: `callee_name` is matched literally, the same
 simplification `grv symbol`'s `LIKE`-based name lookup already makes for
 definitions. Built from a second tree-sitter query per language
-(`Lang::call_query_src`) — covers 48 of the 50 parsed languages (everything
+(`Lang::call_query_src`) — covers 48 of the 53 parsed languages (everything
 except GraphQL and Protobuf, which have no function-call concept to
 extract); a language with no call query just yields no call edges (never a
 hard failure, same graceful-degradation contract as symbol extraction).
 `grv index` reports call sites found alongside symbols/chunks.
+
+Each `grv callers` hit also carries a `ResolutionHint`, shown inline:
+`[likely: same-file definition]` when a same-named definition lives in
+that call site's own file (true far more often than not in real code),
+`[unique definition elsewhere]` when there's only one candidate anywhere
+even though it's not local, or `[ambiguous: ...]` when several same-named
+definitions exist and none are local. Not type resolution — just the
+cheapest real signal available without it.
 
 ### Watch mode — `grv index --watch`
 
@@ -467,38 +476,56 @@ Model-calling methods share a `LiveScheduler` (same design as `swarm`/
 `mission`), so a chatty editor firing several requests at once still can't
 out-run this machine's RAM.
 
-`--tcp` always requires a token — a real 256-bit value from the OS's CSPRNG
-(auto-generated and printed once at startup unless `--tcp-token` sets one),
-checked with a fixed-time comparison (not `==`, which leaks timing info
-byte-by-byte) and a flat delay on a wrong guess — that every request over
-it must echo back in `params.token`; the Unix socket never needs one
-(filesystem permissions are that boundary instead, same as `ollama
-serve`'s own socket). Still not a substitute for real auth on an
-internet-facing service: the connection itself isn't encrypted, so a
-passive listener on the same network segment can still read the token off
-the wire — this is meant for `127.0.0.1`/a trusted LAN, where guessing or
-timing-attacking the token is the realistic threat and both are now closed.
+`--tcp` is TLS-only (TLS 1.3, via `rustls`) — every connection is
+encrypted, using a self-signed certificate generated fresh each time `grv
+serve --tcp` starts. Its SHA-256 fingerprint prints at startup right next
+to the token; since there's no CA to validate a private-IP certificate
+against, hand that fingerprint to whoever connects out of band and have
+them pin it, the same trust-on-first-use model an SSH host key uses. On
+top of that (not instead of it), `--tcp` still always requires a token — a
+real 256-bit value from the OS's CSPRNG (auto-generated and printed once
+at startup unless `--tcp-token` sets one), checked with a fixed-time
+comparison (not `==`, which leaks timing info byte-by-byte) and a flat
+delay on a wrong guess — that every request over it must echo back in
+`params.token`. The Unix socket never needs a token or TLS (filesystem
+permissions are that boundary instead, same as `ollama serve`'s own
+socket). This is still a `127.0.0.1`/trusted-LAN mechanism, not hardened
+auth for an internet-facing service — but a passive listener on the wire
+can no longer read the token off it, which is the specific gap this
+closes.
 
-## Current scope (v0.14)
+## Current scope (v0.15)
 
-- **Languages with verified symbol extraction (50):** Rust, Python,
+Run `grv languages` any time for the live version of this list.
+
+- **Languages with verified symbol extraction (53):** Rust, Python,
   JavaScript, TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua,
   Solidity, PowerShell, Haskell, Fish, Dart, Zig, Julia, Groovy, GraphQL,
   Crystal, D, assembly (label-based — the closest thing assembly has to a
   "symbol"), Elixir, Scala, Swift, Perl, R, OCaml, Elm, Nim, Erlang, Vim,
   Nix, HCL/Terraform, CMake, Verilog, VHDL, Fortran, Prolog, Racket,
-  Scheme, Protobuf, Objective-C, GLSL, HLSL, and Ada. Every one of these
-  was checked against a real sample file's actual `grv symbol` output, not
-  just compiled — see ARCHITECTURE.md's "Language coverage" for the method,
-  including the handful (Elixir, Racket, Scheme) whose grammar has no
-  dedicated "this is a definition" node at all and needed a text-predicate
-  check on top of the tree shape to avoid mistaking an ordinary function
-  call for one.
-- **Recognized + fully searchable, no grammar at all (16):** Kotlin,
-  Svelte, Vue, WGSL, LaTeX (all five have a real reason a grammar can't be
-  linked here — version conflicts or a broken external scanner, see
-  ARCHITECTURE.md), HTML, CSS, JSON, YAML, TOML, XML, Markdown, SQL,
-  Dockerfile, INI, Makefile.
+  Scheme, Protobuf, Objective-C, GLSL, HLSL, Ada, Kotlin, LaTeX, and WGSL.
+  Every one of these was checked against a real sample file's actual `grv
+  symbol` output, not just compiled — see ARCHITECTURE.md's "Language
+  coverage" for the method, including the handful (Elixir, Racket, Scheme)
+  whose grammar has no dedicated "this is a definition" node at all and
+  needed a text-predicate check on top of the tree shape, and the
+  automated regression test (`query_predicate_safety_net`) that check
+  needed once a subtle tree-sitter query syntax mistake shipped
+  undetected for a whole session.
+- **Call-graph coverage (48 of the 53):** everything above except
+  GraphQL/Protobuf (no function-call concept to extract). Purely
+  name-based — `grv callers run` matches every call site literally named
+  `run(...)`, whichever `run` it actually is — but each hit now carries a
+  `ResolutionHint` (same-file definition found / unique definition
+  elsewhere / genuinely ambiguous / nothing indexed), a real signal beyond
+  plain name matching without pretending to be full type resolution.
+- **Grammar linked and parseable, no `grv symbol` support (2):** Svelte
+  and Vue — their own grammars parse a `<script>` block as one opaque
+  blob of text, so there's no def query to write without a second,
+  injection-based parse pass this project doesn't do.
+- **Recognized + fully searchable, no grammar (11):** HTML, CSS, JSON,
+  YAML, TOML, XML, Markdown, SQL, Dockerfile, INI, Makefile.
 - That's 66 recognized languages total, plus: any other text file is still
   fully searchable (line-window chunking never depends on tree-sitter), it
   just won't show up in `grv symbol`/get its own name.
@@ -516,7 +543,5 @@ timing-attacking the token is the realistic threat and both are now closed.
 
 ## Roadmap
 
-- Kotlin/Svelte/Vue/WGSL/LaTeX symbol extraction — each blocked on a real external issue (old tree-sitter core pinned by the crate, or a broken external-scanner link), not an oversight. See ARCHITECTURE.md.
-- Call-graph *type resolution* — still name-based by design (`grv callers run` matches every call site literally named `run(...)`, whichever `run` it actually is); language coverage itself is done (48 of 50 parsed languages, everything except GraphQL/Protobuf which have no calls to extract).
-- `grv serve --tcp`'s token is now a real 256-bit random value checked in constant time, but the connection itself still isn't encrypted — fine bound to 127.0.0.1/a trusted LAN, not something to expose past that as-is.
-- Verilog's call query only covers builtin `$display`/`$finish`/etc. calls, not plain user-defined task/function calls — a real grammar-parsing gap found while verifying, not a guess.
+- Call-graph *type resolution* — still name-based by design, `ResolutionHint` notwithstanding (see above); a real per-language scope/import resolver is a different order of engineering effort, on par with what a language server spends its whole existence on.
+- Svelte/Vue symbol extraction would need a second, injection-based parse of their `<script>` block's embedded JS/TS — the grammars themselves only expose it as opaque text.

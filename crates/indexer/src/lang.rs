@@ -107,6 +107,163 @@ pub enum Lang {
     Other,
 }
 
+/// Every `Lang` variant, once, in one place — used by the query-safety-net
+/// tests below (and anything else that wants "every language GRAVITON
+/// knows about" without re-deriving the list). Deliberately hand-maintained
+/// rather than a derive macro (no `strum` dependency for one array); a
+/// `match` with every arm spelled out below would fail to compile if a
+/// variant were ever added here and forgotten there, so this list itself
+/// can't silently drift — see `all_langs_is_exhaustive` below.
+pub const ALL_LANGS: &[Lang] = &[
+    Lang::Rust,
+    Lang::Python,
+    Lang::JavaScript,
+    Lang::TypeScript,
+    Lang::Tsx,
+    Lang::C,
+    Lang::Cpp,
+    Lang::Go,
+    Lang::Java,
+    Lang::CSharp,
+    Lang::Php,
+    Lang::Ruby,
+    Lang::Bash,
+    Lang::Lua,
+    Lang::Solidity,
+    Lang::PowerShell,
+    Lang::Haskell,
+    Lang::Fish,
+    Lang::Dart,
+    Lang::Zig,
+    Lang::Julia,
+    Lang::Groovy,
+    Lang::GraphQL,
+    Lang::Crystal,
+    Lang::D,
+    Lang::Asm,
+    Lang::Elixir,
+    Lang::Scala,
+    Lang::Swift,
+    Lang::Perl,
+    Lang::R,
+    Lang::OCaml,
+    Lang::Elm,
+    Lang::Nim,
+    Lang::Erlang,
+    Lang::Vim,
+    Lang::Latex,
+    Lang::Nix,
+    Lang::Hcl,
+    Lang::CMake,
+    Lang::Verilog,
+    Lang::Vhdl,
+    Lang::Fortran,
+    Lang::Prolog,
+    Lang::Racket,
+    Lang::Scheme,
+    Lang::Proto,
+    Lang::Svelte,
+    Lang::Vue,
+    Lang::ObjC,
+    Lang::Glsl,
+    Lang::Hlsl,
+    Lang::Wgsl,
+    Lang::Ada,
+    Lang::Kotlin,
+    Lang::Html,
+    Lang::Css,
+    Lang::Json,
+    Lang::Yaml,
+    Lang::Toml,
+    Lang::Xml,
+    Lang::Markdown,
+    Lang::Sql,
+    Lang::Dockerfile,
+    Lang::Ini,
+    Lang::Makefile,
+    Lang::Other,
+];
+
+/// Compile-time guard, not a runtime check: if a new `Lang` variant is ever
+/// added to the enum without also being added to `ALL_LANGS` above, the
+/// `match` in `all_langs_covers_every_variant` (below, in `#[cfg(test)]`)
+/// becomes non-exhaustive and the crate fails to *build* -- catching a
+/// forgotten variant immediately, at the next `cargo build`, rather than
+/// leaving `ALL_LANGS` (and everything that trusts it, like the query
+/// safety net below) silently incomplete.
+#[cfg(test)]
+fn _all_langs_exhaustive_match_guard(l: Lang) {
+    match l {
+        Lang::Rust
+        | Lang::Python
+        | Lang::JavaScript
+        | Lang::TypeScript
+        | Lang::Tsx
+        | Lang::C
+        | Lang::Cpp
+        | Lang::Go
+        | Lang::Java
+        | Lang::CSharp
+        | Lang::Php
+        | Lang::Ruby
+        | Lang::Bash
+        | Lang::Lua
+        | Lang::Solidity
+        | Lang::PowerShell
+        | Lang::Haskell
+        | Lang::Fish
+        | Lang::Dart
+        | Lang::Zig
+        | Lang::Julia
+        | Lang::Groovy
+        | Lang::GraphQL
+        | Lang::Crystal
+        | Lang::D
+        | Lang::Asm
+        | Lang::Elixir
+        | Lang::Scala
+        | Lang::Swift
+        | Lang::Perl
+        | Lang::R
+        | Lang::OCaml
+        | Lang::Elm
+        | Lang::Nim
+        | Lang::Erlang
+        | Lang::Vim
+        | Lang::Latex
+        | Lang::Nix
+        | Lang::Hcl
+        | Lang::CMake
+        | Lang::Verilog
+        | Lang::Vhdl
+        | Lang::Fortran
+        | Lang::Prolog
+        | Lang::Racket
+        | Lang::Scheme
+        | Lang::Proto
+        | Lang::Svelte
+        | Lang::Vue
+        | Lang::ObjC
+        | Lang::Glsl
+        | Lang::Hlsl
+        | Lang::Wgsl
+        | Lang::Ada
+        | Lang::Kotlin
+        | Lang::Html
+        | Lang::Css
+        | Lang::Json
+        | Lang::Yaml
+        | Lang::Toml
+        | Lang::Xml
+        | Lang::Markdown
+        | Lang::Sql
+        | Lang::Dockerfile
+        | Lang::Ini
+        | Lang::Makefile
+        | Lang::Other => {}
+    }
+}
+
 impl Lang {
     pub fn from_path(path: &Path) -> Lang {
         // Filename-based detection first, for extensionless conventions.
@@ -324,6 +481,11 @@ impl Lang {
             Lang::Glsl => tree_sitter_glsl::LANGUAGE_GLSL.into(),
             Lang::Hlsl => tree_sitter_hlsl::LANGUAGE_HLSL.into(),
             Lang::Ada => tree_sitter_ada::LANGUAGE.into(),
+            Lang::Latex => codebook_tree_sitter_latex::LANGUAGE.into(),
+            Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+            Lang::Svelte => tree_sitter_svelte_ng::LANGUAGE.into(),
+            Lang::Vue => tree_sitter_vuejs::LANGUAGE.into(),
+            Lang::Wgsl => tree_sitter_wgsl_bevy::LANGUAGE.into(),
             _ => return None,
         })
     }
@@ -355,10 +517,23 @@ impl Lang {
                 (method_definition name: (property_identifier) @name) @def
                 "#
             }
+            // `class_declaration`'s `name:` field is a `type_identifier`
+            // here, unlike plain JavaScript's `identifier` -- a real,
+            // previously-undetected mismatch this query shipped with since
+            // this project's very first version (TypeScript/TSX had no
+            // dedicated test, unlike every language added since; caught by
+            // `query_predicate_safety_net`'s pattern-count check, which
+            // found the whole query failing to *compile* -- not just
+            // matching the wrong thing -- since `Query::new` rejects a
+            // field/type mismatch as an "impossible pattern" at compile
+            // time. That meant every TypeScript/TSX symbol -- functions
+            // and interfaces included, not just classes -- silently
+            // extracted nothing, because one bad pattern fails the whole
+            // multi-pattern query string.
             Lang::TypeScript | Lang::Tsx => {
                 r#"
                 (function_declaration name: (identifier) @name) @def
-                (class_declaration name: (identifier) @name) @def
+                (class_declaration name: (type_identifier) @name) @def
                 (method_definition name: (property_identifier) @name) @def
                 (interface_declaration name: (type_identifier) @name) @def
                 "#
@@ -751,6 +926,42 @@ impl Lang {
                 (subprogram_declaration (procedure_specification name: (identifier) @name)) @def
                 "#
             }
+            Lang::Kotlin => {
+                r#"
+                (function_declaration name: (identifier) @name) @def
+                (class_declaration name: (identifier) @name) @def
+                "#
+            }
+            Lang::Wgsl => {
+                r#"
+                (function_declaration name: (identifier) @name) @def
+                (struct_declaration name: (identifier) @name) @def
+                "#
+            }
+            // LaTeX's `\script`/component content isn't its own concern
+            // here -- `\section{...}`/`\label{...}` are the structural
+            // "definitions" LaTeX's own grammar actually exposes; the
+            // title's full text (which can be multiple words) lives in the
+            // inner `text` node, not a single `word` -- capturing `word`
+            // alone would only grab a title's first word.
+            Lang::Latex => {
+                r#"
+                (section text: (curly_group (text) @name)) @def
+                (label_definition name: (curly_group_label label: (label) @name)) @def
+                "#
+            }
+            // Svelte/Vue deliberately have NO def_query_src: their own
+            // grammars parse a `<script>` block's entire body as one
+            // opaque `raw_text` node -- the actual function/variable
+            // definitions inside it are real JS/TS, but recovering them
+            // would mean a second parse pass (tree-sitter's "language
+            // injection", which real editors do via a separate .scm query
+            // an editor's own host application drives) that this
+            // project's one-query-per-language design doesn't do. Still a
+            // real win over the tagged tier: both are linked, parsed
+            // grammars now (so e.g. future call-graph/injection-based work
+            // has something to build on), just not ones with a
+            // `grv symbol`-shaped answer today.
             _ => return None,
         })
     }
@@ -1006,15 +1217,15 @@ impl Lang {
                 (normal_command (identifier) @callee) @call
                 "#
             }
-            // Only the builtin `$system_task`/`$function` form
-            // (`system_tf_call`) is captured here, verified against a real
-            // parse -- a plain user task/function call as a bare procedural
-            // statement didn't produce a usable parse tree in this
-            // grammar version from a hand-written sample, so it's left out
-            // rather than guessed at.
+            // `tf_call` (task/function call) covers a plain user
+            // function/task call like `y = bar(1);` -- found on a second
+            // real sample after the first attempt's sample tripped an
+            // unrelated grammar quirk; `system_tf_call` is the separate
+            // builtin `$display`/`$finish`/... form.
             Lang::Verilog => {
                 r#"
                 (system_tf_call (system_tf_identifier) @callee) @call
+                (tf_call (simple_identifier) @callee) @call
                 "#
             }
             Lang::Vhdl => {
@@ -1648,6 +1859,13 @@ mod call_queries {
     }
 
     #[test]
+    fn verilog_plain_task_function_call() {
+        let src = "module m;\n  function integer bar;\n    input integer x;\n    begin\n      bar = x;\n    end\n  endfunction\n\n  initial begin\n    reg [31:0] y;\n    y = bar(1);\n  end\nendmodule\n";
+        let found = callees(Lang::Verilog, src);
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
     fn vhdl_procedure_call() {
         let src = "architecture behavior of counter is\nbegin\n  process is\n  begin\n    foo(1);\n  end process;\nend architecture behavior;\n";
         let found = callees(Lang::Vhdl, src);
@@ -1715,3 +1933,260 @@ mod call_queries {
         assert!(found.contains(&"Bar".to_string()), "{found:?}");
     }
 }
+
+/// The automated version of the bug hunt that found Elixir's `if x do y
+/// end` being wrongly extracted as a definition named "x": a
+/// `(#eq?/#any-of?/#not-any-of?/#match?/...)` predicate written as a
+/// sibling top-level form after `(pattern) @capture` — instead of nested
+/// *inside* the same outer parens, `((pattern) @capture (#pred? ...))` —
+/// silently compiles into an extra, content-less pattern of its own,
+/// leaving the real pattern's predicate list empty (and therefore
+/// unfiltered). That bug shipped, undetected, in three languages' `def_query_src`
+/// for an entire session, because every sample those queries were tested
+/// against happened not to need the predicate to get the right answer.
+///
+/// Rather than trust "someone will remember to write an adversarial test
+/// for every future predicate", this checks a structural invariant that's
+/// true for every query in this file regardless of what it matches: every
+/// intended top-level pattern ends with exactly one `@def` (or `@call`)
+/// capture, so a compiled query's `pattern_count()` must equal how many
+/// times that capture name appears in the source. If a predicate ever
+/// gets mis-nested again — in a language that exists today, or one added
+/// next year — `pattern_count()` silently grows past that number, and
+/// this test fails immediately, for every language, without needing a
+/// human to think up the specific adversarial input that would expose it.
+#[cfg(test)]
+mod query_predicate_safety_net {
+    use super::*;
+
+    /// Exact-token count of `capture` (e.g. `@call`) in `src` -- a plain
+    /// `src.matches(capture).count()` would also count it as a substring
+    /// of a longer capture name (`@call` inside `@callee`, which every
+    /// call query also has), so this requires the character right after
+    /// the match to NOT be a capture-name continuation character.
+    fn count_capture_token(src: &str, capture: &str) -> usize {
+        let is_capture_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-';
+        src.match_indices(capture)
+            .filter(|(i, m)| src[i + m.len()..].chars().next().is_none_or(|c| !is_capture_char(c)))
+            .count()
+    }
+
+    fn assert_pattern_count_matches_captures(lang: Lang, src: &str, capture: &str, query_kind: &str) {
+        let Some(ts_lang) = lang.ts_language() else { return };
+        let query = match Query::new(&ts_lang, src) {
+            Ok(q) => q,
+            Err(e) => panic!("{lang:?}: {query_kind} failed to compile: {e}"),
+        };
+        let expected = count_capture_token(src, capture);
+        assert_eq!(
+            query.pattern_count(),
+            expected,
+            "{lang:?}: {query_kind} compiled to {} pattern(s) but has {expected} `{capture}` capture(s) -- \
+             a predicate is very likely written as a sibling top-level form instead of nested inside \
+             the pattern's own parens. Wrong:\n  (pattern) @{cap}\n  (#eq? ...)\nRight:\n  ((pattern) @{cap}\n   (#eq? ...))",
+            query.pattern_count(),
+            cap = capture.trim_start_matches('@'),
+        );
+    }
+
+    #[test]
+    fn every_def_query_pattern_count_matches_its_def_captures() {
+        for &lang in ALL_LANGS {
+            if let Some(src) = lang.def_query_src() {
+                assert_pattern_count_matches_captures(lang, src, "@def", "def_query_src");
+            }
+        }
+    }
+
+    #[test]
+    fn every_call_query_pattern_count_matches_its_call_captures() {
+        for &lang in ALL_LANGS {
+            if let Some(src) = lang.call_query_src() {
+                assert_pattern_count_matches_captures(lang, src, "@call", "call_query_src");
+            }
+        }
+    }
+
+    /// Ties `ALL_LANGS` to the actual enum: `_all_langs_exhaustive_match_guard`
+    /// fails to *compile* the moment a new `Lang` variant exists without an
+    /// arm for it, and this count is the second half -- it fails at *test*
+    /// time if that new variant's arm was added there but never added to
+    /// `ALL_LANGS` itself (the two tests above, and anything else built on
+    /// `ALL_LANGS`, would otherwise silently skip it forever). Update this
+    /// number (and `ALL_LANGS`) together when adding a language.
+    #[test]
+    fn all_langs_has_every_known_variant() {
+        assert_eq!(ALL_LANGS.len(), 67, "a Lang variant was added/removed without updating ALL_LANGS to match");
+    }
+}
+
+/// The original six languages (Rust/Python/JS/TS/TSX/Go) had never had a
+/// single real-sample assertion test of their own, unlike every language
+/// added since -- `query_predicate_safety_net` catching TypeScript's
+/// `class_declaration` field-type mismatch (a compile-time "impossible
+/// pattern" that silently zeroed out ALL TypeScript/TSX symbol extraction,
+/// not just classes) is exactly what that gap let through undetected.
+/// This closes it: real def + call extraction, asserted against real
+/// samples, for the languages this whole tool was originally built around.
+#[cfg(test)]
+mod original_six_queries {
+    use super::*;
+
+    fn names(lang: Lang, src: &str) -> Vec<String> {
+        crate::extract_symbols(src, lang).into_iter().map(|s| s.name).collect()
+    }
+
+    fn callees(lang: Lang, src: &str) -> Vec<String> {
+        crate::extract_calls(src, lang).into_iter().map(|c| c.callee_name).collect()
+    }
+
+    #[test]
+    fn rust_def_and_call() {
+        let src = "struct Point { x: i32 }\nenum Color { Red }\ntrait Shape {}\nimpl Point {}\nmod util {}\n\nfn foo(x: i32) -> i32 {\n    bar(x);\n    x.method();\n    Point::new();\n    println!(\"{}\", x);\n    x\n}\n";
+        let n = names(Lang::Rust, src);
+        for want in ["Point", "Color", "Shape", "util", "foo"] {
+            assert!(n.contains(&want.to_string()), "names={n:?}");
+        }
+        let c = callees(Lang::Rust, src);
+        for want in ["bar", "method", "new", "println"] {
+            assert!(c.contains(&want.to_string()), "callees={c:?}");
+        }
+    }
+
+    #[test]
+    fn python_def_and_call() {
+        let src = "class Greeter:\n    def greet(self):\n        foo(1)\n        self.helper()\n\ndef foo(x):\n    return x\n";
+        let n = names(Lang::Python, src);
+        for want in ["Greeter", "greet", "foo"] {
+            assert!(n.contains(&want.to_string()), "names={n:?}");
+        }
+        let c = callees(Lang::Python, src);
+        for want in ["foo", "helper"] {
+            assert!(c.contains(&want.to_string()), "callees={c:?}");
+        }
+    }
+
+    #[test]
+    fn javascript_def_and_call() {
+        let src = "class Greeter {\n  greet() {\n    foo(1);\n    this.helper();\n  }\n}\n\nfunction foo(x) {\n  return x;\n}\n";
+        let n = names(Lang::JavaScript, src);
+        for want in ["Greeter", "greet", "foo"] {
+            assert!(n.contains(&want.to_string()), "names={n:?}");
+        }
+        let c = callees(Lang::JavaScript, src);
+        for want in ["foo", "helper"] {
+            assert!(c.contains(&want.to_string()), "callees={c:?}");
+        }
+    }
+
+    #[test]
+    fn typescript_class_is_not_silently_dropped() {
+        // The exact regression: class_declaration's name field is a
+        // type_identifier in TypeScript, not a plain identifier -- get
+        // this wrong and Query::new rejects the WHOLE multi-pattern query
+        // as an "impossible pattern", so this asserts every def kind in
+        // one query still comes back, not just the class.
+        let src = "interface Shape {\n  area(): number;\n}\n\nclass Greeter {\n  greet(): string {\n    foo(1);\n    this.helper();\n    return \"hi\";\n  }\n}\n\nfunction foo(x: number): number {\n  return x;\n}\n";
+        let n = names(Lang::TypeScript, src);
+        for want in ["Shape", "Greeter", "greet", "foo"] {
+            assert!(n.contains(&want.to_string()), "names={n:?}");
+        }
+        let c = callees(Lang::TypeScript, src);
+        for want in ["foo", "helper"] {
+            assert!(c.contains(&want.to_string()), "callees={c:?}");
+        }
+    }
+
+    #[test]
+    fn tsx_class_is_not_silently_dropped() {
+        let src = "class Greeter {\n  greet(): string {\n    foo(1);\n    return \"hi\";\n  }\n}\n\nfunction foo(x: number): number {\n  return x;\n}\n";
+        let n = names(Lang::Tsx, src);
+        for want in ["Greeter", "greet", "foo"] {
+            assert!(n.contains(&want.to_string()), "names={n:?}");
+        }
+    }
+
+    #[test]
+    fn go_def_and_call() {
+        let src = "package main\n\ntype Point struct {\n\tX int\n}\n\nfunc foo(x int) int {\n\tbar(x)\n\tp := Point{}\n\tp.Method()\n\treturn x\n}\n";
+        let n = names(Lang::Go, src);
+        for want in ["Point", "foo"] {
+            assert!(n.contains(&want.to_string()), "names={n:?}");
+        }
+        let c = callees(Lang::Go, src);
+        for want in ["bar", "Method"] {
+            assert!(c.contains(&want.to_string()), "callees={c:?}");
+        }
+    }
+}
+
+/// Kotlin/Svelte/Vue/WGSL/LaTeX all used to be "genuinely unlinkable"
+/// (see git history / ARCHITECTURE.md for the real type-mismatch and
+/// missing-scanner-file failures that earned them that classification).
+/// Each is now backed by a real, actively-maintained fork that was
+/// individually verified to link *and* parse before being trusted --
+/// these tests are that verification, permanently, not just "it compiled
+/// today".
+#[cfg(test)]
+mod newly_unblocked_grammars {
+    use super::*;
+
+    fn names(lang: Lang, src: &str) -> Vec<String> {
+        crate::extract_symbols(src, lang).into_iter().map(|s| s.name).collect()
+    }
+
+    fn parses_without_error(lang: Lang, src: &str) {
+        let ts_lang = lang.ts_language().unwrap_or_else(|| panic!("{lang:?}: grammar not linked"));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).unwrap_or_else(|e| panic!("{lang:?}: set_language failed: {e}"));
+        let tree = parser.parse(src, None).unwrap_or_else(|| panic!("{lang:?}: parse returned None"));
+        assert!(!tree.root_node().has_error(), "{lang:?}: parse tree has an ERROR node for real sample code:\n{}", tree.root_node().to_sexp());
+    }
+
+    #[test]
+    fn kotlin_function_and_class() {
+        let src = "fun foo(x: Int): Int {\n    return bar(x)\n}\n\nclass Greeter(val name: String) {\n    fun greet(): String {\n        return name\n    }\n}\n";
+        parses_without_error(Lang::Kotlin, src);
+        let found = names(Lang::Kotlin, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Greeter".to_string()), "{found:?}");
+        assert!(found.contains(&"greet".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn wgsl_function_and_struct() {
+        let src = "fn foo(x: f32) -> f32 {\n    return bar(x);\n}\n\nstruct Point {\n    x: f32,\n    y: f32,\n}\n";
+        parses_without_error(Lang::Wgsl, src);
+        let found = names(Lang::Wgsl, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Point".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn latex_section_and_label() {
+        let src = "\\section{Introduction}\n\\label{sec:intro}\n\nSome text \\cite{foo} here.\n\n\\begin{equation}\n  x = y\n\\end{equation}\n";
+        parses_without_error(Lang::Latex, src);
+        let found = names(Lang::Latex, src);
+        assert!(found.contains(&"Introduction".to_string()), "{found:?}");
+        assert!(found.contains(&"sec:intro".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn svelte_parses_a_real_component() {
+        // No def_query_src (see its doc comment) -- a real parse with no
+        // ERROR node is the actual claim being verified here.
+        parses_without_error(
+            Lang::Svelte,
+            "<script>\n  function foo(x) {\n    return bar(x);\n  }\n  let count = 0;\n</script>\n\n<button on:click={foo}>{count}</button>\n",
+        );
+    }
+
+    #[test]
+    fn vue_parses_a_real_component() {
+        parses_without_error(
+            Lang::Vue,
+            "<template>\n  <button @click=\"foo\">{{ count }}</button>\n</template>\n\n<script>\nexport default {\n  methods: {\n    foo() {\n      return bar();\n    }\n  }\n}\n</script>\n",
+        );
+    }
+}
+

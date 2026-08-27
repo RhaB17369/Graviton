@@ -12,6 +12,7 @@ mod permissions;
 mod resources;
 mod run_io;
 mod semantic;
+mod tls;
 mod tools;
 mod watch;
 mod web;
@@ -218,6 +219,8 @@ enum Command {
     },
     /// Show index stats and Ollama connectivity
     Status,
+    /// List every language GRAVITON recognizes and what it can do with it
+    Languages,
     /// Show or update the config file (~/.config/graviton/config.toml)
     Config {
         #[arg(long)]
@@ -413,6 +416,7 @@ async fn main() -> Result<()> {
         Command::Plan { session } => cmd_plan(session),
         Command::Rollback { session, to } => cmd_rollback(session, to),
         Command::Status => cmd_status(&cfg).await,
+        Command::Languages => cmd_languages(),
         Command::Config { model, model_fast, model_deep, embed_model, num_ctx, host } => {
             cmd_config(model, model_fast, model_deep, embed_model, num_ctx, host)
         }
@@ -523,13 +527,23 @@ fn cmd_callers(cfg: &Config, name: &str, limit: usize) -> Result<()> {
     let conn = open_repo_db(cfg, &root)?;
     let hits = callgraph::find_callers(&conn, name, limit)?;
     if hits.is_empty() {
-        println!("no call sites named '{name}' (only Rust/Python/JS/TS/TSX/Go have call edges so far)");
+        println!("no call sites named '{name}' (see `grv languages` for which languages have call-graph coverage)");
         return Ok(());
     }
     for h in hits {
+        // Resolution hint: a real signal on top of the name-based match
+        // (see callgraph.rs's module doc) -- not shown at all when it
+        // can't say anything useful (no definition indexed anywhere), so
+        // the common, unambiguous case stays a clean one-liner.
+        let hint = match h.resolution {
+            callgraph::ResolutionHint::LikelySameFile => " \x1b[2m[likely: same-file definition]\x1b[0m",
+            callgraph::ResolutionHint::UniqueElsewhere => " \x1b[2m[unique definition elsewhere]\x1b[0m",
+            callgraph::ResolutionHint::Ambiguous => " \x1b[2m[ambiguous: multiple definitions, none here]\x1b[0m",
+            callgraph::ResolutionHint::NoDefinitionIndexed => "",
+        };
         match &h.caller_symbol {
-            Some((kind, caller_name)) => println!("{}:{}  from {kind} {caller_name}", h.caller_path, h.line),
-            None => println!("{}:{}  (top-level, not inside an extracted symbol)", h.caller_path, h.line),
+            Some((kind, caller_name)) => println!("{}:{}  from {kind} {caller_name}{hint}", h.caller_path, h.line),
+            None => println!("{}:{}  (top-level, not inside an extracted symbol){hint}", h.caller_path, h.line),
         }
     }
     Ok(())
@@ -540,7 +554,7 @@ fn cmd_callees(cfg: &Config, name: &str, limit: usize) -> Result<()> {
     let conn = open_repo_db(cfg, &root)?;
     let groups = callgraph::find_callees(&conn, name, limit)?;
     if groups.is_empty() {
-        println!("no symbol named '{name}' with any recorded calls (only Rust/Python/JS/TS/TSX/Go have call edges so far)");
+        println!("no symbol named '{name}' with any recorded calls (see `grv languages` for which languages have call-graph coverage)");
         return Ok(());
     }
     for (path, hits) in groups {
@@ -907,6 +921,45 @@ fn cmd_rollback(session: Option<String>, to: Option<u64>) -> Result<()> {
     };
     let undone = checkpoint::rollback(&root, &session_id, to)?;
     println!("rolled back {undone} change(s) from session {session_id}");
+    Ok(())
+}
+
+/// Every recognized language, split into the same three honest tiers
+/// ARCHITECTURE.md describes: symbol extraction verified against a real
+/// sample (`grv symbol` works), call-graph coverage on top of that
+/// (`grv callers`/`callees` work too), or just tagged (searchable via
+/// `grv search`/`ask`, no `grv symbol` support).
+fn cmd_languages() -> Result<()> {
+    let mut full: Vec<&str> = Vec::new();
+    let mut symbols_only: Vec<&str> = Vec::new();
+    let mut tagged_only: Vec<&str> = Vec::new();
+    for &lang in graviton_indexer::ALL_LANGS {
+        if lang == graviton_indexer::Lang::Other {
+            continue;
+        }
+        let name = lang.name();
+        if lang.ts_language().is_none() {
+            tagged_only.push(name);
+        } else if lang.def_query_src().is_some() {
+            if lang.call_query_src().is_some() {
+                full.push(name);
+            } else {
+                symbols_only.push(name);
+            }
+        } else {
+            tagged_only.push(name);
+        }
+    }
+    for v in [&mut full, &mut symbols_only, &mut tagged_only] {
+        v.sort_unstable();
+    }
+    println!("\x1b[1;32msymbols + call graph ({}):\x1b[0m {}", full.len(), full.join(", "));
+    println!("\x1b[1;36msymbols only ({}):\x1b[0m {}", symbols_only.len(), symbols_only.join(", "));
+    println!("\x1b[2msearchable only, no grv symbol ({}):\x1b[0m {}", tagged_only.len(), tagged_only.join(", "));
+    println!(
+        "\n{} languages total, plus any other text file (always fully searchable via `grv search`/`grv ask`, never shows up in `grv symbol`)",
+        full.len() + symbols_only.len() + tagged_only.len()
+    );
     Ok(())
 }
 

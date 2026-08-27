@@ -1,6 +1,6 @@
 mod lang;
 
-pub use lang::Lang;
+pub use lang::{ALL_LANGS, Lang};
 
 use anyhow::Result;
 use ignore::WalkBuilder;

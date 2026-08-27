@@ -60,16 +60,30 @@ tree-sitter-d = "0.8"
 tree-sitter-crystal = "0.1"
 tree-sitter-asm = "0.24"
 tree-sitter-ada = "0.1"
-# tree-sitter-svelte/-vue/-wgsl are declared dependencies of this crate's
-# other grammars' ecosystem but NOT added here: their Rust bindings return
-# a `tree_sitter::Language` from an incompatible tree-sitter core version
-# (0.20 vs. the 0.26 every other grammar here links against) -- it compiles
-# but fails at final link time with "multiple different versions of crate
-# `tree_sitter`". tree-sitter-latex similarly isn't included: its external
-# scanner (used for raw/verbatim-environment lexing) fails to link with
-# undefined `tree_sitter_latex_external_scanner_*` symbols. All three
-# languages are still recognized + fully searchable (see `Lang::from_path`)
-# via the tagged tier, same as Kotlin -- just without a real parse tree.
+# The original tree-sitter-kotlin/-svelte/-vue/-wgsl/-latex crates on
+# crates.io are all genuinely broken here (see git history for the exact
+# type-mismatch/missing-scanner failures found and verified) -- not
+# revisited blindly, but replaced with actively-maintained forks, each
+# checked before adding: real crates.io downloads/update history, a
+# `tree-sitter-language` (not raw `tree-sitter`) dependency (the modern
+# ABI-stable shim every other grammar here already uses, which is what
+# actually makes cross-grammar-vintage linking work), and in Latex's case,
+# the actual scanner.c the original crate was missing. Kotlin/Svelte/Wgsl
+# are `tree-sitter-grammars` org forks (Zed/Neovim/Helix's usual upstream
+# for maintained grammars) or as close to it as a real fix could be found;
+# Vue's had no equivalent published release, only an unpublished branch
+# from that same org -- pinned by commit (not a floating branch) via a git
+# dependency, since crates.io has no better option. Several *other*
+# recently-published "tree-sitter-vue-*" crates were deliberately NOT used
+# despite fixing the same symptom -- a cluster of near-identical,
+# recently-published, unaffiliated-author crates around one popular
+# missing package name is a real dependency-confusion/typosquat pattern,
+# not just an abundance of choice.
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-svelte-ng = "1.0"
+tree-sitter-wgsl-bevy = "0.1"
+codebook-tree-sitter-latex = "0.6"
+tree-sitter-vuejs = { git = "https://github.com/tree-sitter-grammars/tree-sitter-vue", rev = "ded84d24648b73a24b27f8f2d51c28f476bce584" }
 
 [dev-dependencies]
 tempfile = "3"

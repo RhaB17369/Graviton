@@ -43,6 +43,10 @@ graviton/
 │   └── cli/        `grv` binary: subcommands, retrieval/context assembly, prompts
 ```
 
+Rust edition 2024 (bumped from 2021 once the toolchain running this project
+comfortably supported it — no code changes were needed; the workspace
+already avoided the patterns 2024 changes the defaults for).
+
 ### Why Rust over C/C++ for this
 
 - Memory safety matters more than usual here: this walks and parses
@@ -116,7 +120,7 @@ degrades `grv symbol` precision, never `grv search`/`grv ask` recall.
 A second tree-sitter query per language, same graceful-degradation contract
 as the definition query above (`Lang::call_query_src`/`compile_call_query`,
 `indexer::extract_calls`, `CallSite { line, callee_name }`) — written and
-verified for 48 of the 50 parsed languages (all except GraphQL and
+verified for 48 of the 53 parsed languages (all except GraphQL and
 Protobuf, which have no "function call" concept at all — schema
 definition languages, nothing to extract); a language with no call query
 just yields no call edges, never a hard failure. Every match must expose a
@@ -143,11 +147,13 @@ forms as if something "called" them:
   including conditional jumps alongside `call`, since a jump-target graph
   is the closest thing assembly has to "what does this call".
 
-One documented gap, not a guess dressed up as a query: Verilog's call
-query only covers `system_tf_call` (builtin `$display`/`$finish`/...) — a
-plain user-defined task/function call as a bare procedural statement
-didn't produce a usable parse tree from a hand-written sample in this
-grammar version, so it was left out rather than shipped unverified.
+Verilog's call query covers both `system_tf_call` (builtin
+`$display`/`$finish`/...) and `tf_call` (a plain user-defined task/function
+call, e.g. `y = bar(1);`) — the latter was initially left out after a
+hand-written sample tripped an unrelated grammar quirk (a `task`
+declaration's own syntax, not the call site) and produced an `ERROR` node;
+a second, narrower sample isolating just the call site parsed cleanly and
+revealed the real shape (`(tf_call (simple_identifier) @callee)`).
 
 Deliberately name-based, not type-resolved: a new `calls` table
 (`file_id`, `caller_symbol_id` nullable, `callee_name`, `line`) stores the
@@ -159,10 +165,32 @@ finding the *smallest* still-open symbol span containing the call's line —
 capturing already-inserted `(id, start_line, end_line)` triples for the
 file being indexed lets `index_repo` do this with one linear scan per file,
 no extra query. Full type/scope resolution would need real semantic
-analysis per language (a much larger undertaking) for a precision gain
-that matters more to an automated refactoring tool than to a developer
-reading `grv callers`' output — the same tradeoff `grv symbol`'s
-`LIKE`-based name matching already makes.
+analysis per language (a much larger undertaking, on par with what a
+language server spends its whole existence on) for a precision gain that
+matters more to an automated refactoring tool than to a developer reading
+`grv callers`' output — the same tradeoff `grv symbol`'s `LIKE`-based name
+matching already makes.
+
+**`ResolutionHint`** is the honest middle ground: not real resolution, but
+a real signal beyond the bare name match, computed from one extra query
+(`SELECT DISTINCT path FROM symbols JOIN files WHERE name = ?`, once per
+`find_callers` call, not once per hit) rather than per-row lookups.
+Comparing that set of "files that define this name" against each hit's own
+file gives four honestly-labeled outcomes: `LikelySameFile` (a same-named
+definition lives right there — true far more often than not in real code,
+since deliberately shadowing a name across modules is the rare case, not
+the common one), `UniqueElsewhere` (exactly one definition exists anywhere,
+just not in this file — still unambiguous, only not local),
+`Ambiguous` (multiple same-named definitions exist, none local — genuinely
+can't narrow further without real resolution), and `NoDefinitionIndexed`
+(stdlib/external/dynamic-dispatch call, or simply unindexed code). Covered
+by real unit tests against a synthetic in-memory index
+(`crates/cli/src/callgraph.rs`'s `tests` module) exercising each of the
+four outcomes, plus dogfooded against this repo's own index (`grv callers
+open_db` correctly shows `[unique definition elsewhere]` for every call
+site of the one real `open_db` in `graviton-core`; `grv callers
+count_capture_token` shows `[likely: same-file definition]` for a call
+from within the same test module its private helper is defined in).
 
 `calls` rows are cleaned up the same way `symbols`/`embeddings` rows are:
 `ON DELETE CASCADE` from `files`, so a file re-index (which deletes and
@@ -257,89 +285,157 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.14)
+## Language coverage (v0.15)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its
 grammar on crates.io, pull its `node-types.json` to find the right node/field
 names for function/class/method definitions, write the query, and let the
 existing "best-effort, never fatal" machinery handle version drift.
+`ALL_LANGS` (a hand-maintained `&[Lang]` const, tied to the enum by a
+compile-time-exhaustive match — see "The query safety net" below) is the
+canonical list of every recognized language; `grv languages` prints it
+split into the same tiers as here.
 
-GRAVITON recognizes **66 languages total**, split into two honest tiers —
+GRAVITON recognizes **66 languages total**, split into three honest tiers —
 "honest" meaning the tier a language sits in reflects what was actually
 verified, not what merely compiles:
 
-- **50 with a verified `def_query_src`** — the grammar is linked AND its
+- **53 with a verified `def_query_src`** — the grammar is linked AND its
   query was checked against a real sample file's `extract_symbols()` output,
   not just compiled: the original 16 (Rust, Python, JavaScript, TypeScript,
   TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity, PowerShell),
   10 added for the "at least 60 languages" push (Haskell, Fish, Dart, Zig,
   Julia, Groovy, GraphQL, Crystal, D, and assembly — assembly's "symbol" is
-  a label, the closest thing the format has to one), and 24 more added in
-  a follow-up pass (Elixir, Scala, Swift, Perl, R, OCaml, Elm, Nim, Erlang,
+  a label, the closest thing the format has to one), 24 more added in a
+  follow-up pass (Elixir, Scala, Swift, Perl, R, OCaml, Elm, Nim, Erlang,
   Vim, Nix, HCL/Terraform, CMake, Verilog, VHDL, Fortran, Prolog, Racket,
-  Scheme, Protobuf, Objective-C, GLSL, HLSL, Ada) once each one's queries
-  had been checked the same way — see "Text-predicate-based queries"
-  below for the subset of these (Elixir, Racket, Scheme) that needed more
-  than a structural query to get right.
-- **16 tagged only, no grammar at all** — Kotlin, HTML, CSS, JSON, YAML,
-  TOML, XML, Markdown, SQL, Dockerfile, INI, Makefile, plus four added
-  in the same push for real, verified reasons (below): Svelte, Vue, WGSL,
-  LaTeX.
+  Scheme, Protobuf, Objective-C, GLSL, HLSL, Ada — see "Text-predicate-based
+  queries" below for the subset of these that needed more than a
+  structural query), and finally Kotlin, LaTeX, and WGSL once each got a
+  real working grammar (see "Previously-blocked grammars" below).
+- **2 with a real, linked, parseable grammar but no `def_query_src`** —
+  Svelte and Vue. Both grammars parse a `<script>` block's entire body as
+  one opaque `raw_text` node; the actual function/variable definitions
+  inside it are real JS/TS, but recovering them needs a second,
+  "language injection" parse pass (what a real editor's own host
+  application drives via a separate `.scm` query) that this project's
+  one-query-per-language design doesn't do. Still real progress over
+  having no grammar at all — both are now genuinely parsed, just not in a
+  `grv symbol`-shaped way.
+- **11 tagged only, no grammar** — HTML, CSS, JSON, YAML, TOML, XML,
+  Markdown, SQL, Dockerfile, INI, Makefile — markup/data/config formats
+  with no tree-sitter grammar attempted (not "blocked", just never
+  applicable the way a programming language's function/class concept is).
 
 Two real constraints surfaced while adding the original v0.2 batch (Java,
 C#, PHP, Ruby, Bash, Lua, Solidity, PowerShell), and both recurred, harder,
-in the two later, much bigger language pushes:
+in the later, much bigger language pushes:
 
 - **Node/field names must be looked up per grammar, not assumed.** They
   don't follow one convention: Ruby's `class`/`module` nodes *do* expose a
-  `name:` field (unlike what a naive guess suggests), while Kotlin and
-  PowerShell's grammars expose the name as a bare positional child with no
-  field label at all (`(class_declaration (type_identifier) @name)` instead
-  of `(class_declaration name: (type_identifier) @name)`). Get this wrong
-  and the query still compiles — it just silently matches nothing, which is
-  why every language in the 50-language tier was verified two ways: real
+  `name:` field (unlike what a naive guess suggests), while PowerShell's
+  grammar exposes the name as a bare positional child with no field label
+  at all (`(class_declaration (type_identifier) @name)` instead of
+  `(class_declaration name: (type_identifier) @name)`). Get this wrong and
+  the query still compiles — it just silently matches nothing, which is
+  why every language in the 53-language tier was verified two ways: real
   `node-types.json` inspection plus a real parse (`to_sexp()` dump) of a
   hand-written sample file in each language, then a permanent test
   (`crates/indexer/src/lang.rs`'s `new_language_queries` module) asserting
   `extract_symbols()` returns the expected names from that sample — not
-  "it compiled".
-- **Cargo's `links` uniqueness bites grammar crates that lag upstream.**
-  `tree-sitter-kotlin` (0.3.8, the latest release on crates.io) depends on
-  tree-sitter 0.21/0.22; every other grammar here depends on 0.26. Cargo
-  will not link two versions of a native library that both declare `links =
-  "tree-sitter"` into one binary, so Kotlin can't be added as a parsed
-  language without vendoring a patched grammar crate — not worth it for one
-  language when the file is still fully searchable either way.
-- **A `links` conflict isn't the only way a grammar can be unusable — a
-  type mismatch or a missing symbol can hide until final link time.**
-  Discovered the hard way with three more candidates during the 37-language
-  push:
-  - `tree-sitter-svelte`, `tree-sitter-vue`, `tree-sitter-wgsl`: no `links`
-    conflict at all — Cargo resolves and compiles each in isolation without
-    complaint. The failure only shows up when their `language()` fn's
-    return value is used somewhere expecting `tree_sitter::Language`: their
-    bindings return that type from an *old* tree-sitter core (0.20.10),
-    which is a structurally different Rust type from this workspace's 0.26,
-    even though both are named `tree_sitter::Language`. `cargo build -p
-    graviton-indexer` (lib-only) won't catch this either if the mismatched
-    arm is never reached in that crate's own code — it only surfaces as a
-    `match`-arm type error once `ts_language()` actually tries to return one.
-  - `tree-sitter-latex`: compiles fine, links its grammar fine, but its
-    external scanner (used for verbatim/raw-environment lexing, e.g. inside
-    `\verb`) references `tree_sitter_latex_external_scanner_{create,
-    destroy,scan,serialize,deserialize}` symbols that are undefined at
-    **executable** link time. A plain `cargo build -p graviton-indexer`
-    (building a library, where not every symbol needs resolving yet) won't
-    catch this — it only appears once something links the real `grv`
-    binary or a test binary. This is why the project's practice is to
-    verify every new-language batch with a full `cargo build --workspace`
-    (or `cargo test --workspace`), never a per-crate build alone.
+  "it compiled". "Compiles and matches nothing" isn't even the worst
+  failure mode a wrong field guess can produce — see "The query safety
+  net" below for a *different* mismatch (a field of the wrong *type*) that
+  fails to compile the entire query, silently zeroing out every def kind
+  in it, not just the wrong one.
+- **A `links` conflict, or a subtler type/symbol mismatch, can make a
+  grammar crate unusable however new the code around it is** — see
+  "Previously-blocked grammars" for the specifics and how each was
+  eventually resolved (all five were, in the end — none of the languages
+  named in past versions of this doc as "blocked" still are).
 
-  All four are kept as `Lang` enum variants with working `from_path`/`name()`
-  (so files are still recognized, tagged, and fully searchable) but no
-  `ts_language()` arm — they fall to tagged tier, same category as Kotlin,
-  rather than being silently dropped or crashing the build.
+### Previously-blocked grammars — Kotlin, Svelte, Vue, WGSL, LaTeX
+
+All five used to be flatly unlinkable. All five now have a real, linked,
+tested grammar, via actively-maintained forks rather than the original
+crates.io releases — the *reasons* they were blocked are still worth
+recording, because the failure modes are exactly what to expect from any
+future language whose ecosystem hasn't caught up to a newer tree-sitter
+core:
+
+- **The real fix, once found, generalizes**: modern tree-sitter grammar
+  crates (roughly 2023+) don't depend on the full `tree-sitter` crate at
+  runtime at all — they depend on a tiny, ABI-stable `tree-sitter-language`
+  shim crate (currently "0.1", rarely needing to bump) for the `LanguageFn`
+  type their `LANGUAGE` const is built from, and only pull in the real
+  `tree-sitter` crate as a *dev-dependency* for their own internal tests.
+  That shim is what lets every one of this project's 60+ grammar crates —
+  pinning wildly different tree-sitter versions in their own `Cargo.toml`
+  metadata — link together against this workspace's actual tree-sitter
+  0.26 with zero conflicts: none of them actually depend on it as a real
+  dependency. A grammar crate that still depends on the *full* `tree-sitter`
+  crate directly is a pre-shim, older-generation crate, and that's the
+  actual, generalizable tell for "this one might not link":
+  - `tree-sitter-kotlin` (0.3.8, crates.io's only release) pins tree-sitter
+    0.21/0.22 as a real dependency — Cargo's `links = "tree-sitter"`
+    uniqueness rule refuses two versions of that native library in one
+    binary, so it couldn't coexist with anything else here at all.
+  - `tree-sitter-svelte`/`-vue`/`-wgsl`'s official crates.io releases pin
+    tree-sitter 0.20.10 the same pre-shim way — but *without* a `links`
+    conflict being raised (Cargo resolves and compiles each in isolation
+    fine). The failure only shows up when their `language()` fn's return
+    value is used somewhere expecting `tree_sitter::Language`: their
+    bindings return that type from that *old* core, a structurally
+    different Rust type from this workspace's 0.26 despite an identical
+    name. `cargo build -p graviton-indexer` (lib-only) won't catch this if
+    the mismatched arm is never reached in that crate's own code — it only
+    surfaces as a `match`-arm type error once `ts_language()` actually
+    tries to return one.
+  - `tree-sitter-latex`'s official crate compiles and links its *grammar*
+    fine, but is missing `scanner.c` from its packaged file list entirely
+    — a real packaging bug, not a version issue — so its external scanner
+    (used for verbatim/raw-environment lexing) references
+    `tree_sitter_latex_external_scanner_{create,destroy,scan,serialize,
+    deserialize}` symbols with no definition anywhere, undefined at
+    **executable** link time only. A plain `cargo build -p graviton-indexer`
+    (a library build, where not every symbol needs resolving yet) won't
+    catch this — it only appears once something links the real `grv`
+    binary or a test binary, which is why every new-language batch is
+    verified with a full `cargo build --workspace`, never a per-crate
+    build alone.
+- **The fix**: each of the five now uses a real, actively-maintained fork
+  instead — checked before adding, not just swapped in blindly: real
+  crates.io download/update history, a `tree-sitter-language` dependency
+  (confirming it's the modern, shim-based generation), and for Latex,
+  confirming `scanner.c` actually ships this time.
+  - `tree-sitter-kotlin-ng`, `tree-sitter-svelte-ng`, `tree-sitter-wgsl-bevy`
+    are all published, current releases from the `tree-sitter-grammars`
+    GitHub org — the same community maintenance org Zed/Neovim/Helix lean
+    on for grammars whose original author has moved on.
+  - `codebook-tree-sitter-latex` republishes `latex-lsp/tree-sitter-latex`
+    (the real, actively developed upstream — `latex-lsp` also maintains
+    `texlab`, an established LaTeX language server) under a crates.io name
+    that isn't already squatted by the broken original.
+  - Vue had no equivalent published release anywhere — only an unpublished
+    `update` branch on the `tree-sitter-grammars` fork. Added as a `git`
+    dependency pinned to that branch's exact commit (not a floating
+    branch reference, so this doesn't silently change under us), since
+    crates.io simply has no better option yet.
+  - **Explicitly rejected**: several *other* recently-published
+    `tree-sitter-vue-*` crates on crates.io also "fix" the same symptom.
+    Not used, on purpose — a cluster of near-identical, recently-published
+    crates from unaffiliated, unfamiliar authors clustered around one
+    popular missing package name (one had 100k+ downloads within months of
+    a 0.1.0 release) is a real dependency-confusion/typosquatting pattern
+    worth being paranoid about, not just an abundance of choice. This
+    matters more, not less, for a tool whose own purpose includes security
+    tooling.
+- Kotlin/WGSL/Latex all gained a real, verified `def_query_src` once
+  linked (Kotlin/WGSL both expose clean `name:` fields; Latex's
+  `\section{...}`/`\label{...}` are the structural "definitions" its
+  grammar actually has). Svelte/Vue did not — see the tier breakdown above
+  for why that's a real, different limitation, not an oversight.
 
 ### Text-predicate-based queries (Elixir, Racket, Scheme)
 
@@ -432,6 +528,66 @@ proven correct once a test exercises an input that would produce the
 `elixir_call_excludes_definition_keywords`'s check against a real
 `defmodule`/`def` sample are exactly that kind of test, not just assertions
 that the real names are found.
+
+### The query safety net (`lang::query_predicate_safety_net`)
+
+Hand-crafting one adversarial sample per predicate-bearing query (the
+previous section) proves *that specific* query correct — it doesn't
+prevent the *next* predicate, in the next language added a year from now,
+from repeating the exact same mis-nesting mistake. Rather than trust "the
+next person will remember to write an adversarial test", this checks a
+structural invariant that holds for every query in this file regardless of
+what it matches: every intended top-level pattern ends with exactly one
+`@def` (or `@call`) capture, so a correctly-compiled query's
+`Query::pattern_count()` must equal how many times that capture name
+appears in the source text. A mis-nested predicate makes `pattern_count()`
+grow past that number — silently, for any language, present or future —
+and this test catches it immediately:
+
+```rust
+for &lang in ALL_LANGS {
+    if let Some(src) = lang.def_query_src() {
+        let query = Query::new(&lang.ts_language().unwrap(), src).unwrap();
+        let expected = count_capture_token(src, "@def"); // exact-token count, not a substring match
+        assert_eq!(query.pattern_count(), expected, "...");
+    }
+}
+```
+
+(`count_capture_token`, not a plain `src.matches("@call").count()`,
+because every call query also has `@callee` — a plain substring search
+would double-count it, since `"@call"` is itself a substring of
+`"@callee"`. A real bug this test's own *first* draft hit before catching
+anything real, worth remembering: a checker's checker still needs to be
+correct.)
+
+**Immediately found a second, unrelated, real bug on its first real run**:
+TypeScript/TSX's `def_query_src` failed to *compile* outright —
+`(class_declaration name: (identifier) @name)` — because in this
+grammar, `class_declaration`'s `name:` field is a `type_identifier`, not a
+plain `identifier` (verified against the real `node-types.json`). Tree-sitter
+statically type-checks a query's field/type pairs against the grammar at
+`Query::new` time and rejects a mismatch as an "impossible pattern" — for
+the *entire multi-pattern query string*, not just the one bad pattern. That
+means every TypeScript/TSX symbol — functions and interfaces included, not
+just classes — had been silently extracting nothing, for as long as this
+bug existed, which could be as far back as this project's very first
+version: TypeScript and TSX, unlike every language added since, had never
+had a dedicated real-sample test (`lang::original_six_queries` closes that
+gap now, for all six of the original languages). Fixed by using the
+correct field type; a permanent test (`typescript_class_is_not_silently_dropped`)
+now asserts a real sample's function *and* interface *and* class all come
+back together, specifically because "the whole query silently produces
+nothing" is a failure mode where testing only one def kind wouldn't have
+caught the others going missing too.
+
+`ALL_LANGS` (`crates/indexer/src/lang.rs`) is what lets both safety-net
+tests iterate "every language" without a separate enumeration to keep in
+sync by hand: a hand-written `&[Lang]` const, but tied to the actual enum
+by `_all_langs_exhaustive_match_guard`, a `match` with every arm spelled
+out and no wildcard — add a `Lang` variant without adding an arm there and
+the crate fails to *compile*, not just silently skips the new language in
+these tests.
 
 ## Tool execution (`grv tool`)
 
@@ -1326,33 +1482,41 @@ connection) still passes under the new mechanism too.
   so an unauthenticated TCP client can't stop the daemon either. A wrong
   or missing token also costs the caller a flat 250ms before the error
   comes back, cheap insurance against a scripted guesser hammering the
-  port. None of this is enough to expose the daemon past a
-  `127.0.0.1`/trusted-LAN boundary on its own — the token still travels in
-  cleartext over the TCP connection itself (no TLS), so a passive listener
-  on that network segment can still read it off the wire; the hardening
-  here closes the "guessable/timeable token" gap, not the "needs
-  encryption in transit to be internet-facing" one. Unix socket
-  connections never carry or check a token (filesystem permissions on the
-  socket file are that boundary instead, same trust model `ollama serve`'s
-  own socket uses).
+  port.
+- **`--tcp` transport encryption** (`crates/cli/src/tls.rs`): the token
+  above used to travel in cleartext — encrypted now, every `--tcp`
+  connection required to be TLS 1.3, via `rustls`/`tokio-rustls` (both
+  already in the dependency tree through `reqwest`, so this added no new
+  crypto backend to the build, just a server-side use of one already
+  there). `ephemeral_server_tls()` generates a fresh self-signed
+  certificate (via `rcgen`) on every `grv serve --tcp` start and prints
+  its SHA-256 fingerprint alongside the token — since a private-IP
+  certificate has no CA to validate against, this is trust-on-first-use,
+  the same model an SSH host key uses: the operator hands the fingerprint
+  to whoever connects, out of band, for them to pin. `serve()`'s TCP
+  accept loop wraps each accepted `TcpStream` in `TlsAcceptor::accept`
+  before it ever reaches `handle_conn` — a failed handshake (including a
+  plain garbage/plaintext connection attempt) never reaches the JSON-RPC
+  layer at all, logged and dropped. Verified live, not just unit-tested:
+  a real Python TLS client connecting to a running daemon negotiated
+  TLS 1.3, and the fingerprint read from the actual handshake matched
+  what the daemon printed at startup exactly; a plaintext connection
+  attempt to the same port got a TLS alert (`InvalidContentType`) instead
+  of ever reaching request handling. Unix socket connections still never
+  need a token or TLS (filesystem permissions on the socket file are that
+  boundary instead, same trust model `ollama serve`'s own socket uses) —
+  this is additive to `--tcp` specifically, not a new requirement
+  elsewhere.
 
 ## What's explicitly *not* built yet (see README roadmap)
 
 - Call-graph type/scope resolution — still deliberately name-based, not
-  type-resolved (see "Call graph" above for why that's the right tradeoff
-  at this tool's scale); `grv callers run` matches every call site
-  literally named `run(...)` regardless of which `run` it actually is.
-  Coverage across languages is otherwise done (48 of 50 parsed languages).
-- A real parse tree for Svelte, Vue, WGSL, and LaTeX — each hits a genuine
-  external blocker (old-tree-sitter-core type mismatch for the first
-  three, a broken external-scanner link for the fourth), not an oversight;
-  see "Language coverage" above for the specifics.
-- `grv serve --tcp`'s token auth doesn't include transport encryption —
-  the token itself is now a real 256-bit CSPRNG value checked in constant
-  time (see "`--tcp` token auth" above), but it still travels in cleartext
-  over the TCP connection, so this remains a `127.0.0.1`/trusted-LAN
-  mechanism, not something to expose past that boundary as-is.
-- Verilog's call query only covers builtin `system_tf_call`s
-  (`$display`/...), not plain user-defined task/function calls as bare
-  procedural statements — a real parse-tree gap in this grammar version
-  from a hand-written sample, not a guess; see "Call graph" above.
+  type-resolved (see "Call graph" above for `ResolutionHint`, the honest
+  middle ground this tool does have); a real per-language scope/import
+  resolver is on par with what a language server spends its whole
+  existence on, not a query tweak.
+- Svelte/Vue symbol extraction — both are now genuinely parsed (see
+  "Previously-blocked grammars" above), but their own grammars expose a
+  `<script>` block as one opaque text node; recovering real definitions
+  from it needs a second, injection-based parse this project's
+  one-query-per-language design doesn't do.
