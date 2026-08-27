@@ -111,6 +111,73 @@ Deliberately, **full-text search never depends on this working.**
 regardless of language or parse success. So a query grammar mismatch
 degrades `grv symbol` precision, never `grv search`/`grv ask` recall.
 
+### Call graph (`grv callers`/`grv callees`, `crates/cli/src/callgraph.rs`)
+
+A second tree-sitter query per language, same graceful-degradation contract
+as the definition query above (`Lang::call_query_src`/`compile_call_query`,
+`indexer::extract_calls`, `CallSite { line, callee_name }`) — currently
+written and verified for Rust/Python/JavaScript/TypeScript/TSX/Go; a
+language with no call query just yields no call edges, never a hard
+failure. Every match must expose a `@call` capture (the whole call
+expression, for its line) and a `@callee` capture (the called name's
+text) — e.g. Rust's query also matches `scoped_identifier` calls
+(`Type::method()`) and macro invocations, not just bare identifiers.
+
+Deliberately name-based, not type-resolved: a new `calls` table
+(`file_id`, `caller_symbol_id` nullable, `callee_name`, `line`) stores the
+callee as plain text, so `grv callers run` matches every call site
+anywhere literally named `run(...)`, regardless of which `run` it actually
+is at that scope. `caller_symbol_id` (which symbol's body the call site
+falls inside, or `NULL` for module-level code) is resolved at index time by
+finding the *smallest* still-open symbol span containing the call's line —
+capturing already-inserted `(id, start_line, end_line)` triples for the
+file being indexed lets `index_repo` do this with one linear scan per file,
+no extra query. Full type/scope resolution would need real semantic
+analysis per language (a much larger undertaking) for a precision gain
+that matters more to an automated refactoring tool than to a developer
+reading `grv callers`' output — the same tradeoff `grv symbol`'s
+`LIKE`-based name matching already makes.
+
+`calls` rows are cleaned up the same way `symbols`/`embeddings` rows are:
+`ON DELETE CASCADE` from `files`, so a file re-index (which deletes and
+re-inserts that file's `files` row) or `clear_index` never leaves stale
+call edges pointing at chunks/symbols that no longer exist.
+
+### Watch mode (`grv index --watch`, `crates/cli/src/watch.rs`)
+
+Real filesystem events via the `notify` crate's recommended backend
+(inotify on Linux, kqueue on BSD/macOS, ReadDirectoryChangesW on Windows) —
+not polling. `notify` is the one new runtime dependency added for this:
+reimplementing cross-platform FS event watching by hand would mean three
+different syscall interfaces to get right, not a reasonable "just hand-roll
+it" case the way e.g. `content_hash`'s `DefaultHasher` use was.
+
+Events are debounced (600ms): a single save fires several raw events
+(write, rename, metadata-change) in quick succession, and a `git checkout`/
+branch switch touches many files at once — `watch::watch` drains whatever
+else arrives within the debounce window after the first relevant event, so
+either becomes one `index_repo` call, not one per raw event. `index_repo`
+is already incremental (unchanged-file hash skip), so re-running it on the
+whole tree after a burst is correct and cheap, not a full rebuild.
+
+Events under a skipped directory (`indexer::SKIP_DIRS`, now `pub` so
+`watch.rs` can reuse the exact list `index_repo`'s walker filters on — a
+second hand-copied list would drift) or the configured `index_dir` are
+filtered out before triggering anything; without this, the index.db's own
+WAL writes during re-indexing would trigger re-indexing itself in a loop.
+
+**A real, general bug fix that fell out of building this**: `index_repo`
+never previously removed rows for files deleted since the last index —
+`grv search`/`grv symbol`/`grv callers` could keep surfacing a file that no
+longer exists on disk, forever, until a full `--force` re-index. This
+mattered more once unattended watch-mode re-indexing was going to run for
+arbitrary lengths of time, so it's fixed at the source: `index_repo` now
+tracks every path actually seen on disk during its walk (`seen_paths`),
+and after the walk, deletes `files`/`content_fts`/`embeddings` rows (cascading to `symbols`/`calls`) for any
+previously-indexed path *not* in that set. Reported as `IndexStats::files_removed`,
+verified with a real `rm` under a live `grv index --watch` process (not
+just at compile time) during development.
+
 ### Context assembly (`crates/cli/src/context.rs`)
 
 For `ask`/`investigate`, three retrieval passes feed one budgeted assembly:
@@ -250,11 +317,7 @@ Two important scoping decisions:
   findings — if a long crew run would otherwise blow past `num_ctx`), not
   just the same retrieved code again. REAPER reads what ARCHITECT actually
   said about the code before finding what's exploitable in it; SINGULARITY
-  reads all three real outputs before writing a decision brief. This is the
-  one part of the system where output literally becomes another call's
-  input — everywhere else in GRAVITON, retrieval and generation are one
-  fixed pass (see the next section for why, and the roadmap for what a
-  fuller agentic loop would add).
+  reads all three real outputs before writing a decision brief.
 
 `grv investigate` is orthogonal to the agent roster: it's a structured
 *output format* (`agents::INVESTIGATE_FORMAT`, appended to whichever
@@ -262,13 +325,40 @@ agent's base prompt) rather than its own persona, so
 `grv investigate --agent sentinel "..."` is meaningful (structured
 defensive audit) distinct from plain `grv ask --agent sentinel` (free-form).
 
-Context retrieval (`build_context`) is shared and computed once per
-`ask`/`investigate`/`crew` invocation — every agent in a `crew` run
-currently sees identical retrieved chunks, not a query tailored to its own
-specialty. That's a deliberate v1 simplification (documented in the README
-roadmap), not an oversight: giving each agent its own retrieval query is
-straightforward to add once it's clear the shared-context version is
-actually leaving relevant code unfound in practice.
+### Per-agent retrieval: a bounded read-only tool loop, not one fixed pass
+
+`build_context` (initial retrieval — explicit files, symbol matches, FTS
+chunks, semantic hits if configured) is still computed once per `ask`/
+`crew`/`swarm`/`review` invocation and handed to every agent as a starting
+point, but it's no longer the *only* evidence an agent gets to work with.
+`agentic::run_read_only_loop`/`run_read_only_loop_with` wrap every model
+call in `ask`/`crew`/`review`/`swarm` (`run_pipeline` for the first two, a
+per-agent spawn for the third) in the same bounded tool loop mission's
+leaves and `grv run` already used: `read_only_tool_defs()`'s tools
+(`search_code`/`semantic_search`/`read_file`/`list_dir`/`web_search`/
+`web_fetch`/`git_status`/`git_diff`/`git_log`), dispatched via the existing
+`dispatch_read_only`, capped at `MAX_READONLY_TOOL_STEPS` (6) with a final
+no-tools call to force a text answer if that budget runs out without one.
+
+This is what makes "per-agent retrieval" real without needing a
+per-specialty retrieval *query*: REAPER doesn't need a differently-shaped
+initial FTS query than ARCHITECT's — it can just call `search_code`/
+`semantic_search` itself, with whatever question its own reasoning
+actually needs answered, mid-turn. `run_read_only_loop` is a thin
+convenience wrapper (stdout streaming + `println!` tool-call announcements)
+around the callback-based `run_read_only_loop_with`, which takes plain
+`on_token`/`on_tool_call` closures instead — the same split `grv serve`'s
+streaming `ask`/`review` reuse (see below), so there's one tool-loop
+implementation, not a terminal one and a socket one drifting apart.
+
+**Why `swarm` doesn't stream tokens live even though it now runs this
+loop too**: several agents run concurrently there (`tokio::JoinSet`);
+character-level interleaving from more than one at once would be
+unreadable, so `swarm` passes `stream_final_answer: false` and prints each
+agent's full answer as one block once it finishes. Tool-call announcement
+lines can still interleave under concurrency — the same tradeoff `grv
+mission`'s concurrent leaves already accept, kept consistent rather than
+solved differently in two places.
 
 ## Model tiers, `grv swarm`, and `grv mission`: real multi-model, resource-aware
 
@@ -454,7 +544,8 @@ or run commands, not the user typing them — a materially different trust
 situation from `grv tool run`, where the user names the exact tool and
 args. Two independent mechanisms, chosen deliberately not to overlap:
 
-- **Confirmation** (`agentic::confirm`) gates `write_file`, `edit_file`,
+- **Confirmation** (`state.io.confirm`, via the `RunIo` trait — see "A
+  pluggable confirm/output sink" below) gates `write_file`, `edit_file`,
   `delete_file`, `run_shell`, and `recon_tool` — the user sees the exact
   diff (`similar`-generated, via `diff_preview`) or command before it runs,
   and can decline. `--yolo` skips this for a fully autonomous run.
@@ -537,6 +628,56 @@ the conversation itself:
 execution doesn't map onto one linear transcript the way `grv run`'s
 single-agent loop does, so resuming a partially-completed mission is left
 as future work rather than half-implemented.
+
+### A pluggable confirm/output sink (`crates/cli/src/run_io.rs`) — one loop, two front ends
+
+`agentic::run` originally talked to a terminal directly: `println!` for
+every tool-call announcement/plan update/checkpoint summary, a blocking
+stdin read for confirmation. Once `grv serve`'s `run_start` needed to drive
+the *same* loop from a socket instead (see below), that coupling had to
+come out — not by writing a second loop, which would drift from the first
+one's behavior the moment either changed, but by making the loop talk to a
+small trait instead:
+
+```rust
+pub trait RunIo: Send + Sync {
+    fn emit(&self, line: String);                    // one line of output
+    fn on_token(&self, tok: &str);                    // one streamed answer token
+    fn note_checkpoint_id(&self, _id: &str) {}         // default no-op
+    fn confirm(&self, auto_approve: bool, action: String)
+        -> Pin<Box<dyn Future<Output = Decision> + Send + '_>>;
+}
+```
+
+`confirm` is boxed by hand (`Pin<Box<dyn Future<...>>>`) rather than a plain
+`async fn` in the trait: `dyn RunIo` needs object safety (`agentic::run`
+doesn't know at compile time which implementation it has), and native
+async-fn-in-traits doesn't support dynamic dispatch without either this or
+the `async-trait` crate — hand-rolling one boxed method was less than
+pulling in a dependency for it.
+
+Two implementations:
+- **`TerminalIo`** (`run_io.rs`) — the original behavior, byte for byte:
+  `emit`/`on_token` print to stdout, `confirm` does the blocking stdin
+  read, moved onto `tokio::task::spawn_blocking` so it's not literally
+  blocking the async runtime (it always effectively blocked all other work
+  in `grv run`'s single-agent CLI process anyway — this just stops relying
+  on that as an accident of scheduling).
+- **`ChannelIo`** (`daemon.rs`) — output/tokens become `RunEvent`s on a
+  `tokio::sync::broadcast` channel any number of `run_attach`ed connections
+  can subscribe to; `confirm` blocks on a per-session `mpsc` channel that
+  `run_confirm` (from any connection, not necessarily the one that called
+  `run_start`) feeds a `Decision` into.
+
+This is also why `agentic::run`/`dispatch`/`dispatch_inner` no longer take
+`&rusqlite::Connection` as a parameter at all (they used to) — `grv serve`
+spawns `run_start` sessions via `tokio::spawn`, which requires the future
+to be `Send`, and (per the `Send`-poisoning behavior documented under
+"Semantic search" below) an async fn with `&Connection` anywhere in its
+signature can't satisfy that regardless of how carefully it's used
+internally. The two dispatch arms that need a connection (`recon_tool`,
+`search_code`/`semantic_search`) each open their own short-lived one now,
+the same pattern `dispatch_read_only` already used for `mission`'s leaves.
 
 ### Custom tools (`crates/cli/src/custom_tools.rs`) — extensibility without recompiling
 
@@ -765,12 +906,80 @@ error taxonomy until a real client shows up wanting to branch on one.
 target), `agents` (roster: key/display/tagline/tier), `search` (FTS,
 `{query, limit}`), `symbol` (`{name, limit}`), `semantic_search` (`{query,
 limit}`, errors clearly if no embed model/embeddings), `ask` (`{question,
-agent?, files?}`, one non-streaming model call through `build_context_sync`
-+ `finish_context` — same retrieval every CLI command uses), `review`
-(`{range?, staged?, agent?}`, single-agent over a real `git diff`, not the
-full `grv review` crew pipeline — kept fast for an editor round-trip),
+agent?, files?, stream?}`, through the same `prepare_ask` +
+`run_read_only_loop_with` every other agentic-retrieval command uses —
+`search_code`/`semantic_search`/etc. mid-answer included), `review`
+(`{range?, staged?, agent?, stream?}`, single-agent over a real `git diff`,
+not the full `grv review` crew pipeline — kept fast for an editor round
+trip), `run_start`/`run_attach`/`run_confirm`/`run_status` (a full
+checkpointed `grv run` agentic session over the socket — see below),
 `shutdown` (acks then exits; also removes its own socket file so a clean
 shutdown never needs the stale-socket recovery path below).
+
+### Streaming (`ask`/`review` with `"stream": true`)
+
+Ordinarily `ask`/`review` return one `{"id":...,"result":{...}}` line once
+the whole answer is ready. With `"stream": true` in `params`, the same
+request instead gets zero or more notifications first:
+
+```
+--> {"jsonrpc":"2.0","id":5,"method":"ask","params":{"question":"...","stream":true}}
+<-- {"jsonrpc":"2.0","method":"tool_call","params":{"id":5,"name":"semantic_search","arguments":{...}}}
+<-- {"jsonrpc":"2.0","method":"token","params":{"id":5,"text":"Password"}}
+<-- {"jsonrpc":"2.0","method":"token","params":{"id":5,"text":" verification"}}
+<-- {"jsonrpc":"2.0","id":5,"result":{"agent":"architect","model":"qwen3:8b","answer":"Password verification ..."}}
+```
+
+...ending in the exact same final `result` line the non-streaming path
+sends, so a client that ignores notification-shaped lines (no `id`,
+instead a `method` naming the notification) still gets the complete
+answer either way. Implemented in `handle_streaming`: an `mpsc::
+unbounded_channel` carries `Token`/`ToolCall` events out of the plain sync
+closures `run_read_only_loop_with` calls (`on_token`/`on_tool_call` can't
+themselves be `async`, so they can't write to the socket directly), and
+`tokio::select!` interleaves draining that channel with polling the loop's
+future to completion.
+
+### Driving a full `grv run` session over the socket
+
+`run_start {task, agent?, yolo?, browser?, files?}` returns
+`{"session_id": "..."}` immediately — the actual `agentic::run` loop runs
+as an independent `tokio::spawn`ed task inside the daemon, *not* tied to
+the connection that started it, using a `ChannelIo` (see "A pluggable
+confirm/output sink" above) instead of a terminal:
+
+- **`run_attach {session_id}`** (on any connection, including the one that
+  called `run_start`) acks once, then streams that session's events as
+  `run_event` notifications (`{"session_id","kind": "output"|"token"|
+  "confirm_request"|"done", ...}`) until `done` or the connection drops.
+  Multiple connections can attach to the same session independently (each
+  gets its own `broadcast::Receiver`).
+- **`run_confirm {session_id, decision}`** (`"yes"`/`"no"`/anything else =
+  a `Decision::Redirect` — same three-way semantics the terminal's y/n/
+  free-text prompt has) feeds a decision into the session's confirm
+  channel from *any* connection, unblocking `ChannelIo::confirm`.
+- **`run_status {session_id}`** returns a point-in-time snapshot (running?,
+  a pending confirm's text if any, the checkpoint id once known, how it
+  finished) without needing to attach — for polling, or for a client that
+  attached late and wants to know what it missed.
+
+**The race this has to handle**: `run_start`'s spawned task can reach (and
+block on) a confirmation *before* a client manages to call `run_attach` —
+there's no ordering guarantee between "task starts running" and "client's
+next request arrives". A `ConfirmRequest` broadcast sent before a receiver
+subscribes is simply never delivered to it (`tokio::sync::broadcast`
+doesn't replay to new subscribers), which would otherwise leave an attach
+waiting forever for an event that already happened. Fixed by having
+`handle_run_attach` check the session's status snapshot *after*
+subscribing but *before* entering the receive loop: if a confirmation was
+already pending, or the run had already finished, it synthesizes and sends
+that one event from the snapshot before continuing — subscribe-then-check
+ordering means nothing sent after the subscribe can be missed by this,
+and the synthesized catch-up covers everything sent before it. Verified
+against the actual race, not just reasoned about: a mock run reaching its
+confirm point faster than a second Python process could start and attach
+still surfaced `confirm_request` correctly, and `run_confirm` from a third,
+independent connection unblocked it.
 
 ### Framing/lifecycle details
 
@@ -800,18 +1009,32 @@ shutdown never needs the stale-socket recovery path below).
   long up front, with a message suggesting a short path (e.g. `/tmp/
   grv.sock`), instead of letting `bind` fail with the OS's bare "path must
   be shorter than SUN_LEN".
-- **No auth on `--tcp`**: fine bound to `127.0.0.1` for local editor use;
-  not something to expose beyond localhost without adding one.
+- **`--tcp` token auth**: `serve()` always requires one once `--tcp` is
+  given — `generate_token()` (a plain `DefaultHasher` over wall clock +
+  pid + a per-process counter, not a `rand` dependency; this is meant to
+  stop an opportunistic hit on a `127.0.0.1`/trusted-LAN port from doing
+  anything, not to be a hardened secret) unless `--tcp-token` sets one
+  explicitly, printed once at startup. `handle_conn` checks
+  `params.token` against it for every request on a TCP-accepted
+  connection (`is_tcp`, threaded through from which listener accepted it)
+  before dispatching — including `shutdown`, so an unauthenticated TCP
+  client can't stop the daemon either. Unix socket connections never carry
+  or check a token (filesystem permissions on the socket file are that
+  boundary instead, same trust model `ollama serve`'s own socket uses).
 
 ## What's explicitly *not* built yet (see README roadmap)
 
-- Call-graph edges (`callers`/`callees` beyond a name-match placeholder) —
-  needs a second tree-sitter pass resolving call-expression targets against
-  the symbol table, including cross-file resolution. Nontrivial, deferred.
-- `ask`/`investigate`/`crew`/`swarm` still get one fixed retrieval pass up
-  front rather than issuing their own `search_code`/`semantic_search` calls
-  mid-answer — `grv run` and `grv mission`'s leaves already can (see
-  "Tools" above and "Semantic search" above); extending that to the
-  read-only analysis commands is the natural next step.
-- `grv serve`'s `ask`/`review` are one-shot request/response, no streaming
-  and no way to drive a full checkpointed `grv run` session over the socket.
+- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other ten
+  parsed languages have no `call_query_src` yet, and none of it is
+  type/scope-resolved (name-based matching only, by design — see "Call
+  graph" above for why that's the right tradeoff at this tool's scale).
+- An ANN index for `grv embed` if a single repo's chunk count ever grows
+  large enough that the current linear cosine scan actually shows up as
+  slow — not observed at any repo size tested so far.
+- `grv serve --tcp`'s token is a stopgap (see "`--tcp` token auth" above),
+  not hardened auth suitable for anything beyond `127.0.0.1`/a trusted LAN.
+- `run_attach` only streams events from the moment of attaching forward
+  (plus a synthesized catch-up for an already-pending confirm or an
+  already-finished run — see "Driving a full `grv run` session over the
+  socket" above) — not a full replay of every event since `run_start`;
+  `run_status` covers the rest of that gap.

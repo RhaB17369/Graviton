@@ -248,6 +248,20 @@ pub fn open_db(path: &Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
 
+        -- Name-based (not type-resolved) call graph: `callee_name` is
+        -- matched textually, same simplification `symbols.name` LIKE
+        -- lookups already make. `caller_symbol_id` is NULL when a call
+        -- site isn't inside any extracted symbol (e.g. module-level code).
+        CREATE TABLE IF NOT EXISTS calls (
+            id                INTEGER PRIMARY KEY,
+            file_id           INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            caller_symbol_id  INTEGER REFERENCES symbols(id) ON DELETE SET NULL,
+            callee_name       TEXT NOT NULL,
+            line              INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee_name);
+        CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_symbol_id);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
             path UNINDEXED,
             start_line UNINDEXED,
@@ -293,6 +307,7 @@ pub fn clear_index(conn: &Connection) -> Result<()> {
         r#"
         DELETE FROM embeddings WHERE chunk_id IN (SELECT rowid FROM content_fts WHERE kind != 'tool_output');
         DELETE FROM content_fts WHERE kind != 'tool_output';
+        DELETE FROM calls;
         DELETE FROM symbols;
         DELETE FROM files;
         "#,

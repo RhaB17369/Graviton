@@ -13,6 +13,7 @@ use crate::browser::BrowserSession;
 use crate::checkpoint;
 use crate::custom_tools::{self, CustomTool};
 use crate::permissions;
+use crate::run_io::RunIo;
 use crate::semantic;
 use crate::tools as recon_tools;
 use crate::web;
@@ -22,6 +23,7 @@ use graviton_llm::{ChatMessage, OllamaClient, ToolCall, ToolDef};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const MAX_STEPS: usize = 40;
 const MAX_TOOL_OUTPUT: usize = 8_000;
@@ -38,8 +40,10 @@ struct State {
     browser: Option<BrowserSession>,
     custom_tools: Vec<CustomTool>,
     permissions: Vec<permissions::Rule>,
+    index_dir: String,
     ollama_host: String,
     embed_model: Option<String>,
+    io: Arc<dyn RunIo>,
 }
 
 /// The read-only subset of the tool roster — no file writes/shell/recon,
@@ -303,6 +307,86 @@ pub(crate) async fn dispatch_read_only(cfg: &Config, root: &Path, name: &str, ar
     }
 }
 
+/// Bounded read-only tool loop shared by `ask`/`investigate`/`crew`/
+/// `review`/`swarm`: instead of one fixed retrieval pass handed to a
+/// single completion call (the old `run_agent`), the model can call
+/// `read_only_tool_defs()`'s tools along the way — `search_code`/
+/// `semantic_search` to pull in more than the initial retrieval surfaced,
+/// `read_file`/`list_dir` to look at a specific file it was only shown a
+/// chunk of, `web_search`/`web_fetch`/`git_*` same as everywhere else.
+/// This is what makes "per-agent retrieval" real: each crew stage (or
+/// swarm agent) can now go find its *own* evidence instead of every stage
+/// reasoning over one shared context block.
+///
+/// Not the same loop as `grv run`'s `run()` below — no write/edit/delete/
+/// shell, no checkpoints, no confirm gate; this can never act, only look
+/// harder before answering.
+pub const MAX_READONLY_TOOL_STEPS: usize = 6;
+
+pub async fn run_read_only_loop(
+    client: &OllamaClient,
+    cfg: &Config,
+    root: &Path,
+    model: &str,
+    system: &str,
+    user_msg: &str,
+    stream_final_answer: bool,
+) -> Result<String> {
+    let stdout = std::io::stdout();
+    let on_token = |tok: &str| {
+        if stream_final_answer {
+            let mut lock = stdout.lock();
+            let _ = lock.write_all(tok.as_bytes());
+            let _ = lock.flush();
+        }
+    };
+    let on_tool_call = |name: &str, args: &Value| {
+        println!("\x1b[2m  → {name}({args})\x1b[0m");
+    };
+    let out = run_read_only_loop_with(client, cfg, root, model, system, user_msg, on_token, on_tool_call).await?;
+    if stream_final_answer {
+        println!();
+    }
+    Ok(out)
+}
+
+/// The generic core `run_read_only_loop` wraps for the CLI's stdout/
+/// println behavior — pulled out so `grv serve` (`daemon.rs`) can reuse the
+/// exact same tool loop with its own callbacks (NDJSON notifications over a
+/// socket instead of terminal output), rather than a second hand-copied
+/// implementation drifting from this one over time.
+pub async fn run_read_only_loop_with(
+    client: &OllamaClient,
+    cfg: &Config,
+    root: &Path,
+    model: &str,
+    system: &str,
+    user_msg: &str,
+    mut on_token: impl FnMut(&str),
+    mut on_tool_call: impl FnMut(&str, &Value),
+) -> Result<String> {
+    let tools = read_only_tool_defs();
+    let mut messages = vec![ChatMessage::system(system), ChatMessage::user(user_msg)];
+
+    for _ in 0..MAX_READONLY_TOOL_STEPS {
+        let result = client.chat_stream(model, &messages, cfg.num_ctx, &tools, &mut on_token).await?;
+        if result.tool_calls.is_empty() {
+            return Ok(result.content);
+        }
+        messages.push(ChatMessage::assistant_tool_calls(result.tool_calls.clone()));
+        for tc in &result.tool_calls {
+            on_tool_call(&tc.function.name, &tc.function.arguments);
+            let out = dispatch_read_only(cfg, root, &tc.function.name, &tc.function.arguments).await;
+            messages.push(ChatMessage::tool_result(&tc.function.name, out));
+        }
+    }
+    // Used up the tool-call budget without a final answer -- ask once
+    // more with no tools offered, forcing a text response instead of
+    // silently returning nothing.
+    let result = client.chat_stream(model, &messages, cfg.num_ctx, &[], &mut on_token).await?;
+    Ok(result.content)
+}
+
 fn tool_defs(enable_browser: bool, custom: &[CustomTool]) -> Vec<ToolDef> {
     let mut tools = read_only_tool_defs();
     tools.extend(vec![
@@ -455,27 +539,10 @@ fn tool_defs(enable_browser: bool, custom: &[CustomTool]) -> Vec<ToolDef> {
 /// instead of only being expressible as a blind yes/no. This only fires at
 /// existing confirmation pauses — a `--yolo` run has none, so it can only
 /// be interrupted with Ctrl-C, which this doesn't change.
-enum Decision {
+pub(crate) enum Decision {
     Allow,
     Deny,
     Redirect(String),
-}
-
-fn confirm(auto_approve: bool, action: &str) -> Decision {
-    if auto_approve {
-        return Decision::Allow;
-    }
-    print!("\x1b[1;33m{action}\nallow? [y/N, or type a note to redirect the agent instead] \x1b[0m");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return Decision::Deny;
-    }
-    match line.trim() {
-        "y" | "Y" | "yes" | "Yes" => Decision::Allow,
-        "" | "n" | "N" | "no" | "No" => Decision::Deny,
-        other => Decision::Redirect(other.to_string()),
-    }
 }
 
 /// Turn a `Decision` into the usual bail-if-not-allowed check, folding a
@@ -491,13 +558,18 @@ fn require_allowed(decision: Decision, declined_msg: &str) -> Result<()> {
 /// The single gate every side-effecting tool call goes through:
 /// `.graviton/permissions.toml` rules are checked first (a `deny` rule
 /// blocks even under `--yolo`, an `allow` rule skips the prompt even
-/// without it); anything the rules don't cover falls through to the
-/// existing confirm/`--yolo` behavior unchanged.
-fn gate(state: &State, tool: &str, primary_arg: &str, action_desc: &str, declined_msg: &str) -> Result<()> {
+/// without it); anything the rules don't cover falls through to
+/// `state.io.confirm` (a terminal y/n/redirect prompt for `grv run`, or a
+/// round trip over the socket for `grv serve`'s `run_start` — this gate
+/// doesn't know or care which).
+async fn gate(state: &State, tool: &str, primary_arg: &str, action_desc: &str, declined_msg: &str) -> Result<()> {
     match permissions::check(&state.permissions, tool, primary_arg) {
         permissions::Verdict::Allow => Ok(()),
         permissions::Verdict::Deny(reason) => anyhow::bail!("{declined_msg} — {reason}"),
-        permissions::Verdict::Fallback => require_allowed(confirm(state.auto_approve, action_desc), declined_msg),
+        permissions::Verdict::Fallback => {
+            let decision = state.io.confirm(state.auto_approve, action_desc.to_string()).await;
+            require_allowed(decision, declined_msg)
+        }
     }
 }
 
@@ -550,14 +622,22 @@ fn diff_preview(old: &str, new: &str) -> String {
     out
 }
 
-async fn dispatch(state: &mut State, conn: &rusqlite::Connection, name: &str, args: &Value) -> String {
-    match dispatch_inner(state, conn, name, args).await {
+// Neither `dispatch` nor `dispatch_inner` takes `&rusqlite::Connection` as
+// a parameter -- unlike `dispatch_read_only`'s callers, `grv run`'s own
+// loop must itself be spawnable (`grv serve`'s `run_start`), and
+// `Connection` isn't `Sync`, so `&Connection` anywhere in an async fn's
+// signature poisons its future's `Send`-ness regardless of how it's
+// actually used inside (see `SearchOutcome`'s doc comment). The two arms
+// that need a connection (`recon_tool`, `search_code`/`semantic_search`)
+// each open their own short-lived one instead, same as `dispatch_read_only`.
+async fn dispatch(state: &mut State, name: &str, args: &Value) -> String {
+    match dispatch_inner(state, name, args).await {
         Ok(s) => s,
         Err(e) => format!("error: {e:#}"),
     }
 }
 
-async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &str, args: &Value) -> Result<String> {
+async fn dispatch_inner(state: &mut State, name: &str, args: &Value) -> Result<String> {
     let arg_str = |key: &str| -> Result<String> {
         args.get(key)
             .and_then(|v| v.as_str())
@@ -568,7 +648,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
     match name {
         "update_plan" => {
             let steps = args.get("steps").cloned().unwrap_or(Value::Array(vec![]));
-            println!("{}", format_plan(&steps));
+            state.io.emit(format_plan(&steps));
             state.checkpoint.save_plan(&json!({ "steps": steps })).ok();
             Ok(format!("plan updated ({} step(s))", steps.as_array().map(|a| a.len()).unwrap_or(0)))
         }
@@ -590,7 +670,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             let full = resolve_rel(&state.root, &rel)?;
             let old = std::fs::read_to_string(&full).unwrap_or_default();
             let preview = diff_preview(&old, &content);
-            gate(state, "write_file", &rel, &format!("write_file {rel}\n{preview}"), "user declined this write")?;
+            gate(state, "write_file", &rel, &format!("write_file {rel}\n{preview}"), "user declined this write").await?;
             state.checkpoint.snapshot_before_write(&rel)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).ok();
@@ -613,7 +693,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             }
             let updated = content.replacen(&old_string, &new_string, 1);
             let preview = diff_preview(&content, &updated);
-            gate(state, "edit_file", &rel, &format!("edit_file {rel}\n{preview}"), "user declined this edit")?;
+            gate(state, "edit_file", &rel, &format!("edit_file {rel}\n{preview}"), "user declined this edit").await?;
             state.checkpoint.snapshot_before_write(&rel)?;
             std::fs::write(&full, &updated).with_context(|| format!("writing {rel}"))?;
             Ok(format!("edited {rel}"))
@@ -624,7 +704,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             if !full.exists() {
                 anyhow::bail!("{rel} doesn't exist");
             }
-            gate(state, "delete_file", &rel, &format!("delete_file {rel}"), "user declined this delete")?;
+            gate(state, "delete_file", &rel, &format!("delete_file {rel}"), "user declined this delete").await?;
             state.checkpoint.snapshot_before_delete(&rel)?;
             std::fs::remove_file(&full).with_context(|| format!("deleting {rel}"))?;
             Ok(format!("deleted {rel}"))
@@ -632,7 +712,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
         "run_shell" => {
             let command = arg_str("command")?;
             let why = args.get("why").and_then(|v| v.as_str()).unwrap_or("");
-            gate(state, "run_shell", &command, &format!("run_shell: {command}\n({why})"), "user declined running this command")?;
+            gate(state, "run_shell", &command, &format!("run_shell: {command}\n({why})"), "user declined running this command").await?;
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&command)
@@ -650,7 +730,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
                 _ => detect_test_command(&state.root)
                     .ok_or_else(|| anyhow::anyhow!("couldn't auto-detect a test command for this project — pass `command` explicitly"))?,
             };
-            gate(state, "run_tests", &command, &format!("run_tests: {command}"), "user declined running tests")?;
+            gate(state, "run_tests", &command, &format!("run_tests: {command}"), "user declined running tests").await?;
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&command)
@@ -669,7 +749,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
             let stage_desc = if paths.is_empty() { "all changes".to_string() } else { paths.join(", ") };
-            gate(state, "git_commit", &message, &format!("git_commit: \"{message}\" (staging: {stage_desc})"), "user declined this commit")?;
+            gate(state, "git_commit", &message, &format!("git_commit: \"{message}\" (staging: {stage_desc})"), "user declined this commit").await?;
             let mut add_args = vec!["add".to_string()];
             if paths.is_empty() {
                 add_args.push("-A".to_string());
@@ -696,8 +776,10 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
             let recon_invocation = format!("{tool} {}", args_list.join(" "));
-            gate(state, "recon_tool", &recon_invocation, &format!("recon_tool: {recon_invocation}"), "user declined running this tool")?;
-            recon_tools::run_and_index(conn, &tool, &args_list)?;
+            gate(state, "recon_tool", &recon_invocation, &format!("recon_tool: {recon_invocation}"), "user declined running this tool").await?;
+            let db_path = graviton_core::db_path_for(&state.root, &state.index_dir)?;
+            let conn = graviton_core::open_db(&db_path)?;
+            recon_tools::run_and_index(&conn, &tool, &args_list)?;
             let output: String = conn
                 .query_row("SELECT output FROM tool_runs ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
                 .unwrap_or_default();
@@ -721,7 +803,14 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
             }
         }
         "search_code" | "semantic_search" => {
-            match prepare_search_tool(conn, state.embed_model.as_deref(), name, args) {
+            let db_path = graviton_core::db_path_for(&state.root, &state.index_dir)?;
+            if !db_path.exists() {
+                anyhow::bail!("no index found — run `grv index` first");
+            }
+            let conn = graviton_core::open_db(&db_path)?;
+            let outcome = prepare_search_tool(&conn, state.embed_model.as_deref(), name, args);
+            drop(conn); // done with the connection before the async ranking step below
+            match outcome {
                 Some(outcome) => finish_search_outcome(&state.ollama_host, outcome).await,
                 None => unreachable!(),
             }
@@ -740,7 +829,7 @@ async fn dispatch_inner(state: &mut State, conn: &rusqlite::Connection, name: &s
                 &command,
                 &format!("custom tool '{}': {command}", tool.name),
                 &format!("user declined running custom tool '{}'", tool.name),
-            )?;
+            ).await?;
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&command)
@@ -868,21 +957,21 @@ fn list_dir(path: &Path, recursive: bool) -> Result<String> {
 /// (e.g. it hit `MAX_STEPS` last time) with no new instruction.
 pub async fn run(
     cfg: &Config,
-    conn: &rusqlite::Connection,
     root: &Path,
     agent: &AgentSpec,
     task: &str,
     initial_context: Option<String>,
     loop_cfg: AgentLoopConfig,
     resume_session: Option<String>,
+    io: Arc<dyn RunIo>,
 ) -> Result<()> {
     let custom = custom_tools::load_all(root);
     if !custom.is_empty() {
-        println!("\x1b[2mcustom tools loaded: {}\x1b[0m", custom.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
+        io.emit(format!("\x1b[2mcustom tools loaded: {}\x1b[0m", custom.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")));
     }
     let rules = permissions::load(root);
     if !rules.is_empty() {
-        println!("\x1b[2m{} permission rule(s) loaded from .graviton/permissions.toml\x1b[0m", rules.len());
+        io.emit(format!("\x1b[2m{} permission rule(s) loaded from .graviton/permissions.toml\x1b[0m", rules.len()));
     }
     let tools = tool_defs(loop_cfg.enable_browser, &custom);
 
@@ -898,8 +987,10 @@ pub async fn run(
                     browser: None,
                     custom_tools: custom,
                     permissions: rules,
+                    index_dir: cfg.index_dir.clone(),
                     ollama_host: cfg.ollama_host.clone(),
                     embed_model: cfg.embed_model.clone(),
+                    io: io.clone(),
                 },
                 restored,
                 true,
@@ -913,20 +1004,23 @@ pub async fn run(
                 browser: None,
                 custom_tools: custom,
                 permissions: rules,
+                index_dir: cfg.index_dir.clone(),
                 ollama_host: cfg.ollama_host.clone(),
                 embed_model: cfg.embed_model.clone(),
+                io: io.clone(),
             },
             Vec::new(),
             false,
         ),
     };
 
-    println!("\x1b[2mcheckpoint session: {}\x1b[0m", state.checkpoint.id);
+    io.note_checkpoint_id(&state.checkpoint.id);
+    io.emit(format!("\x1b[2mcheckpoint session: {}\x1b[0m", state.checkpoint.id));
 
     if resumed {
-        println!("\x1b[2mresumed — {} prior message(s) restored\x1b[0m", messages.len());
+        io.emit(format!("\x1b[2mresumed — {} prior message(s) restored\x1b[0m", messages.len()));
         if let Ok(Some(plan)) = checkpoint::load_plan(root, &state.checkpoint.id) {
-            println!("{}", format_plan(plan.get("steps").unwrap_or(&plan)));
+            io.emit(format_plan(plan.get("steps").unwrap_or(&plan)));
         }
     }
 
@@ -965,18 +1059,13 @@ pub async fn run(
     }
 
     let client = OllamaClient::new(&cfg.ollama_host);
-    println!("\x1b[1;35m═══ {} (agentic) ═══\x1b[0m", agent.display);
+    io.emit(format!("\x1b[1;35m═══ {} (agentic) ═══\x1b[0m", agent.display));
 
     for step in 0..MAX_STEPS {
-        let stdout = std::io::stdout();
         let result = client
-            .chat_stream(cfg.model_for_tier(agent.tier), &messages, cfg.num_ctx, &tools, |tok| {
-                let mut lock = stdout.lock();
-                let _ = lock.write_all(tok.as_bytes());
-                let _ = lock.flush();
-            })
+            .chat_stream(cfg.model_for_tier(agent.tier), &messages, cfg.num_ctx, &tools, |tok| io.on_token(tok))
             .await?;
-        println!();
+        io.emit(String::new()); // blank line after the streamed answer, matching the terminal's old unconditional println!()
 
         if result.tool_calls.is_empty() {
             push_and_record(&mut messages, &state, ChatMessage::assistant(result.content));
@@ -987,18 +1076,18 @@ pub async fn run(
         push_and_record(&mut messages, &state, ChatMessage::assistant_tool_calls(clone_tool_calls(&result.tool_calls)));
         for call in &result.tool_calls {
             let name = &call.function.name;
-            println!("\x1b[2m→ {name}({})\x1b[0m", call.function.arguments);
-            let output = dispatch(&mut state, conn, name, &call.function.arguments).await;
-            println!("\x1b[2m← {}\x1b[0m", truncate_display(&output));
+            io.emit(format!("\x1b[2m→ {name}({})\x1b[0m", call.function.arguments));
+            let output = dispatch(&mut state, name, &call.function.arguments).await;
+            io.emit(format!("\x1b[2m← {}\x1b[0m", truncate_display(&output)));
             push_and_record(&mut messages, &state, ChatMessage::tool_result(name.clone(), output));
         }
 
         if step == MAX_STEPS - 1 {
-            println!(
+            io.emit(format!(
                 "\x1b[1;31m[stopped: reached the {MAX_STEPS}-step limit for this run — \
                  `grv run --continue {}` to keep going]\x1b[0m",
                 state.checkpoint.id
-            );
+            ));
         }
     }
     print_checkpoint_summary(&state);
@@ -1015,10 +1104,10 @@ fn push_and_record(messages: &mut Vec<ChatMessage>, state: &State, msg: ChatMess
 fn print_checkpoint_summary(state: &State) {
     let n = state.checkpoint.step_count();
     if n > 0 {
-        println!(
+        state.io.emit(format!(
             "\x1b[2m{n} file change(s) checkpointed under session {} — `grv rollback {}` to undo\x1b[0m",
             state.checkpoint.id, state.checkpoint.id
-        );
+        ));
     }
 }
 

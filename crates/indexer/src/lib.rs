@@ -17,7 +17,7 @@ const CHUNK_OVERLAP: usize = 30;
 
 /// Directories that are always skipped regardless of .gitignore, because
 /// indexing them is either pointless or actively harmful to relevance.
-const SKIP_DIRS: &[&str] = &[
+pub const SKIP_DIRS: &[&str] = &[
     ".git", ".graviton", "target", "node_modules", "dist", "build", "venv",
     ".venv", "__pycache__", ".mypy_cache", ".idea", ".vscode",
 ];
@@ -27,7 +27,9 @@ pub struct IndexStats {
     pub files_scanned: usize,
     pub files_indexed: usize,
     pub files_skipped_unchanged: usize,
+    pub files_removed: usize,
     pub symbols_extracted: usize,
+    pub calls_extracted: usize,
     pub chunks_written: usize,
 }
 
@@ -36,6 +38,12 @@ pub struct IndexStats {
 /// re-running this after small edits is cheap.
 pub fn index_repo(conn: &mut Connection, root: &Path) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
+    // Every path actually seen on disk this pass -- anything in `files`
+    // that *isn't* in here by the end has been deleted/moved/renamed since
+    // the last index and gets cleaned up below, instead of lingering in
+    // search/symbol/call-graph results forever (this matters more once
+    // `grv index --watch` is running unattended).
+    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let walker = WalkBuilder::new(root)
         .hidden(true)
@@ -88,6 +96,7 @@ pub fn index_repo(conn: &mut Connection, root: &Path) -> Result<IndexStats> {
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
+        seen_paths.insert(rel_path.clone());
 
         let hash = content_hash(&content);
         let mtime = meta
@@ -129,13 +138,35 @@ pub fn index_repo(conn: &mut Connection, root: &Path) -> Result<IndexStats> {
         let file_id = tx.last_insert_rowid();
 
         let symbols = extract_symbols(&content, language);
+        // (symbol row id, start_line, end_line) for every symbol just
+        // inserted -- used below to find each call site's innermost
+        // enclosing symbol without a second query.
+        let mut symbol_rows: Vec<(i64, i64, i64)> = Vec::with_capacity(symbols.len());
         for sym in &symbols {
             tx.execute(
                 "INSERT INTO symbols (file_id, kind, name, start_line, end_line, parent) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![file_id, sym.kind, sym.name, sym.start_line, sym.end_line, sym.parent],
             )?;
+            symbol_rows.push((tx.last_insert_rowid(), sym.start_line, sym.end_line));
         }
         stats.symbols_extracted += symbols.len();
+
+        let calls = extract_calls(&content, language);
+        for c in &calls {
+            // Innermost enclosing symbol = the containing one with the
+            // smallest line span (nested functions/methods all contain
+            // the call site; the smallest span is the most specific).
+            let caller_symbol_id = symbol_rows
+                .iter()
+                .filter(|(_, start, end)| *start <= c.line && c.line <= *end)
+                .min_by_key(|(_, start, end)| end - start)
+                .map(|(id, _, _)| *id);
+            tx.execute(
+                "INSERT INTO calls (file_id, caller_symbol_id, callee_name, line) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![file_id, caller_symbol_id, c.callee_name, c.line],
+            )?;
+        }
+        stats.calls_extracted += calls.len();
 
         let chunks = chunk_lines(&content, CHUNK_LINES, CHUNK_OVERLAP);
         for (start, end, body) in &chunks {
@@ -148,6 +179,26 @@ pub fn index_repo(conn: &mut Connection, root: &Path) -> Result<IndexStats> {
 
         tx.commit()?;
         stats.files_indexed += 1;
+    }
+
+    let previously_indexed: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT path FROM files")?;
+        let out: Vec<String> = stmt.query_map([], |r| r.get(0))?.filter_map(|r| r.ok()).collect();
+        out
+    };
+    let gone: Vec<&String> = previously_indexed.iter().filter(|p| !seen_paths.contains(*p)).collect();
+    if !gone.is_empty() {
+        let tx = conn.transaction()?;
+        for path in &gone {
+            tx.execute(
+                "DELETE FROM embeddings WHERE chunk_id IN (SELECT rowid FROM content_fts WHERE path = ?1)",
+                [path.as_str()],
+            )?;
+            tx.execute("DELETE FROM content_fts WHERE path = ?1", [path.as_str()])?;
+            tx.execute("DELETE FROM files WHERE path = ?1", [path.as_str()])?; // cascades symbols/calls
+        }
+        tx.commit()?;
+        stats.files_removed = gone.len();
     }
 
     Ok(stats)
@@ -238,6 +289,59 @@ pub fn extract_symbols(content: &str, language: Lang) -> Vec<ExtractedSymbol> {
             end_line: node.end_position().row as i64 + 1,
             parent: None,
         });
+    }
+    out
+}
+
+pub struct CallSite {
+    pub line: i64,
+    pub callee_name: String,
+}
+
+/// Best-effort call-site extraction (see `Lang::call_query_src` for the
+/// name-based-not-type-resolved caveat). Empty vec, never an error, for a
+/// language with no call query or a grammar/query mismatch — same
+/// contract as `extract_symbols`.
+pub fn extract_calls(content: &str, language: Lang) -> Vec<CallSite> {
+    let Some(ts_lang) = language.ts_language() else {
+        return Vec::new();
+    };
+    let Some(query) = language.compile_call_query() else {
+        return Vec::new();
+    };
+
+    let mut parser = Parser::new();
+    if parser.set_language(&ts_lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+
+    let callee_idx = query.capture_index_for_name("callee");
+    let call_idx = query.capture_index_for_name("call");
+    let (Some(callee_idx), Some(call_idx)) = (callee_idx, call_idx) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let bytes = content.as_bytes();
+    let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+    while let Some(m) = matches.next() {
+        let mut callee_text = None;
+        let mut call_node = None;
+        for cap in m.captures {
+            if cap.index == callee_idx {
+                callee_text = cap.node.utf8_text(bytes).ok().map(|s| s.to_string());
+            } else if cap.index == call_idx {
+                call_node = Some(cap.node);
+            }
+        }
+        let (Some(callee_name), Some(node)) = (callee_text, call_node) else {
+            continue;
+        };
+        out.push(CallSite { line: node.start_position().row as i64 + 1, callee_name });
     }
     out
 }

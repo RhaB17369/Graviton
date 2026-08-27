@@ -226,8 +226,11 @@ machines — see ARCHITECTURE.md for the sizing rationale).
 cd /path/to/some/huge/repo
 
 grv index                          # build/update the local index (incremental)
+grv index --watch                  # ...then keep re-indexing on file changes
 grv search "jwt verify"            # full-text search over indexed chunks
 grv symbol validate_token          # jump straight to a symbol's source
+grv callers validate_token         # every call site named validate_token
+grv callees handle_login           # every call made from within handle_login
 
 grv agents                         # show the roster
 grv ask "trace user input into os.system in vuln.py"              # ARCHITECT by default
@@ -346,11 +349,50 @@ part to run locally. `grv embed --force` recomputes everything (e.g. after
 switching embedding models); re-indexing a changed file automatically drops
 its stale embeddings so they never point at chunks that no longer exist.
 
+### Call graph — `grv callers`/`grv callees`
+
+```sh
+grv callers check_password        # every call site anywhere in the index literally named check_password
+grv callees dispatch_inner        # every call made from within dispatch_inner
+```
+
+Text-based, not type-resolved: `callee_name` is matched literally, the same
+simplification `grv symbol`'s `LIKE`-based name lookup already makes for
+definitions. Built from a second tree-sitter query per language
+(`Lang::call_query_src`) — currently covers Rust/Python/JS/TS/TSX/Go; other
+parsed languages just yield no call edges yet (never a hard failure, same
+graceful-degradation contract as symbol extraction). `grv index` reports
+call sites found alongside symbols/chunks.
+
+### Watch mode — `grv index --watch`
+
+```sh
+grv index --watch
+```
+
+Indexes once, then keeps re-indexing on real filesystem events (`notify`'s
+inotify/kqueue/FSEvents backend, not polling), debounced so a save (which
+fires several raw events) or a `git checkout`/branch switch (which touches
+many files at once) becomes one re-index instead of many. Deleted files are
+now also cleaned out of the index (search/symbol/call-graph results no
+longer linger for files that no longer exist) — a real fix, not just a
+watch-mode feature, since `grv index` re-runs benefit from it too.
+
+### Per-agent retrieval, everywhere
+
+`ask`/`investigate`/`crew`/`review`/`swarm` no longer just reason over one
+fixed context block handed to them up front — each stage/agent gets its own
+bounded tool loop (`search_code`/`semantic_search`/`read_file`/`list_dir`/
+`web_search`/`web_fetch`/`git_*`), so a `crew` stage that needs different
+evidence than the one before it can go get it, instead of every stage being
+stuck with the same retrieval pass. `grv run`'s own tool loop already had
+this; the read-only commands now share the exact same mechanism.
+
 ### `grv serve` — a daemon for editor/IDE integrations
 
 ```sh
 grv serve                              # unix socket at a short, repo-hashed path (avoids the ~100-byte socket path limit)
-grv serve --tcp 127.0.0.1:7420         # also listen on TCP
+grv serve --tcp 127.0.0.1:7420         # also listen on TCP -- prints a required token; see below
 ```
 
 Runs in the foreground (like `ollama serve`) speaking one JSON object per
@@ -359,14 +401,28 @@ LSP-style `Content-Length` framing, so a three-line script in anything can
 talk to it (`nc -U .graviton/grv.sock` works for manual testing). This
 keeps the index connection and Ollama's warmed-up state alive across
 requests, instead of every editor query paying a fresh `grv` process's
-startup cost. Methods: `status`, `agents`, `search`, `symbol`,
-`semantic_search`, `ask`, `review`, `shutdown` — full request/response
-shapes and an example session are in ARCHITECTURE.md. Model-calling methods
-share a `LiveScheduler` (same design as `swarm`/`mission`), so a chatty
-editor firing several requests at once still can't out-run this machine's
-RAM.
+startup cost.
 
-## Current scope (v0.10)
+Methods: `status`, `agents`, `search`, `symbol`, `semantic_search`, `ask`,
+`review` (add `"stream": true` to either of the last two for live
+`token`/`tool_call` notifications instead of one final answer), `run_start`/
+`run_attach`/`run_confirm`/`run_status` (drive a full checkpointed `grv run`
+agentic session — confirm prompts included — over the socket instead of
+only from a terminal), and `shutdown`. Full request/response shapes and an
+example session (including the confirm round trip) are in ARCHITECTURE.md.
+Model-calling methods share a `LiveScheduler` (same design as `swarm`/
+`mission`), so a chatty editor firing several requests at once still can't
+out-run this machine's RAM.
+
+`--tcp` always requires a token (auto-generated and printed once at
+startup unless `--tcp-token` sets one) that every request over it must echo
+back in `params.token`; the Unix socket never needs one (filesystem
+permissions are that boundary instead, same as `ollama serve`'s own
+socket). Not a hardened secret — enough to stop an opportunistic hit on the
+port from doing anything, for a tool meant to bind `127.0.0.1`/a trusted
+LAN, not to stand in for real auth on an internet-facing service.
+
+## Current scope (v0.11)
 
 - **Languages with symbol extraction (17):** Rust, Python, JavaScript,
   TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua, Solidity,
@@ -381,20 +437,18 @@ RAM.
   for precise jumps, plus optional embedding-based semantic search (see
   above) once `grv config --embed-model` + `grv embed` are set up — off by
   default, and every command behaves exactly as before if you never opt in.
-- **Single-shot context building:** `ask`/`investigate` run one retrieval
-  pass before calling the model. They don't yet let the model ask for more
-  context mid-answer (that's the natural v2: give the model a `search`/
-  `symbol` tool call and loop). Today, if context is insufficient, the model
-  is instructed to say exactly what it's missing so you can re-run with
-  `--file` or a narrower question.
+- **Agentic retrieval, not single-shot:** `ask`/`investigate`/`crew`/
+  `review`/`swarm` (bounded, read-only tool loop) and `grv run`/`grv
+  mission` (full tool loop) can all pull in more than their initial
+  retrieval pass via `search_code`/`semantic_search`/`read_file`/etc.
+  mid-answer. If a question still turns out to be underspecified, the
+  model is instructed to say exactly what it's missing so you can re-run
+  with `--file` or a narrower question.
 
 ## Roadmap
 
-- Let agents request more context mid-run instead of one fixed retrieval pass — partially done: `grv mission`'s leaves and `grv run` can already call `web_search`/`web_fetch`/`read_file`/`list_dir`/`search_code`/`semantic_search` mid-answer; `ask`/`investigate`/`crew`/`swarm` still only get one fixed retrieval pass up front
-- Call-graph edges (`grv callers`/`grv callees`) from tree-sitter reference queries
-- Incremental re-index on file save (watch mode)
 - Kotlin symbol extraction once a crates.io grammar release supports current tree-sitter
-- Per-agent retrieval (each crew stage currently reasons over the same shared context; REAPER asking a differently-shaped question than ARCHITECT could pull in more relevant chunks for each)
-- `grv serve`'s `ask`/`review` are one-shot request/response — no token streaming back to the editor, and no way to drive a full `grv run` agentic session (with its confirm prompts) over the socket yet
+- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go (C/C++/Java/C#/PHP/Ruby/Bash/Lua/Solidity/PowerShell have no call queries yet)
 - An ANN index for `grv embed` once a single repo's chunk count grows large enough that the current linear cosine scan actually shows up (not yet observed at any repo size tested)
-- `grv serve --tcp` has no auth — fine bound to 127.0.0.1, not something to expose beyond localhost as-is
+- `grv serve --tcp`'s token is a stopgap, not hardened auth — fine bound to 127.0.0.1/a trusted LAN, not something to expose more broadly as-is
+- `grv serve run_attach` only streams events from attach time forward (plus a synthesized catch-up for a pending confirm or an already-finished run) — not a full replay of everything that happened before you attached; `run_status` fills the rest of the gap

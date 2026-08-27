@@ -299,4 +299,67 @@ impl Lang {
             }
         }
     }
+
+    /// Call-site query: every match must expose a `@call` capture (the
+    /// whole call expression, for its line number) and a `@callee`
+    /// capture (just the called name's text). This resolves *names*, not
+    /// symbols — no type inference, so `grv callers foo` matches every
+    /// call site textually named `foo` regardless of which `foo` it is at
+    /// a given scope. That's the same honest simplification `grv symbol`
+    /// already makes (LIKE-based name matching, not full resolution), not
+    /// a new one.
+    ///
+    /// Covers the languages exercised/verified so far (Rust, Python,
+    /// JS/TS/TSX, Go) — not yet every parsed language; an uncovered
+    /// language just yields no call edges, same graceful-degradation
+    /// contract as `def_query_src` for a query that fails to compile.
+    pub fn call_query_src(&self) -> Option<&'static str> {
+        Some(match self {
+            Lang::Rust => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                (call_expression function: (field_expression field: (field_identifier) @callee)) @call
+                (call_expression function: (scoped_identifier name: (identifier) @callee)) @call
+                (macro_invocation macro: (identifier) @callee) @call
+                "#
+            }
+            Lang::Python => {
+                r#"
+                (call function: (identifier) @callee) @call
+                (call function: (attribute attribute: (identifier) @callee)) @call
+                "#
+            }
+            Lang::JavaScript => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                (call_expression function: (member_expression property: (property_identifier) @callee)) @call
+                "#
+            }
+            Lang::TypeScript | Lang::Tsx => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                (call_expression function: (member_expression property: (property_identifier) @callee)) @call
+                "#
+            }
+            Lang::Go => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                (call_expression function: (selector_expression field: (field_identifier) @callee)) @call
+                "#
+            }
+            _ => return None,
+        })
+    }
+
+    pub fn compile_call_query(&self) -> Option<Query> {
+        let lang = self.ts_language()?;
+        let src = self.call_query_src()?;
+        match Query::new(&lang, src) {
+            Ok(q) => Some(q),
+            Err(e) => {
+                tracing::warn!(lang = self.name(), error = %e, "call query failed to compile, call-graph extraction disabled for this language");
+                None
+            }
+        }
+    }
 }

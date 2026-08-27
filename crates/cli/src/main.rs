@@ -1,6 +1,7 @@
 mod agentic;
 mod agents;
 mod browser;
+mod callgraph;
 mod checkpoint;
 mod context;
 mod custom_tools;
@@ -8,8 +9,10 @@ mod daemon;
 mod mission;
 mod permissions;
 mod resources;
+mod run_io;
 mod semantic;
 mod tools;
+mod watch;
 mod web;
 
 use agents::AgentSpec;
@@ -17,8 +20,7 @@ use agents::AgentSpec;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use graviton_core::Config;
-use graviton_llm::{ChatMessage, OllamaClient};
-use std::io::Write;
+use graviton_llm::OllamaClient;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -37,6 +39,10 @@ enum Command {
         /// Wipe the existing index before indexing
         #[arg(long)]
         force: bool,
+        /// After the initial index, keep re-indexing on file changes
+        /// (real filesystem events, debounced -- Ctrl+C to stop)
+        #[arg(long)]
+        watch: bool,
     },
     /// Full-text search over indexed code chunks
     Search {
@@ -65,6 +71,21 @@ enum Command {
     Symbol {
         name: String,
         #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
+    /// Every call site anywhere in the index literally named `name` (text
+    /// match, not type-resolved -- see ARCHITECTURE.md). Currently covers
+    /// Rust/Python/JS/TS/TSX/Go; other parsed languages have no call
+    /// edges yet.
+    Callers {
+        name: String,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// Every call made from within the symbol(s) named `name`
+    Callees {
+        name: String,
+        #[arg(long, default_value_t = 30)]
         limit: usize,
     },
     /// Ask one agent a question, with retrieved code as context
@@ -227,9 +248,15 @@ enum Command {
         /// Unix socket path limit)
         #[arg(long)]
         socket: Option<PathBuf>,
-        /// Also listen on this TCP address, e.g. 127.0.0.1:7420
+        /// Also listen on this TCP address, e.g. 127.0.0.1:7420 -- every
+        /// request over it must echo back the token (see --tcp-token) in
+        /// params.token; the unix socket never needs one
         #[arg(long)]
         tcp: Option<String>,
+        /// Required token for --tcp requests (auto-generated and printed
+        /// once at startup if omitted)
+        #[arg(long)]
+        tcp_token: Option<String>,
     },
 }
 
@@ -317,10 +344,12 @@ async fn main() -> Result<()> {
     let cfg = Config::load_or_init()?;
 
     match cli.cmd {
-        Command::Index { path, force } => cmd_index(&cfg, path, force),
+        Command::Index { path, force, watch } => cmd_index(&cfg, path, force, watch),
         Command::Search { query, limit, semantic } => cmd_search(&cfg, &query, limit, semantic).await,
         Command::Embed { force, model } => cmd_embed(&cfg, force, model).await,
         Command::Symbol { name, limit } => cmd_symbol(&cfg, &name, limit),
+        Command::Callers { name, limit } => cmd_callers(&cfg, &name, limit),
+        Command::Callees { name, limit } => cmd_callees(&cfg, &name, limit),
         Command::Ask { question, files, agent } => {
             let spec = resolve_agent(&agent)?;
             cmd_ask(&cfg, &question, files, spec, false).await
@@ -366,11 +395,11 @@ async fn main() -> Result<()> {
         }
         Command::Tool { action } => cmd_tool(&cfg, action),
         Command::Custom { action } => cmd_custom(action),
-        Command::Serve { socket, tcp } => daemon::serve(&cfg, repo_root()?, socket, tcp).await,
+        Command::Serve { socket, tcp, tcp_token } => daemon::serve(&cfg, repo_root()?, socket, tcp, tcp_token).await,
     }
 }
 
-fn cmd_index(cfg: &Config, path: Option<PathBuf>, force: bool) -> Result<()> {
+fn cmd_index(cfg: &Config, path: Option<PathBuf>, force: bool, do_watch: bool) -> Result<()> {
     let root = path.map(Ok).unwrap_or_else(repo_root)?;
     let root = root.canonicalize().context("resolving repo path")?;
     let db_path = graviton_core::db_path_for(&root, &cfg.index_dir)?;
@@ -381,13 +410,18 @@ fn cmd_index(cfg: &Config, path: Option<PathBuf>, force: bool) -> Result<()> {
     println!("Indexing {} ...", root.display());
     let stats = graviton_indexer::index_repo(&mut conn, &root)?;
     println!(
-        "done: {} files scanned, {} indexed, {} unchanged, {} symbols, {} chunks",
+        "done: {} files scanned, {} indexed, {} unchanged, {} removed, {} symbols, {} call sites, {} chunks",
         stats.files_scanned,
         stats.files_indexed,
         stats.files_skipped_unchanged,
+        stats.files_removed,
         stats.symbols_extracted,
+        stats.calls_extracted,
         stats.chunks_written
     );
+    if do_watch {
+        watch::watch(&root, &cfg.index_dir, conn)?;
+    }
     Ok(())
 }
 
@@ -457,6 +491,40 @@ fn cmd_symbol(cfg: &Config, name: &str, limit: usize) -> Result<()> {
     for b in blocks {
         println!("\x1b[1;33m{}\x1b[0m", b.header);
         println!("{}\n", b.body);
+    }
+    Ok(())
+}
+
+fn cmd_callers(cfg: &Config, name: &str, limit: usize) -> Result<()> {
+    let root = repo_root()?;
+    let conn = open_repo_db(cfg, &root)?;
+    let hits = callgraph::find_callers(&conn, name, limit)?;
+    if hits.is_empty() {
+        println!("no call sites named '{name}' (only Rust/Python/JS/TS/TSX/Go have call edges so far)");
+        return Ok(());
+    }
+    for h in hits {
+        match &h.caller_symbol {
+            Some((kind, caller_name)) => println!("{}:{}  from {kind} {caller_name}", h.caller_path, h.line),
+            None => println!("{}:{}  (top-level, not inside an extracted symbol)", h.caller_path, h.line),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_callees(cfg: &Config, name: &str, limit: usize) -> Result<()> {
+    let root = repo_root()?;
+    let conn = open_repo_db(cfg, &root)?;
+    let groups = callgraph::find_callees(&conn, name, limit)?;
+    if groups.is_empty() {
+        println!("no symbol named '{name}' with any recorded calls (only Rust/Python/JS/TS/TSX/Go have call edges so far)");
+        return Ok(());
+    }
+    for (path, hits) in groups {
+        println!("\x1b[1;33m{path}\x1b[0m");
+        for h in hits {
+            println!("  :{}  calls {}", h.line, h.callee_name);
+        }
     }
     Ok(())
 }
@@ -547,24 +615,6 @@ fn agent_system_prompt(agent: &AgentSpec, investigate: bool) -> String {
     }
 }
 
-/// Stream one agent's reply to stdout, returning the full text. This path
-/// never offers tools — `ask`/`investigate`/`crew` are read-only analysis
-/// over retrieved context. `grv run` (see `agentic.rs`) is the tool-using
-/// agentic loop.
-async fn run_agent(client: &OllamaClient, cfg: &Config, model: &str, system: &str, user_msg: &str) -> Result<String> {
-    let messages = vec![ChatMessage::system(system), ChatMessage::user(user_msg)];
-    let stdout = std::io::stdout();
-    let result = client
-        .chat_stream(model, &messages, cfg.num_ctx, &[], |tok| {
-            let mut lock = stdout.lock();
-            let _ = lock.write_all(tok.as_bytes());
-            let _ = lock.flush();
-        })
-        .await?;
-    println!();
-    Ok(result.content)
-}
-
 async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &AgentSpec, investigate: bool) -> Result<()> {
     let root = repo_root()?;
     let conn = open_repo_db(cfg, &root)?;
@@ -582,7 +632,9 @@ async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &Agen
 
     println!("\x1b[1;35m═══ {} ═══\x1b[0m", agent.display);
     let client = OllamaClient::new(&cfg.ollama_host);
-    run_agent(&client, cfg, cfg.model_for_tier(agent.tier), &system, &user_msg).await.map(|_| ())
+    agentic::run_read_only_loop(&client, cfg, &root, cfg.model_for_tier(agent.tier), &system, &user_msg, true)
+        .await
+        .map(|_| ())
 }
 
 async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &str) -> Result<()> {
@@ -595,7 +647,7 @@ async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &
         format!("Retrieved context:\n{context_text}")
     };
     let specs = resolve_pipeline(pipeline)?;
-    run_pipeline(cfg, &format!("Question: {question}"), &context_block, "Findings from the rest of the crew so far:", &specs).await
+    run_pipeline(cfg, &root, &format!("Question: {question}"), &context_block, "Findings from the rest of the crew so far:", &specs).await
 }
 
 fn resolve_pipeline(pipeline: &str) -> Result<Vec<&'static AgentSpec>> {
@@ -611,7 +663,7 @@ fn resolve_pipeline(pipeline: &str) -> Result<Vec<&'static AgentSpec>> {
 /// `context_char_budget()` and truncated from the front so a long pipeline
 /// doesn't blow past `num_ctx` by the final stage), not just the same
 /// context re-served.
-async fn run_pipeline(cfg: &Config, prompt: &str, context_block: &str, handoff_label: &str, specs: &[&'static AgentSpec]) -> Result<()> {
+async fn run_pipeline(cfg: &Config, root: &std::path::Path, prompt: &str, context_block: &str, handoff_label: &str, specs: &[&'static AgentSpec]) -> Result<()> {
     let client = OllamaClient::new(&cfg.ollama_host);
     let mut prior = String::new();
 
@@ -622,7 +674,7 @@ async fn run_pipeline(cfg: &Config, prompt: &str, context_block: &str, handoff_l
         } else {
             format!("{prompt}\n\n{context_block}\n\n{handoff_label}\n{prior}")
         };
-        let output = run_agent(&client, cfg, cfg.model_for_tier(spec.tier), spec.system_prompt, &user_msg).await?;
+        let output = agentic::run_read_only_loop(&client, cfg, root, cfg.model_for_tier(spec.tier), spec.system_prompt, &user_msg, true).await?;
         prior.push_str(&format!("\n--- {} ---\n{}\n", spec.display, output.trim()));
         let cap = cfg.context_char_budget();
         if prior.len() > cap {
@@ -673,7 +725,7 @@ async fn cmd_review(cfg: &Config, range: Option<String>, staged: bool, pipeline:
     let prompt = "Review this diff for correctness, security, and design issues. Be specific: \
                   cite the exact changed line, explain the concrete risk or improvement it \
                   creates (not a generic label), and give the fix.";
-    run_pipeline(cfg, prompt, &context_block, "Findings from the rest of the review so far:", &specs).await
+    run_pipeline(cfg, &root, prompt, &context_block, "Findings from the rest of the review so far:", &specs).await
 }
 
 /// Run several agents concurrently on the same question, no hand-off
@@ -722,8 +774,9 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
     for spec in specs {
         let scheduler = scheduler.clone();
         let client = OllamaClient::new(&cfg.ollama_host);
+        let cfg_owned = cfg.clone();
+        let root_owned = root.clone();
         let model = cfg.model_for_tier(spec.tier).to_string();
-        let num_ctx = cfg.num_ctx;
         let system = spec.system_prompt.to_string();
         let user_msg = format!("Question: {question}\n\n{context_block}");
         let display = spec.display;
@@ -731,7 +784,13 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
         tasks.spawn(async move {
             let _permit = scheduler.acquire().await;
             let started = std::time::Instant::now();
-            let result = client.chat_stream(&model, &[ChatMessage::system(system), ChatMessage::user(user_msg)], num_ctx, &[], |_| {}).await;
+            // stream_final_answer=false: several agents run concurrently
+            // here, so live token streaming from more than one at once
+            // would interleave garbled output -- each agent's full answer
+            // prints as one block once it finishes instead (tool-call log
+            // lines can still interleave, same tradeoff `grv mission`
+            // already accepts for its concurrent leaves).
+            let result = agentic::run_read_only_loop(&client, &cfg_owned, &root_owned, &model, &system, &user_msg, false).await;
             (display, tagline, model, started.elapsed(), result)
         });
     }
@@ -740,7 +799,7 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
         let (display, tagline, model, elapsed, result) = joined.context("swarm task panicked")?;
         println!("\x1b[1;35m═══ {display} — {tagline} [{model}, {:.1}s] ═══\x1b[0m", elapsed.as_secs_f32());
         match result {
-            Ok(r) => println!("{}\n", r.content.trim()),
+            Ok(content) => println!("{}\n", content.trim()),
             Err(e) => println!("(failed: {e})\n"),
         }
     }
@@ -768,7 +827,7 @@ async fn cmd_run(cfg: &Config, task: &str, files: Vec<PathBuf>, agent: &AgentSpe
         String::new() // unused when resuming — the restored transcript already has the original context
     };
     let loop_cfg = agentic::AgentLoopConfig { auto_approve: yolo, enable_browser: browser };
-    agentic::run(cfg, &conn, &root, agent, task, Some(context_text), loop_cfg, resume_session).await
+    agentic::run(cfg, &root, agent, task, Some(context_text), loop_cfg, resume_session, std::sync::Arc::new(run_io::TerminalIo)).await
 }
 
 fn cmd_checkpoints() -> Result<()> {
