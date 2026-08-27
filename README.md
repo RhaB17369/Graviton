@@ -404,10 +404,11 @@ grv callees dispatch_inner        # every call made from within dispatch_inner
 Text-based, not type-resolved: `callee_name` is matched literally, the same
 simplification `grv symbol`'s `LIKE`-based name lookup already makes for
 definitions. Built from a second tree-sitter query per language
-(`Lang::call_query_src`) — currently covers Rust/Python/JS/TS/TSX/Go; other
-parsed languages just yield no call edges yet (never a hard failure, same
-graceful-degradation contract as symbol extraction). `grv index` reports
-call sites found alongside symbols/chunks.
+(`Lang::call_query_src`) — covers 48 of the 50 parsed languages (everything
+except GraphQL and Protobuf, which have no function-call concept to
+extract); a language with no call query just yields no call edges (never a
+hard failure, same graceful-degradation contract as symbol extraction).
+`grv index` reports call sites found alongside symbols/chunks.
 
 ### Watch mode — `grv index --watch`
 
@@ -454,24 +455,31 @@ Methods: `status`, `agents`, `search`, `symbol`, `semantic_search`, `ask`,
 `run_attach`/`run_confirm`/`run_answer_choice`/`run_status` (drive a full
 checkpointed `grv run` agentic session — confirm prompts and `ask_user`
 questions included — over the socket instead of only from a terminal), and
-`shutdown`. `run_attach` streams `run_event` notifications, one of which is
-`"kind": "ask_choice"` (the agent's `ask_user` tool call, with its question
-and options) — reply with `run_answer_choice {session_id, selected: [...]}`
-from any connection. Full request/response shapes and an example session
-(including the confirm and ask_choice round trips) are in ARCHITECTURE.md.
+`shutdown`. `run_attach` replays a session's **entire** event history from
+`run_start` onward, not just what happens after you attach, then continues
+live — attach a minute late and you still get everything from the
+beginning. One `run_event` kind is `"ask_choice"` (the agent's `ask_user`
+tool call, with its question and options) — reply with `run_answer_choice
+{session_id, selected: [...]}` from any connection. Full request/response
+shapes and an example session (including the confirm and ask_choice round
+trips) are in ARCHITECTURE.md.
 Model-calling methods share a `LiveScheduler` (same design as `swarm`/
 `mission`), so a chatty editor firing several requests at once still can't
 out-run this machine's RAM.
 
-`--tcp` always requires a token (auto-generated and printed once at
-startup unless `--tcp-token` sets one) that every request over it must echo
-back in `params.token`; the Unix socket never needs one (filesystem
-permissions are that boundary instead, same as `ollama serve`'s own
-socket). Not a hardened secret — enough to stop an opportunistic hit on the
-port from doing anything, for a tool meant to bind `127.0.0.1`/a trusted
-LAN, not to stand in for real auth on an internet-facing service.
+`--tcp` always requires a token — a real 256-bit value from the OS's CSPRNG
+(auto-generated and printed once at startup unless `--tcp-token` sets one),
+checked with a fixed-time comparison (not `==`, which leaks timing info
+byte-by-byte) and a flat delay on a wrong guess — that every request over
+it must echo back in `params.token`; the Unix socket never needs one
+(filesystem permissions are that boundary instead, same as `ollama
+serve`'s own socket). Still not a substitute for real auth on an
+internet-facing service: the connection itself isn't encrypted, so a
+passive listener on the same network segment can still read the token off
+the wire — this is meant for `127.0.0.1`/a trusted LAN, where guessing or
+timing-attacking the token is the realistic threat and both are now closed.
 
-## Current scope (v0.13)
+## Current scope (v0.14)
 
 - **Languages with verified symbol extraction (50):** Rust, Python,
   JavaScript, TypeScript, TSX, C, C++, Go, Java, C#, PHP, Ruby, Bash, Lua,
@@ -509,6 +517,6 @@ LAN, not to stand in for real auth on an internet-facing service.
 ## Roadmap
 
 - Kotlin/Svelte/Vue/WGSL/LaTeX symbol extraction — each blocked on a real external issue (old tree-sitter core pinned by the crate, or a broken external-scanner link), not an oversight. See ARCHITECTURE.md.
-- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other 44+ parsed languages have no call queries yet.
-- `grv serve --tcp`'s token is a stopgap, not hardened auth — fine bound to 127.0.0.1/a trusted LAN, not something to expose more broadly as-is
-- `grv serve run_attach` only streams events from attach time forward (plus a synthesized catch-up for a pending confirm, a pending `ask_user` question, or an already-finished run) — not a full replay of everything that happened before you attached; `run_status` fills the rest of the gap
+- Call-graph *type resolution* — still name-based by design (`grv callers run` matches every call site literally named `run(...)`, whichever `run` it actually is); language coverage itself is done (48 of 50 parsed languages, everything except GraphQL/Protobuf which have no calls to extract).
+- `grv serve --tcp`'s token is now a real 256-bit random value checked in constant time, but the connection itself still isn't encrypted — fine bound to 127.0.0.1/a trusted LAN, not something to expose past that as-is.
+- Verilog's call query only covers builtin `$display`/`$finish`/etc. calls, not plain user-defined task/function calls — a real grammar-parsing gap found while verifying, not a guess.

@@ -115,13 +115,39 @@ degrades `grv symbol` precision, never `grv search`/`grv ask` recall.
 
 A second tree-sitter query per language, same graceful-degradation contract
 as the definition query above (`Lang::call_query_src`/`compile_call_query`,
-`indexer::extract_calls`, `CallSite { line, callee_name }`) — currently
-written and verified for Rust/Python/JavaScript/TypeScript/TSX/Go; a
-language with no call query just yields no call edges, never a hard
-failure. Every match must expose a `@call` capture (the whole call
-expression, for its line) and a `@callee` capture (the called name's
-text) — e.g. Rust's query also matches `scoped_identifier` calls
-(`Type::method()`) and macro invocations, not just bare identifiers.
+`indexer::extract_calls`, `CallSite { line, callee_name }`) — written and
+verified for 48 of the 50 parsed languages (all except GraphQL and
+Protobuf, which have no "function call" concept at all — schema
+definition languages, nothing to extract); a language with no call query
+just yields no call edges, never a hard failure. Every match must expose a
+`@call` capture (the whole call expression, for its line) and a `@callee`
+capture (the called name's text) — e.g. Rust's query also matches
+`scoped_identifier` calls (`Type::method()`) and macro invocations, not
+just bare identifiers.
+
+A few languages' call queries lean on the same text-predicate technique as
+their def queries (see "Text-predicate-based queries" below) to stay a
+*call* graph rather than accidentally re-surfacing definitions or special
+forms as if something "called" them:
+
+- **Elixir**: excludes `def`/`defmodule`/`if`/`case`/etc. via
+  `#not-any-of?` — without it, `def foo do ... end` would show up as a
+  call to something named `def`, since it's structurally the same `call`
+  node a real function call is.
+- **Racket/Scheme**: excludes `define`/`lambda`/`if`/`let`/etc. the same
+  way, for the same generic-S-expression reason as their def queries.
+- **Assembly**: has no dedicated "call" node — a `call`/`jmp`/`jNN`
+  instruction's operand looks identical to any other instruction's operand
+  at the grammar level. `#any-of?` on the mnemonic is what turns "every
+  instruction operand" into "control-flow targets" — deliberately
+  including conditional jumps alongside `call`, since a jump-target graph
+  is the closest thing assembly has to "what does this call".
+
+One documented gap, not a guess dressed up as a query: Verilog's call
+query only covers `system_tf_call` (builtin `$display`/`$finish`/...) — a
+plain user-defined task/function call as a bare procedural statement
+didn't produce a usable parse tree from a hand-written sample in this
+grammar version, so it was left out rather than shipped unverified.
 
 Deliberately name-based, not type-resolved: a new `calls` table
 (`file_id`, `caller_symbol_id` nullable, `callee_name`, `line`) stores the
@@ -231,7 +257,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.13)
+## Language coverage (v0.14)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its
@@ -360,17 +386,52 @@ while let Some(m) = matches.next() {
 }
 ```
 
-This is a no-op for every one of the other 47 parsed languages — none of
-their queries declare a predicate, and `satisfies_text_predicates` returns
-`true` when a pattern has none. Elixir's query combines this with `.`
-anchors (`(list . (symbol) @kw . (symbol) @name)`) to pin a capture to an
+This is a no-op for every parsed language whose queries declare no
+predicate — `satisfies_text_predicates` returns `true` when a pattern has
+none. Elixir's def query combines this with `.` anchors (`(list . (symbol)
+@kw . (symbol) @name)`, in the Racket/Scheme case) to pin a capture to an
 exact child position — needed because an unanchored pattern can match a
 node's *later* children just as validly as its first ones, which for
-`(define (foo x) (+ x 1))` could otherwise capture `+` (from the body)
-as if it were the name being defined. `lang::new_language_queries`'s
-`racket_define_and_struct` test asserts exactly that failure mode doesn't
-happen (`assert!(!found.contains(&"+".to_string()))`), not just that the
-real names are found.
+`(define (foo x) (+ x 1))` could otherwise capture `+` (from the body) as
+if it were the name being defined.
+
+**A second, easy-to-miss requirement, found the hard way after the fix
+above still didn't work**: a predicate must be nested *inside the same
+outer parentheses* as the pattern it modifies, not written as a sibling
+top-level form after it. The natural-looking
+
+```scheme
+(call target: (identifier) @kw (arguments (alias) @name) (do_block)) @def
+(#eq? @kw "defmodule")
+```
+
+silently compiles to **two separate patterns** — the `(#eq? ...)` line
+becomes its own pattern with no node content, matching independently (and
+uselessly) elsewhere in the tree, while the real pattern keeps its empty
+predicate list and stays completely unfiltered. `is_predicate_actually_enforced_on_real_def_query`,
+a debug test added while chasing this (`(if x do y end)` in Elixir
+returning `["x"]` as a "definition") is what caught it — every earlier
+"passing" predicate test up to that point (Elixir def, Racket/Scheme def)
+had happened to pass anyway, because their sample inputs were never
+actually structurally ambiguous enough to need the predicate — the `.`
+anchors alone were doing all the real filtering, silently masking that the
+predicates themselves were inert. The fix is one extra pair of parens
+wrapping pattern *and* predicate together:
+
+```scheme
+((call target: (identifier) @kw (arguments (alias) @name) (do_block)) @def
+ (#eq? @kw "defmodule"))
+```
+
+Every predicate-bearing pattern in `lang.rs` (Elixir/Racket/Scheme's
+`def_query_src`, and Elixir/Racket/Scheme/Asm's `call_query_src`) uses this
+wrapped form. The lesson generalizes: a predicate-based query is only
+proven correct once a test exercises an input that would produce the
+*wrong* answer if the predicate were silently inert — `racket_define_and_struct`'s
+`assert!(!found.contains(&"+".to_string()))` and
+`elixir_call_excludes_definition_keywords`'s check against a real
+`defmodule`/`def` sample are exactly that kind of test, not just assertions
+that the real names are found.
 
 ## Tool execution (`grv tool`)
 
@@ -1170,11 +1231,13 @@ the connection that started it, using a `ChannelIo` (see "A pluggable
 confirm/output sink" above) instead of a terminal:
 
 - **`run_attach {session_id}`** (on any connection, including the one that
-  called `run_start`) acks once, then streams that session's events as
-  `run_event` notifications (`{"session_id","kind": "output"|"token"|
-  "confirm_request"|"ask_choice"|"done", ...}`) until `done` or the
-  connection drops. Multiple connections can attach to the same session
-  independently (each gets its own `broadcast::Receiver`).
+  called `run_start`) acks once, then replays that session's **entire**
+  event history from `run_start` onward — not just what happens after
+  attaching — as `run_event` notifications (`{"session_id","kind":
+  "output"|"token"|"confirm_request"|"ask_choice"|"done", ...}`), then
+  continues live until `done` or the connection drops. Multiple
+  connections can attach to the same session independently, each getting
+  its own full replay regardless of when it attaches.
 - **`run_confirm {session_id, decision}`** (`"yes"`/`"no"`/anything else =
   a `Decision::Redirect` — same three-way semantics the terminal's y/n/
   free-text prompt has) feeds a decision into the session's confirm
@@ -1185,28 +1248,36 @@ confirm/output sink" above) instead of a terminal:
 - **`run_status {session_id}`** returns a point-in-time snapshot (running?,
   a pending confirm's text or pending `ask_user` question if any, the
   checkpoint id once known, how it finished) without needing to attach —
-  for polling, or for a client that attached late and wants to know what
-  it missed.
+  for a quick poll that doesn't want the full event log.
 
-**The race this has to handle**: `run_start`'s spawned task can reach (and
-block on) a confirmation or an `ask_user` question *before* a client
-manages to call `run_attach` — there's no ordering guarantee between "task
-starts running" and "client's next request arrives". A `ConfirmRequest`/
-`AskChoice` broadcast sent before a receiver subscribes is simply never
-delivered to it (`tokio::sync::broadcast` doesn't replay to new
-subscribers), which would otherwise leave an attach
-waiting forever for an event that already happened. Fixed by having
-`handle_run_attach` check the session's status snapshot *after*
-subscribing but *before* entering the receive loop: if a confirmation or
-an `ask_user` question was already pending, or the run had already
-finished, it synthesizes and sends that one event from the snapshot before
-continuing — subscribe-then-check
-ordering means nothing sent after the subscribe can be missed by this,
-and the synthesized catch-up covers everything sent before it. Verified
-against the actual race, not just reasoned about: a mock run reaching its
-confirm point faster than a second Python process could start and attach
-still surfaced `confirm_request` correctly, and `run_confirm` from a third,
-independent connection unblocked it.
+**Full replay, not just a race-safety patch.** `RunHandle` keeps an
+authoritative, ordered, append-only `history: Arc<Mutex<Vec<RunEvent>>>`
+for the session — every `Output`/`Token`/`ConfirmRequest`/`AskChoice`/
+`Done` a run ever produces, not only the latest pending one. The broadcast
+channel (`events_tx`) carries **no payload at all**, just a `()` wake-up
+ping; `handle_run_attach` subscribes to it first (for the same
+race-safety reason as before — nothing pushed after this point can be
+missed), then loops: drain `history[next_idx..]` and send each as a
+notification, and when a ping arrives (or the channel reports `Lagged`,
+meaning some pings coalesced), just re-drain from `next_idx` again. This
+is what actually closes the "only replays from attach time forward" gap,
+and it subsumes the previous per-field catch-up hack (which separately
+special-cased an already-pending confirm, an already-pending `ask_user`
+question, and an already-finished run) with one mechanism: a `Lagged` or
+even entirely missed ping costs nothing, because the next drain always
+re-reads the authoritative log from exactly where this attach left off,
+never from the channel's payload. `history` is bounded by one run's own
+output (a fresh `run_start` gets a fresh, empty log), not daemon uptime.
+
+Verified against the actual gap, not just reasoned about: a mock chat
+server streaming ten words with a 300ms gap between each, `run_start`ed,
+then deliberately left with **nobody attached** for 1.5 seconds (several
+tokens streaming into the void), then attached from a brand-new
+connection — the full original sentence came back from the very first
+word, not just whatever streamed after the late attach. The pre-existing
+confirm-race test (a mock run reaching its confirm point faster than a
+second process could attach, `run_confirm`ed from a third, independent
+connection) still passes under the new mechanism too.
 
 ### Framing/lifecycle details
 
@@ -1237,32 +1308,51 @@ independent connection unblocked it.
   grv.sock`), instead of letting `bind` fail with the OS's bare "path must
   be shorter than SUN_LEN".
 - **`--tcp` token auth**: `serve()` always requires one once `--tcp` is
-  given — `generate_token()` (a plain `DefaultHasher` over wall clock +
-  pid + a per-process counter, not a `rand` dependency; this is meant to
-  stop an opportunistic hit on a `127.0.0.1`/trusted-LAN port from doing
-  anything, not to be a hardened secret) unless `--tcp-token` sets one
-  explicitly, printed once at startup. `handle_conn` checks
-  `params.token` against it for every request on a TCP-accepted
-  connection (`is_tcp`, threaded through from which listener accepted it)
-  before dispatching — including `shutdown`, so an unauthenticated TCP
-  client can't stop the daemon either. Unix socket connections never carry
-  or check a token (filesystem permissions on the socket file are that
-  boundary instead, same trust model `ollama serve`'s own socket uses).
+  given — `generate_token()` draws 32 bytes from the OS CSPRNG
+  (`getrandom`, hex-encoded to a 64-char/256-bit token) unless
+  `--tcp-token` sets one explicitly, printed once at startup. This used to
+  be a plain `DefaultHasher` over wall clock + pid + a per-process
+  counter — not actually a secret, since `DefaultHasher` uses a fixed,
+  known key and every input feeding it was either guessable (pid, a
+  counter starting at 0) or coarse enough to narrow down (a daemon-start
+  timestamp); someone who could bound the startup window and pid range
+  could search the *real* keyspace directly instead of the nominal 128
+  bits it looked like. `handle_conn` checks `params.token` against the
+  real token via `constant_time_eq` (a fixed-time byte comparison — `==`
+  on `&str` short-circuits on the first differing byte, which leaks how
+  many leading bytes were right through response timing) for every
+  request on a TCP-accepted connection (`is_tcp`, threaded through from
+  which listener accepted it) before dispatching — including `shutdown`,
+  so an unauthenticated TCP client can't stop the daemon either. A wrong
+  or missing token also costs the caller a flat 250ms before the error
+  comes back, cheap insurance against a scripted guesser hammering the
+  port. None of this is enough to expose the daemon past a
+  `127.0.0.1`/trusted-LAN boundary on its own — the token still travels in
+  cleartext over the TCP connection itself (no TLS), so a passive listener
+  on that network segment can still read it off the wire; the hardening
+  here closes the "guessable/timeable token" gap, not the "needs
+  encryption in transit to be internet-facing" one. Unix socket
+  connections never carry or check a token (filesystem permissions on the
+  socket file are that boundary instead, same trust model `ollama serve`'s
+  own socket uses).
 
 ## What's explicitly *not* built yet (see README roadmap)
 
-- Call-graph coverage beyond Rust/Python/JS/TS/TSX/Go — the other 44+
-  parsed languages have no `call_query_src` yet, and none of it is
-  type/scope-resolved (name-based matching only, by design — see "Call
-  graph" above for why that's the right tradeoff at this tool's scale).
+- Call-graph type/scope resolution — still deliberately name-based, not
+  type-resolved (see "Call graph" above for why that's the right tradeoff
+  at this tool's scale); `grv callers run` matches every call site
+  literally named `run(...)` regardless of which `run` it actually is.
+  Coverage across languages is otherwise done (48 of 50 parsed languages).
 - A real parse tree for Svelte, Vue, WGSL, and LaTeX — each hits a genuine
   external blocker (old-tree-sitter-core type mismatch for the first
   three, a broken external-scanner link for the fourth), not an oversight;
   see "Language coverage" above for the specifics.
-- `grv serve --tcp`'s token is a stopgap (see "`--tcp` token auth" above),
-  not hardened auth suitable for anything beyond `127.0.0.1`/a trusted LAN.
-- `run_attach` only streams events from the moment of attaching forward
-  (plus a synthesized catch-up for an already-pending confirm, an already-
-  pending `ask_user` question, or an already-finished run — see "Driving a
-  full `grv run` session over the socket" above) — not a full replay of
-  every event since `run_start`; `run_status` covers the rest of that gap.
+- `grv serve --tcp`'s token auth doesn't include transport encryption —
+  the token itself is now a real 256-bit CSPRNG value checked in constant
+  time (see "`--tcp` token auth" above), but it still travels in cleartext
+  over the TCP connection, so this remains a `127.0.0.1`/trusted-LAN
+  mechanism, not something to expose past that boundary as-is.
+- Verilog's call query only covers builtin `system_tf_call`s
+  (`$display`/...), not plain user-defined task/function calls as bare
+  procedural statements — a real parse-tree gap in this grammar version
+  from a hand-written sample, not a guess; see "Call graph" above.

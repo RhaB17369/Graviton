@@ -536,17 +536,17 @@ impl Lang {
             // *text* is literally one of the def-like keywords counts.
             Lang::Elixir => {
                 r#"
-                (call target: (identifier) @kw (arguments (alias) @name) (do_block)) @def
-                (#eq? @kw "defmodule")
+                ((call target: (identifier) @kw (arguments (alias) @name) (do_block)) @def
+                 (#eq? @kw "defmodule"))
 
-                (call target: (identifier) @kw (arguments (call target: (identifier) @name (arguments _))) (do_block)) @def
-                (#any-of? @kw "def" "defp" "defmacro" "defmacrop")
+                ((call target: (identifier) @kw (arguments (call target: (identifier) @name (arguments _))) (do_block)) @def
+                 (#any-of? @kw "def" "defp" "defmacro" "defmacrop"))
 
-                (call target: (identifier) @kw (arguments (call target: (identifier) @name (arguments _)) (keywords))) @def
-                (#any-of? @kw "def" "defp" "defmacro" "defmacrop")
+                ((call target: (identifier) @kw (arguments (call target: (identifier) @name (arguments _)) (keywords))) @def
+                 (#any-of? @kw "def" "defp" "defmacro" "defmacrop"))
 
-                (call target: (identifier) @kw (arguments (identifier) @name) (do_block)) @def
-                (#any-of? @kw "def" "defp" "defmacro" "defmacrop")
+                ((call target: (identifier) @kw (arguments (identifier) @name) (do_block)) @def
+                 (#any-of? @kw "def" "defp" "defmacro" "defmacrop"))
                 "#
             }
             Lang::Scala => {
@@ -689,20 +689,20 @@ impl Lang {
             // "name is the second child" shape.
             Lang::Racket => {
                 r#"
-                (list . (symbol) @kw . (symbol) @name) @def
-                (#any-of? @kw "define" "struct" "define-struct")
+                ((list . (symbol) @kw . (symbol) @name) @def
+                 (#any-of? @kw "define" "struct" "define-struct"))
 
-                (list . (symbol) @kw . (list . (symbol) @name)) @def
-                (#eq? @kw "define")
+                ((list . (symbol) @kw . (list . (symbol) @name)) @def
+                 (#eq? @kw "define"))
                 "#
             }
             Lang::Scheme => {
                 r#"
-                (list . (symbol) @kw . (symbol) @name) @def
-                (#eq? @kw "define")
+                ((list . (symbol) @kw . (symbol) @name) @def
+                 (#eq? @kw "define"))
 
-                (list . (symbol) @kw . (list . (symbol) @name)) @def
-                (#eq? @kw "define")
+                ((list . (symbol) @kw . (list . (symbol) @name)) @def
+                 (#eq? @kw "define"))
                 "#
             }
             Lang::Proto => {
@@ -812,6 +812,263 @@ impl Lang {
                 r#"
                 (call_expression function: (identifier) @callee) @call
                 (call_expression function: (selector_expression field: (field_identifier) @callee)) @call
+                "#
+            }
+            Lang::C | Lang::Glsl | Lang::Hlsl => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                "#
+            }
+            Lang::Cpp => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                (call_expression function: (field_expression field: (field_identifier) @callee)) @call
+                (call_expression function: (qualified_identifier name: (identifier) @callee)) @call
+                "#
+            }
+            Lang::Java | Lang::Groovy => {
+                r#"
+                (method_invocation name: (identifier) @callee) @call
+                "#
+            }
+            Lang::CSharp => {
+                r#"
+                (invocation_expression function: (identifier) @callee) @call
+                (invocation_expression function: (member_access_expression name: (identifier) @callee)) @call
+                "#
+            }
+            Lang::Php => {
+                r#"
+                (function_call_expression function: (name) @callee) @call
+                (member_call_expression name: (name) @callee) @call
+                (scoped_call_expression name: (name) @callee) @call
+                "#
+            }
+            Lang::Ruby => {
+                r#"
+                (call method: (identifier) @callee) @call
+                "#
+            }
+            Lang::Bash => {
+                r#"
+                (command name: (command_name (word) @callee)) @call
+                "#
+            }
+            Lang::Fish => {
+                r#"
+                (command name: (word) @callee) @call
+                "#
+            }
+            Lang::Lua => {
+                r#"
+                (function_call name: (identifier) @callee) @call
+                (function_call name: (method_index_expression method: (identifier) @callee)) @call
+                (function_call name: (dot_index_expression field: (identifier) @callee)) @call
+                "#
+            }
+            Lang::Solidity => {
+                r#"
+                (call_expression function: (expression (identifier) @callee)) @call
+                (call_expression function: (expression (member_expression property: (identifier) @callee))) @call
+                "#
+            }
+            // PowerShell cmdlet names (`Get-Process`, `Write-Host`) are
+            // captured as the whole `command_name` node's text -- there's
+            // no further identifier field to drill into (it's a leaf).
+            Lang::PowerShell => {
+                r#"
+                (command command_name: (command_name) @callee) @call
+                "#
+            }
+            Lang::Haskell => {
+                r#"
+                (apply function: (variable) @callee) @call
+                "#
+            }
+            Lang::Dart => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                (call_expression function: (member_expression property: (identifier) @callee)) @call
+                "#
+            }
+            Lang::Zig => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                (call_expression function: (field_expression . (field_expression) . (identifier) @callee)) @call
+                (call_expression function: (field_expression member: (identifier) @callee)) @call
+                "#
+            }
+            Lang::Julia => {
+                r#"
+                (call_expression (identifier) @callee) @call
+                (call_expression (field_expression value: (identifier) . (identifier) @callee)) @call
+                "#
+            }
+            Lang::Crystal => {
+                r#"
+                (call name: (identifier) @callee) @call
+                "#
+            }
+            Lang::D => {
+                r#"
+                (call_expression . (identifier) @callee) @call
+                (call_expression (type (identifier) . (identifier) @callee)) @call
+                "#
+            }
+            // Assembly has no dedicated "call" node -- a `call`/`jmp`/`jNN`
+            // instruction's operand is structurally identical to any other
+            // instruction's operand (both are just `(ident (reg (word)))`
+            // per this grammar). The `#any-of?` predicate on the mnemonic
+            // is what makes this a *call/jump-target* graph instead of
+            // "every operand of every instruction" -- deliberately
+            // includes conditional jumps alongside `call`, since a control-
+            // flow-target graph is the closest analog assembly has to
+            // "what does this call".
+            Lang::Asm => {
+                r#"
+                ((instruction kind: (word) @mnemonic (ident (reg (word)) @callee)) @call
+                 (#any-of? @mnemonic "call" "callq" "jmp" "je" "jne" "jz" "jnz" "jl" "jle" "jg" "jge" "ja" "jae" "jb" "jbe" "loop"))
+                "#
+            }
+            // See the def_query_src comment on `Lang::Elixir`: `def`/
+            // `defmodule`/control-flow macros are all plain `call` nodes.
+            // `#not-any-of?` keeps this a *call graph*, not a "definition
+            // graph" wearing a callee's clothes -- without it, every `def
+            // foo` would also show up as if something called `def`.
+            Lang::Elixir => {
+                r#"
+                ((call target: (identifier) @callee (arguments)) @call
+                 (#not-any-of? @callee "def" "defp" "defmacro" "defmacrop" "defmodule" "if" "unless" "case" "cond" "receive" "try" "with" "for"))
+
+                (call target: (dot right: (identifier) @callee)) @call
+                "#
+            }
+            Lang::Scala => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                (call_expression function: (field_expression field: (identifier) @callee)) @call
+                "#
+            }
+            Lang::Swift => {
+                r#"
+                (call_expression . (simple_identifier) @callee) @call
+                (call_expression (navigation_expression suffix: (navigation_suffix suffix: (simple_identifier) @callee))) @call
+                "#
+            }
+            Lang::Perl => {
+                r#"
+                (call_expression_with_bareword function_name: (identifier) @callee) @call
+                (method_invocation function_name: (identifier) @callee) @call
+                "#
+            }
+            Lang::R => {
+                r#"
+                (call function: (identifier) @callee) @call
+                "#
+            }
+            Lang::OCaml => {
+                r#"
+                (application_expression function: (value_path (value_name) @callee)) @call
+                "#
+            }
+            Lang::Elm => {
+                r#"
+                (function_call_expr target: (value_expr name: (value_qid (lower_case_identifier) @callee))) @call
+                "#
+            }
+            Lang::Nim => {
+                r#"
+                (call name: (identifier) @callee) @call
+                "#
+            }
+            Lang::Erlang => {
+                r#"
+                (call expr: (atom) @callee) @call
+                "#
+            }
+            Lang::Vim => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                "#
+            }
+            Lang::Nix => {
+                r#"
+                (apply_expression function: (variable_expression name: (identifier) @callee)) @call
+                "#
+            }
+            Lang::Hcl => {
+                r#"
+                (function_call (identifier) @callee) @call
+                "#
+            }
+            Lang::CMake => {
+                r#"
+                (normal_command (identifier) @callee) @call
+                "#
+            }
+            // Only the builtin `$system_task`/`$function` form
+            // (`system_tf_call`) is captured here, verified against a real
+            // parse -- a plain user task/function call as a bare procedural
+            // statement didn't produce a usable parse tree in this
+            // grammar version from a hand-written sample, so it's left out
+            // rather than guessed at.
+            Lang::Verilog => {
+                r#"
+                (system_tf_call (system_tf_identifier) @callee) @call
+                "#
+            }
+            Lang::Vhdl => {
+                r#"
+                (procedure_call_statement (name (identifier) @callee)) @call
+                "#
+            }
+            Lang::Fortran => {
+                r#"
+                (subroutine_call subroutine: (identifier) @callee) @call
+                (call_expression . (identifier) @callee) @call
+                "#
+            }
+            // No dedicated "call" node in Prolog's grammar -- every
+            // `compound_term` (a predicate applied to arguments) is
+            // structurally the same whether it's a clause's head or a goal
+            // in its body. Matching every one, unscoped, is simpler and
+            // more robust across arbitrarily deep comma-conjunction chains
+            // than trying to exclude just the head -- the head then also
+            // shows up as a "call" to itself, a minor, documented
+            // over-approximation consistent with this call graph's
+            // existing name-based (not resolved) nature.
+            Lang::Prolog => {
+                r#"
+                (compound_term functor: (atom) @callee) @call
+                "#
+            }
+            // Same generic-S-expression reasoning as the def_query_src
+            // comment on `Lang::Racket`/`Lang::Scheme`: everything is a
+            // `list`, so "is this a call" needs the same `.`-anchored
+            // leading-symbol capture, this time with `#not-any-of?` to
+            // exclude the special forms/binders that aren't really calls
+            // (including `define` itself, already covered separately).
+            Lang::Racket => {
+                r#"
+                ((list . (symbol) @callee) @call
+                 (#not-any-of? @callee "define" "struct" "define-struct" "lambda" "if" "cond" "let" "let*" "letrec" "begin" "when" "unless" "set!" "quote" "quasiquote" "unquote"))
+                "#
+            }
+            Lang::Scheme => {
+                r#"
+                ((list . (symbol) @callee) @call
+                 (#not-any-of? @callee "define" "lambda" "if" "cond" "let" "let*" "letrec" "begin" "when" "unless" "set!" "quote" "quasiquote" "unquote"))
+                "#
+            }
+            Lang::ObjC => {
+                r#"
+                (call_expression function: (identifier) @callee) @call
+                (message_expression method: (identifier) @callee) @call
+                "#
+            }
+            Lang::Ada => {
+                r#"
+                (procedure_call_statement name: (identifier) @callee) @call
                 "#
             }
             _ => return None,
@@ -1133,3 +1390,328 @@ mod new_language_queries {
     }
 }
 
+#[cfg(test)]
+mod call_queries {
+    // Each `call_query_src` addition verified against a real parse of real
+    // sample code, same discipline as `new_language_queries` above --
+    // `crate::extract_calls`'s output checked against a hand-written
+    // sample containing real call sites, not just "the query compiles".
+    use super::*;
+
+    fn callees(lang: Lang, src: &str) -> Vec<String> {
+        crate::extract_calls(src, lang).into_iter().map(|c| c.callee_name).collect()
+    }
+
+    #[test]
+    fn c_call() {
+        let found = callees(Lang::C, "int main() {\n    foo(1);\n    return bar(2);\n}\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn cpp_call_field_and_qualified() {
+        let src = "void main() {\n    foo(1);\n    obj.method(2);\n    obj->method(3);\n    Namespace::func(4);\n}\n";
+        let found = callees(Lang::Cpp, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.iter().filter(|n| *n == "method").count() >= 2, "{found:?}");
+        assert!(found.contains(&"func".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn java_method_invocation() {
+        let src = "class A {\n  void m() {\n    foo(1);\n    obj.method(2);\n    this.method(3);\n  }\n}\n";
+        let found = callees(Lang::Java, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.iter().filter(|n| *n == "method").count() >= 2, "{found:?}");
+    }
+
+    #[test]
+    fn csharp_invocation() {
+        let src = "class A {\n  void M() {\n    Foo(1);\n    obj.Method(2);\n    this.Method(3);\n  }\n}\n";
+        let found = callees(Lang::CSharp, src);
+        assert!(found.contains(&"Foo".to_string()), "{found:?}");
+        assert!(found.iter().filter(|n| *n == "Method").count() >= 2, "{found:?}");
+    }
+
+    #[test]
+    fn php_function_member_scoped_call() {
+        let src = "<?php\nfoo(1);\n$obj->method(2);\nKlass::method(3);\n";
+        let found = callees(Lang::Php, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.iter().filter(|n| *n == "method").count() >= 2, "{found:?}");
+    }
+
+    #[test]
+    fn ruby_call() {
+        let found = callees(Lang::Ruby, "foo(1)\nobj.method(2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn bash_command() {
+        let found = callees(Lang::Bash, "foo bar\nls -la\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"ls".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn fish_command() {
+        let found = callees(Lang::Fish, "foo bar\necho hi\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"echo".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn lua_function_call_and_methods() {
+        let src = "foo(1)\nobj:method(2)\nobj.method(3)\n";
+        let found = callees(Lang::Lua, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.iter().filter(|n| *n == "method").count() >= 2, "{found:?}");
+    }
+
+    #[test]
+    fn solidity_call() {
+        let src = "contract A {\n  function m() public {\n    foo(1);\n    this.bar(2);\n  }\n}\n";
+        let found = callees(Lang::Solidity, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn powershell_command() {
+        let found = callees(Lang::PowerShell, "Get-Process\nWrite-Host \"hi\"\n");
+        assert!(found.contains(&"Get-Process".to_string()), "{found:?}");
+        assert!(found.contains(&"Write-Host".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn haskell_apply() {
+        let found = callees(Lang::Haskell, "main = do\n  foo 1\n  bar 2\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn dart_call_and_method() {
+        let src = "void f() {\n  foo(1);\n  obj.method(2);\n}\n";
+        let found = callees(Lang::Dart, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn zig_call_and_field_call() {
+        let src = "fn f() void {\n    foo(1);\n    std.debug.print(\"hi\", .{});\n}\n";
+        let found = callees(Lang::Zig, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"print".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn julia_call_and_field_call() {
+        let found = callees(Lang::Julia, "foo(1)\nbar.method(2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn groovy_method_invocation() {
+        let found = callees(Lang::Groovy, "foo(1)\nobj.method(2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn crystal_call() {
+        let found = callees(Lang::Crystal, "foo(1)\nobj.method(2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn d_call_and_qualified_call() {
+        let src = "void f() {\n    foo(1);\n    obj.method(2);\n}\n";
+        let found = callees(Lang::D, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn asm_call_and_jump_targets() {
+        let found = callees(Lang::Asm, "call foo\njmp bar\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn elixir_call_excludes_definition_keywords() {
+        let found = callees(Lang::Elixir, "foo(1)\nMod.bar(2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+        // The real bar the #not-any-of? predicate has to clear.
+        let found2 = callees(Lang::Elixir, "defmodule M do\n  def foo(x) do\n    x\n  end\nend\n");
+        assert!(!found2.contains(&"def".to_string()), "{found2:?}");
+        assert!(!found2.contains(&"defmodule".to_string()), "{found2:?}");
+    }
+
+    #[test]
+    fn scala_call_and_field_call() {
+        let src = "object A {\n  def m() = {\n    foo(1)\n    obj.method(2)\n  }\n}\n";
+        let found = callees(Lang::Scala, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn swift_call_and_navigation_call() {
+        let src = "func f() {\n    foo(1)\n    obj.method(2)\n}\n";
+        let found = callees(Lang::Swift, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn perl_call_and_method() {
+        let found = callees(Lang::Perl, "foo(1);\n$obj->method(2);\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn r_call() {
+        let found = callees(Lang::R, "foo(1)\nbar(2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn ocaml_application() {
+        let found = callees(Lang::OCaml, "let () =\n  foo 1;\n  bar 2\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn elm_function_call() {
+        let found = callees(Lang::Elm, "f = foo 1\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn nim_call() {
+        let found = callees(Lang::Nim, "foo(1)\nbar(2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn erlang_call() {
+        let found = callees(Lang::Erlang, "f() ->\n    foo(1),\n    bar(2).\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn vim_call_expression() {
+        let found = callees(Lang::Vim, "call Foo(1)\necho Bar()\n");
+        assert!(found.contains(&"Foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn nix_apply_expression() {
+        let found = callees(Lang::Nix, "foo 1\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn hcl_function_call() {
+        let found = callees(Lang::Hcl, "x = foo(1)\ny = bar(2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn cmake_normal_command() {
+        let found = callees(Lang::CMake, "message(hi)\nfoo(bar)\n");
+        assert!(found.contains(&"message".to_string()), "{found:?}");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn verilog_system_tf_call() {
+        let src = "module m;\n  initial begin\n    $display(\"hi\");\n  end\nendmodule\n";
+        let found = callees(Lang::Verilog, src);
+        assert!(found.contains(&"$display".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn vhdl_procedure_call() {
+        let src = "architecture behavior of counter is\nbegin\n  process is\n  begin\n    foo(1);\n  end process;\nend architecture behavior;\n";
+        let found = callees(Lang::Vhdl, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn fortran_call_and_call_expression() {
+        let found = callees(Lang::Fortran, "program p\n  call foo(1)\n  x = bar(2)\nend program p\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn prolog_compound_term_calls() {
+        let found = callees(Lang::Prolog, "f(X) :- foo(X), bar(X).\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn racket_call_excludes_special_forms() {
+        let found = callees(Lang::Racket, "(foo 1)\n(bar 2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+        let found2 = callees(Lang::Racket, "(define (foo x) (if x 1 2))\n");
+        assert!(!found2.contains(&"define".to_string()), "{found2:?}");
+        assert!(!found2.contains(&"if".to_string()), "{found2:?}");
+    }
+
+    #[test]
+    fn scheme_call_excludes_special_forms() {
+        let found = callees(Lang::Scheme, "(foo 1)\n(bar 2)\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"bar".to_string()), "{found:?}");
+        let found2 = callees(Lang::Scheme, "(define (foo x) (let ((y 1)) y))\n");
+        assert!(!found2.contains(&"define".to_string()), "{found2:?}");
+        assert!(!found2.contains(&"let".to_string()), "{found2:?}");
+    }
+
+    #[test]
+    fn objc_call_and_message() {
+        let src = "void f() {\n    foo(1);\n    [obj method:2];\n}\n";
+        let found = callees(Lang::ObjC, src);
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+        assert!(found.contains(&"method".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn glsl_call() {
+        let found = callees(Lang::Glsl, "void f() {\n    foo(1.0);\n}\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn hlsl_call() {
+        let found = callees(Lang::Hlsl, "void f() {\n    foo(1.0);\n}\n");
+        assert!(found.contains(&"foo".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn ada_procedure_call() {
+        let found = callees(Lang::Ada, "procedure P is\nbegin\n   Foo (1);\n   Bar (2);\nend P;\n");
+        assert!(found.contains(&"Foo".to_string()), "{found:?}");
+        assert!(found.contains(&"Bar".to_string()), "{found:?}");
+    }
+}

@@ -117,7 +117,24 @@ struct DaemonCtx {
 /// is already cheap to clone (channel handles, an `Arc<Mutex<...>>>`).
 #[derive(Clone)]
 struct RunHandle {
-    events_tx: broadcast::Sender<RunEvent>,
+    /// A pure wake-up signal, not the event payload -- see `history` and
+    /// `handle_run_attach`'s doc comment for why the payload was moved out
+    /// of the broadcast channel entirely.
+    events_tx: broadcast::Sender<()>,
+    /// The full, ordered, append-only log of this session's events, from
+    /// `run_start` to (once it exists) `Done`. This -- not the broadcast
+    /// channel -- is what makes `run_attach` a full replay regardless of
+    /// when a client attaches: `tokio::sync::broadcast` never replays a
+    /// message to a subscriber that joined after it was sent (the exact
+    /// race the confirm/ask_choice catch-up logic used to patch around one
+    /// event at a time), so the channel now only ever carries "check
+    /// `history` again", never the content itself -- a lagged or entirely
+    /// missed wake-up costs nothing, since the next check re-reads
+    /// `history` from wherever this attach left off. Bounded in practice
+    /// by one run's own output (a session's `Token`/`Output` events stop
+    /// accumulating the moment it finishes; a fresh `run_start` gets a
+    /// fresh, empty `history`), not by daemon uptime.
+    history: Arc<StdMutex<Vec<RunEvent>>>,
     confirm_tx: mpsc::UnboundedSender<Decision>,
     choice_tx: mpsc::UnboundedSender<Vec<String>>,
     status: Arc<StdMutex<RunStatusSnapshot>>,
@@ -159,24 +176,36 @@ impl RunEvent {
     }
 }
 
-/// The `RunIo` a `run_start` session uses: output/tokens become broadcast
-/// events any attached connection receives; a confirmation or an
-/// `ask_user` choice blocks on its own per-session channel that
-/// `run_confirm`/`run_answer_choice` (from any connection) feeds.
+/// The `RunIo` a `run_start` session uses: output/tokens become logged
+/// events any attached connection can replay (see `RunHandle::history`); a
+/// confirmation or an `ask_user` choice blocks on its own per-session
+/// channel that `run_confirm`/`run_answer_choice` (from any connection)
+/// feeds.
 struct ChannelIo {
-    events_tx: broadcast::Sender<RunEvent>,
+    events_tx: broadcast::Sender<()>,
+    history: Arc<StdMutex<Vec<RunEvent>>>,
     confirm_rx: AsyncMutex<mpsc::UnboundedReceiver<Decision>>,
     choice_rx: AsyncMutex<mpsc::UnboundedReceiver<Vec<String>>>,
     status: Arc<StdMutex<RunStatusSnapshot>>,
 }
 
+impl ChannelIo {
+    /// Append to the authoritative log, then ping any attached readers to
+    /// go check it -- see `RunHandle::history`'s doc comment for why the
+    /// event itself never travels over the broadcast channel.
+    fn push_event(&self, ev: RunEvent) {
+        self.history.lock().unwrap().push(ev);
+        let _ = self.events_tx.send(());
+    }
+}
+
 impl RunIo for ChannelIo {
     fn emit(&self, line: String) {
-        let _ = self.events_tx.send(RunEvent::Output(line));
+        self.push_event(RunEvent::Output(line));
     }
 
     fn on_token(&self, tok: &str) {
-        let _ = self.events_tx.send(RunEvent::Token(tok.to_string()));
+        self.push_event(RunEvent::Token(tok.to_string()));
     }
 
     fn note_checkpoint_id(&self, id: &str) {
@@ -189,7 +218,7 @@ impl RunIo for ChannelIo {
                 return Decision::Allow;
             }
             self.status.lock().unwrap().pending_confirm = Some(action.clone());
-            let _ = self.events_tx.send(RunEvent::ConfirmRequest(action));
+            self.push_event(RunEvent::ConfirmRequest(action));
             let mut rx = self.confirm_rx.lock().await;
             let decision = rx.recv().await.unwrap_or(Decision::Deny);
             self.status.lock().unwrap().pending_confirm = None;
@@ -200,7 +229,7 @@ impl RunIo for ChannelIo {
     fn ask_choice(&self, question: String, options: Vec<String>, multi_select: bool) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
         Box::pin(async move {
             self.status.lock().unwrap().pending_choice = Some((question.clone(), options.clone(), multi_select));
-            let _ = self.events_tx.send(RunEvent::AskChoice(question, options, multi_select));
+            self.push_event(RunEvent::AskChoice(question, options, multi_select));
             let mut rx = self.choice_rx.lock().await;
             let picked = rx.recv().await.unwrap_or_default();
             self.status.lock().unwrap().pending_choice = None;
@@ -209,23 +238,69 @@ impl RunIo for ChannelIo {
     }
 }
 
-/// Not a cryptographically hardened secret generator -- combines wall
-/// clock, process id, and a per-process counter through a plain hasher, no
-/// `rand` dependency. Matches this daemon's actual threat model: stopping
-/// an opportunistic/accidental hit on a `--tcp` port from doing anything,
-/// for a tool meant to bind `127.0.0.1`/a trusted LAN, not stand in for
-/// real auth on an internet-facing service.
+/// 256 bits from the OS CSPRNG (`getrandom` -- `/dev/urandom`,
+/// `getrandom(2)`, or the platform equivalent), hex-encoded. This used to
+/// be a `DefaultHasher` over wall clock + pid + a counter: not actually a
+/// secret, since `DefaultHasher` is a plain (non-cryptographic) hash with a
+/// fixed all-zero key, and every input feeding it was either guessable
+/// (pid, a process-local counter starting at 0) or coarse enough to
+/// brute-force (wall-clock time near a known daemon-start window) --
+/// someone who could narrow the startup window and pid range could search
+/// the effective keyspace directly instead of the nominal 128 bits it
+/// looked like. A real CSPRNG closes that regardless of how predictable
+/// the inputs around it are.
 fn generate_token() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut hasher = DefaultHasher::new();
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
-    // hash twice with a reseed so a 64-bit hash output doesn't feel this thin
-    let first = hasher.finish();
-    first.hash(&mut hasher);
-    format!("{:016x}{:016x}", first, hasher.finish())
+    let mut buf = [0u8; 32];
+    // `getrandom` failing at all means the OS's own randomness source is
+    // unavailable -- not a scenario to silently degrade out of by falling
+    // back to a weak source; better to fail the whole `grv serve --tcp`
+    // startup than hand out a token that isn't actually one.
+    getrandom::getrandom(&mut buf).expect("OS random source unavailable -- cannot generate a --tcp token");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Constant-time equality for comparing a client-supplied token against the
+/// real one -- `==` on `&str`/`&[u8]` short-circuits on the first
+/// mismatching byte, which leaks how many leading bytes were correct
+/// through response timing (the classic token/API-key timing side
+/// channel). This always walks every byte of the longer input regardless
+/// of where a mismatch first occurs. A length mismatch is checked (and
+/// returned) before that walk -- length isn't the secret here, the token
+/// *content* is, so branching on length alone doesn't leak anything
+/// meaningful.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_and_mismatches() {
+        assert!(constant_time_eq("abc123", "abc123"));
+        assert!(!constant_time_eq("abc123", "abc124"));
+        assert!(!constant_time_eq("abc123", "abc12"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn generated_tokens_are_real_random_64_hex_chars_and_dont_repeat() {
+        let a = generate_token();
+        let b = generate_token();
+        assert_eq!(a.len(), 64, "expected 32 bytes hex-encoded, got {a:?}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two real CSPRNG draws colliding would mean getrandom is broken, not just unlucky");
+    }
 }
 
 impl DaemonCtx {
@@ -357,6 +432,15 @@ where
         };
 
         if is_tcp && !token_ok(&ctx, &req.params) {
+            // A flat delay before responding to a wrong/missing token --
+            // cheap insurance against a scripted guesser hammering the
+            // port faster than a human would ever retry by hand. With a
+            // real 256-bit CSPRNG token (see `generate_token`) this isn't
+            // the thing standing between an attacker and the token, but it
+            // costs a legitimate caller nothing (a wrong token here is
+            // already a misconfiguration, not a normal-path event) and
+            // there's no reason to make brute-forcing free.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             let resp = json!({"jsonrpc": "2.0", "id": req.id, "error": {"code": -32001, "message": "missing or wrong params.token"}});
             if writer.write_all(format!("{resp}\n").as_bytes()).await.is_err() || writer.flush().await.is_err() {
                 break;
@@ -413,7 +497,10 @@ fn log_tool_call(name: &str, args: &Value) {
 fn token_ok(ctx: &DaemonCtx, params: &Value) -> bool {
     match &ctx.tcp_token {
         None => true, // shouldn't happen (serve() always sets one once --tcp is on), fail open only if it's genuinely unset
-        Some(expected) => params.get("token").and_then(|v| v.as_str()) == Some(expected.as_str()),
+        Some(expected) => match params.get("token").and_then(|v| v.as_str()) {
+            Some(got) => constant_time_eq(got, expected),
+            None => false,
+        },
     }
 }
 
@@ -531,11 +618,24 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> std
 }
 
 /// `run_attach {session_id}`: acks once (so the caller knows it's
-/// subscribed), then streams that session's `RunEvent`s as `run_event`
-/// notifications until a `Done` event or the connection drops. Multiple
-/// connections can attach to the same session (each gets its own
-/// `broadcast::Receiver`); a late attach only sees events from then on --
-/// `run_status` is how a client finds out what already happened.
+/// subscribed), then replays that session's **entire** `RunEvent` history
+/// from `run_start` onward as `run_event` notifications, before continuing
+/// live until a `Done` event or the connection drops. Multiple connections
+/// can attach to the same session, independently, each getting the full
+/// replay + live tail regardless of when it attaches.
+///
+/// The trick that makes a full, race-free replay simple: `history` (see
+/// `RunHandle`) is the one authoritative, ordered log, and the broadcast
+/// channel carries no payload at all -- just a "go check `history` again"
+/// ping. That means there is no way to miss content here: a wake-up that
+/// never arrives, arrives late, or collapses several pushes into one
+/// (`Lagged`) all have the exact same recovery, "re-read `history` from
+/// `next_idx`", so none of them can lose an event. This replaces the old
+/// per-field catch-up hack (separately special-casing an already-pending
+/// confirm, an already-pending `ask_user` question, and an already-finished
+/// run) with one mechanism that covers all of those *and* every ordinary
+/// `Output`/`Token` line emitted before this attach — the actual gap named
+/// in the roadmap.
 async fn handle_run_attach<W: AsyncWrite + Unpin>(ctx: &DaemonCtx, req: &RpcRequest, writer: &mut W) -> std::io::Result<()> {
     let Some(session_id) = req.params.get("session_id").and_then(|v| v.as_str()).map(str::to_string) else {
         return write_line(writer, &json!({"jsonrpc":"2.0","id":req.id,"error":{"code":-32000,"message":"missing 'session_id'"}})).await;
@@ -546,46 +646,52 @@ async fn handle_run_attach<W: AsyncWrite + Unpin>(ctx: &DaemonCtx, req: &RpcRequ
     };
     write_line(writer, &json!({"jsonrpc":"2.0","id":req.id,"result":"attached"})).await?;
 
-    // Subscribe *before* checking the snapshot below, so an event that
-    // fires in between is still seen live (not missed, not double-sent
-    // for real -- the synthesized catch-ups below only fire for state
-    // that was already true before this subscribe existed).
-    let mut rx = handle.events_tx.subscribe();
-    {
-        let snapshot = handle.status.lock().unwrap().clone();
-        // A confirmation was already pending before we attached -- its
-        // `ConfirmRequest` broadcast went out before our receiver existed,
-        // so replay it from the snapshot or this attach would wait
-        // forever for an event that already happened.
-        if let Some(action) = snapshot.pending_confirm {
-            write_line(writer, &RunEvent::ConfirmRequest(action).to_notification(&session_id)).await?;
+    // Subscribe *before* draining history, same race-safety reasoning as
+    // before: any event pushed between this subscribe and the first drain
+    // below still triggers a ping we'll see, so it gets picked up by
+    // either this initial drain or the next loop iteration -- never lost,
+    // and the index-based drain below makes a double-send impossible too.
+    let mut wake_rx = handle.events_tx.subscribe();
+    let mut next_idx = 0usize;
+    loop {
+        let batch: Vec<RunEvent> = {
+            let history = handle.history.lock().unwrap();
+            history[next_idx..].to_vec()
+        };
+        let mut finished = false;
+        for event in batch {
+            let done = matches!(event, RunEvent::Done { .. });
+            write_line(writer, &event.to_notification(&session_id)).await?;
+            next_idx += 1;
+            if done {
+                finished = true;
+            }
         }
-        // Same idea for an ask_user question already waiting on an answer.
-        if let Some((question, options, multi_select)) = snapshot.pending_choice {
-            write_line(writer, &RunEvent::AskChoice(question, options, multi_select).to_notification(&session_id)).await?;
-        }
-        // Same idea if the run already finished before we attached.
-        if !snapshot.running {
-            let ok = snapshot.finished_ok.unwrap_or(false);
-            let message = snapshot.finished_message.unwrap_or_default();
-            write_line(writer, &RunEvent::Done { ok, message }.to_notification(&session_id)).await?;
+        if finished {
             return Ok(());
         }
-    }
-    loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let done = matches!(event, RunEvent::Done { .. });
-                write_line(writer, &event.to_notification(&session_id)).await?;
-                if done {
-                    return Ok(());
+        match wake_rx.recv().await {
+            // A real ping, or a `Lagged` (we missed some pings) -- either
+            // way just loop back and re-drain `history` from `next_idx`,
+            // which is always correct regardless of how many wake-ups
+            // were coalesced or missed.
+            Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            // The sender side is gone, meaning `run_start`'s task itself
+            // was dropped without ever pushing a `Done` (shouldn't happen
+            // in practice -- its epilogue always pushes one -- but a
+            // final drain here means a bug there degrades to "attach
+            // returns slightly early" instead of "silently loses the
+            // session's last events").
+            Err(broadcast::error::RecvError::Closed) => {
+                let batch: Vec<RunEvent> = {
+                    let history = handle.history.lock().unwrap();
+                    history[next_idx..].to_vec()
+                };
+                for event in batch {
+                    write_line(writer, &event.to_notification(&session_id)).await?;
                 }
+                return Ok(());
             }
-            // Fell behind the broadcast buffer under heavy output -- keep
-            // going with whatever's next rather than disconnecting; a
-            // `run_status` call fills in anything this attach missed.
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
         }
     }
 }
@@ -691,21 +797,23 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
                 .unwrap_or_default();
 
             let session_id = generate_token()[..12].to_string();
-            let (events_tx, _) = broadcast::channel::<RunEvent>(1024);
+            let (events_tx, _) = broadcast::channel::<()>(1024);
             let (confirm_tx, confirm_rx) = mpsc::unbounded_channel::<Decision>();
             let (choice_tx, choice_rx) = mpsc::unbounded_channel::<Vec<String>>();
             let status = Arc::new(StdMutex::new(RunStatusSnapshot { running: true, ..Default::default() }));
+            let history = Arc::new(StdMutex::new(Vec::<RunEvent>::new()));
             let io: Arc<dyn RunIo> = Arc::new(ChannelIo {
                 events_tx: events_tx.clone(),
+                history: history.clone(),
                 confirm_rx: AsyncMutex::new(confirm_rx),
                 choice_rx: AsyncMutex::new(choice_rx),
                 status: status.clone(),
             });
 
-            ctx.runs
-                .lock()
-                .await
-                .insert(session_id.clone(), RunHandle { events_tx: events_tx.clone(), confirm_tx, choice_tx, status: status.clone() });
+            ctx.runs.lock().await.insert(
+                session_id.clone(),
+                RunHandle { events_tx: events_tx.clone(), history: history.clone(), confirm_tx, choice_tx, status: status.clone() },
+            );
 
             let cfg_owned = ctx.cfg.clone();
             let root_owned = ctx.root.clone();
@@ -737,7 +845,8 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
                     st.finished_ok = Some(ok);
                     st.finished_message = Some(message.clone());
                 }
-                let _ = events_tx.send(RunEvent::Done { ok, message });
+                history.lock().unwrap().push(RunEvent::Done { ok, message });
+                let _ = events_tx.send(());
             });
 
             Ok(json!({"session_id": session_id}))

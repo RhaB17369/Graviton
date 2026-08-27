@@ -343,8 +343,18 @@ pub fn extract_calls(content: &str, language: Lang) -> Vec<CallSite> {
     let mut out = Vec::new();
     let mut cursor = QueryCursor::new();
     let bytes = content.as_bytes();
+    // Same predicate-enforcement need as `extract_symbols` -- see its
+    // comment. Elixir/Racket/Scheme/Asm's call queries use `#not-any-of?`/
+    // `#any-of?` to exclude definition keywords or restrict to actual
+    // control-flow mnemonics, which is inert without this.
+    let mut pred_buf1 = Vec::new();
+    let mut pred_buf2 = Vec::new();
+    let mut bytes_provider = bytes;
     let mut matches = cursor.matches(&query, tree.root_node(), bytes);
     while let Some(m) = matches.next() {
+        if !m.satisfies_text_predicates(&query, &mut pred_buf1, &mut pred_buf2, &mut bytes_provider) {
+            continue;
+        }
         let mut callee_text = None;
         let mut call_node = None;
         for cap in m.captures {
