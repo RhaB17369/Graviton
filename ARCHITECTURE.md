@@ -198,7 +198,7 @@ kind, name, parent, line }`) instead of being a bare label:
   resolved `use`/`import` naming exactly this definition's file (see
   "Import resolution" below) — genuine resolution via an actual import
   statement, not a co-location heuristic. Only produced for the languages
-  with an import resolver (31 languages as of this writing — see "Import
+  with an import resolver (47 languages as of this writing — see "Import
   resolution" below for the full list).
 - `Ambiguous(Vec<DefinitionRef>)` — multiple same-named definitions exist,
   none local, and either this language has no import resolver yet or none
@@ -342,29 +342,115 @@ Resolution reuses two generic functions rather than one per language:
   Python's `from X import a, b`), with `exposing (..)` treated as the
   wildcard case.
 
-**Deliberately not attempted**, named rather than silently skipped:
-D/Haskell/Julia's plain (non-`qualified`) import brings a whole module's
+**D/Haskell/Julia's whole-module-unqualified-exposure gap, since solved**:
+a plain (non-`qualified`) import in these three brings a whole module's
 exports into *unqualified* scope — semantically closer to a wildcard than
-to Java's "import one class", and different enough that reusing
+to Java's "import one class". The original mistake would have been reusing
 `resolve_dotted_module`'s "last segment is the imported name" assumption
-would produce a confidently wrong signal (the module's own name is rarely
-a callable) without a way to tell the `qualified`/aliased form apart from
-the plain one yet. Left unresolved rather than guessed, consistent with
-every other honest gap in this section. The remaining ~15 parsed languages
-without an import resolver at all (Elixir, Erlang, Perl, Nim, OCaml,
-Fortran, VHDL, Prolog, Scheme, Crystal, Lua, Zig, PowerShell, LaTeX, Dart,
-PHP, Ada) are future work, not attempted this batch.
+as-is, which — for a plain, unqualified import — produces a confidently
+wrong signal (the module's own name is rarely a callable). The actual fix
+was a `wildcard_is_package_directory: bool` parameter on
+`resolve_dotted_module` itself, not a bespoke resolver per language: for a
+*package* language (Java/Kotlin/Groovy/Scala, where `a.b` genuinely names
+a directory that can hold many files), a wildcard resolves to every
+same-extension file in that directory via `files_by_dir` — the existing
+behavior. For a *module* language (Haskell/D/Julia/Elm — one module maps
+to exactly one file, full stop, there is no package directory), a
+wildcard instead resolves to that SAME single file a plain import of it
+would, via the identical `<root>/a/b/C.<ext>` lookup — looking up `a/b` as
+a directory would be wrong here (it usually doesn't even exist, and a
+module's sibling files in the same directory are never part of what its
+wildcard exposes). Extraction still had to distinguish each language's own
+qualified/selective/hiding forms precisely (Haskell's `qualified` keyword
+and `hiding` clause, D's `import_bind`/`imported`-wrapper shape verified
+via a real parse-tree dump, Julia's `using` vs `import` and `selected_import`
+clause) rather than guess — see `haskell_import`/`d_import`/`julia_import`'s
+own doc comments in `imports.rs` for the exact per-language rules.
+
+**A retroactively-caught regression, found while designing the fix
+above, not user-reported**: Elm's own `exposing (..)` had been wired as a
+Java-style package wildcard (a directory listing) before this batch,
+which is exactly the same mistake D/Haskell/Julia would have made —
+Elm modules are one-per-file too. Fixed the same way, by passing
+`wildcard_is_package_directory: false` for Elm as well and removing the
+now-unneeded `elm_files_by_dir` directory index; locked in by
+`elm_exposing_all_resolves_to_its_own_file_only_not_a_directory_listing`.
+
+**14 more languages** got real import extraction + resolution in the
+follow-up batch after that: Erlang, Zig, PHP, LaTeX, Dart, Scheme, and
+PowerShell are quoted/relative-literal paths, resolved the same way as the
+C-family group above via `resolve_relative_literal` (PowerShell's fix
+doubled as a real extraction bug fix — see below). Lua's `require("a.b")`
+reuses `resolve_dotted_module` with its wildcard form disabled (Lua's
+`package.path` convention has no wildcard). Ada, OCaml, Perl, Fortran, and
+Elixir each needed a genuinely different small dedicated resolver, since
+none of their naming conventions fit either generic function:
+`resolve_ada` (GNAT's convention: the *whole* dotted name is dash-joined
+and lowercased into one flat filename — `My_Pkg.Child` → `my_pkg-child.ads`
+— not slash-nested into a directory the way Java's is), `resolve_ocaml`
+(only the outermost dotted segment is a real compilation unit —
+`open Base.List` resolves via `base.ml`'s lowercased name only; a
+sub-module named after the first dot lives inside that same file and is
+honestly left unresolved-past-the-first-segment rather than guessed at),
+`resolve_perl` (CPAN's `::` → `/` convention under `lib/`, structurally
+identical to `resolve_dotted_module` but keyed on a two-character
+separator that function's `split('.')` can't express), `resolve_fortran_module`
+(a flat filename guess against a handful of real extensions — Fortran, unlike
+every other language here, has no standardized module-to-file convention
+at all, so `include`'s real relative-literal path is tried first and this
+is only a fallback), and `resolve_elixir` (Mix's CamelCase-per-segment →
+snake_case-per-segment convention under `lib/`, via a small `camel_to_snake`
+helper that only inserts an underscore at a real word boundary so an
+acronym like `HTTPServer` still splits as `http_server`, not
+`h_t_t_p_server`).
+
+Two real extraction bugs surfaced and were fixed during this batch, both
+found by checking a real parse-tree dump rather than trusting the first
+plausible-looking grammar shape:
+
+- **Elixir**: `find_nodes` stops descending once it finds a match of the
+  target kind — correct for `use_declaration`/`import_statement`, which
+  never nest inside themselves, but wrong for Elixir's `call` node, since
+  `defmodule Foo do ... end` is *itself* a `call` (target `defmodule`)
+  whose `do_block` can contain more `call`s for `alias`/`import`/`require`/
+  `use`. The outer match was found and recursion stopped right there,
+  silently missing every import inside every module. Fixed with a new
+  `find_nodes_nested` helper that keeps descending into a match instead of
+  stopping at it, used only where nesting is real (Elixir).
+- **PowerShell**: the `Import-Module ./x` extraction path picked the FIRST
+  named child of `command_elements` as the argument — which is actually
+  a `command_argument_sep` separator token, not the `generic_token` path
+  that follows it (confirmed via a real parse-tree dump). Fixed to skip
+  separator tokens when looking for the argument. The dot-source form
+  (`. .\file.ps1`) was unaffected — it reads a different field.
+
+**Only 4 parsed languages have no import resolver at all now**, each with
+a specific, verified reason rather than "not gotten to yet": Nim
+(tree-sitter-nim 0.1.0 has no import/include-related node type in its
+grammar at all — nothing to hook extraction onto), VHDL (no reliable
+package-to-file naming convention exists to resolve against, unlike every
+language above), Prolog (directive shape too uncertain to encode safely
+from this project's investigation), and Crystal (confirmed via a real
+parse-tree dump that tree-sitter-crystal 0.1.0 doesn't parse
+`require "..."` — with or without parentheses — as a call/macro-invocation
+node at all; it splits into two unrelated `expression_statement` nodes, so
+there's no node shape to extract from in the first place, the same
+category of gap as Nim's, not a shape this project got wrong).
 
 Verified per-language against real samples (`imports.rs`'s `tests` module —
-22 tests, one or more per language/family), plus end-to-end resolution
+38 tests, one or more per language/family), plus end-to-end resolution
 integration tests through `index_repo` for a representative case of each
-resolver mechanism (`lib.rs`'s `index_repo_tests`: a real C `#include`
-resolving to a local header while a system header stays unrecorded, a
-real cross-file Java import resolving via a conventional Maven source
-root, and a Java wildcard import resolving to every file in its package
-directory) — plus a live dogfood against a real synthetic multi-language
-scratch repo (Java cross-file class import, C local-header include, and a
-Bash `source` all resolving correctly through the actual `grv` binary, not
+resolver mechanism (`lib.rs`'s `index_repo_tests`, 155 tests total in that
+crate: a real C `#include` resolving to a local header while a system
+header stays unrecorded, a real cross-file Java import resolving via a
+conventional Maven source root, a Java wildcard import resolving to every
+file in its package directory, the D/Haskell/Julia/Elm
+`wildcard_is_package_directory` fix, and one representative case each for
+Ada, OCaml, Perl, Fortran, Elixir, Lua, Dart, Scheme, and PowerShell from
+the newest batch) — plus a live dogfood against real synthetic
+multi-language scratch repos (Java cross-file class import, C
+local-header include, a Bash `source`, an Elixir `alias`, and an Ada
+`with` clause all resolving correctly through the actual `grv` binary, not
 just Rust unit tests).
 
 A real bug this project's own dogfooding against its own repo caught
@@ -480,7 +566,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.19)
+## Language coverage (v0.20)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its

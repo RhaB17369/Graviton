@@ -36,6 +36,46 @@
 //!   path (`go.mod`'s `module` line) plus the repo's directory tree.
 //!   Unlike the others, a Go import names a *package* (a directory), so
 //!   resolution can legitimately produce several files, not one.
+//! - **C/C++/ObjC/GLSL/HLSL/Vim/Proto/Solidity/Verilog/Nix/Bash/Fish/Ruby/
+//!   R/Racket/CMake/Erlang/Zig/PHP/LaTeX/Dart/Scheme/PowerShell**: quoted/
+//!   relative-literal paths, resolved against the importing file's own
+//!   directory via `resolve_relative_literal` -- the same shape as C's
+//!   `#include "x"`.
+//! - **Java/Kotlin/Groovy/Scala/C#/Elm/Haskell/D/Julia**: hierarchical
+//!   dotted module names, resolved via `resolve_dotted_module` against
+//!   conventional source roots. The JVM family (plus a wildcard-disabled
+//!   C#) are real *package* languages, where `a.b.*` genuinely means
+//!   "every file in directory a/b" (`wildcard_is_package_directory:
+//!   true`). Elm/Haskell/D/Julia map exactly one module to one file --
+//!   there is no package directory at all, so their wildcard/unqualified/
+//!   `exposing (..)`/`hiding`/aliased forms all resolve to that SAME one
+//!   file a plain import would (`wildcard_is_package_directory: false`);
+//!   getting this backwards for Elm once produced a confidently wrong
+//!   directory listing, which is the mistake this flag exists to prevent
+//!   from recurring for any future module-per-file language.
+//! - **Lua**: `require("a.b")` -> `a/b.lua`, the same dotted-to-slash shape
+//!   as the module languages above (via `resolve_dotted_module` with its
+//!   wildcard form disabled, since Lua has none).
+//! - **Ada, OCaml, Perl, Fortran, Elixir**: each has its own genuinely
+//!   different file-naming convention that doesn't fit the two generic
+//!   resolvers above, so each gets a small dedicated function --
+//!   `resolve_ada` (GNAT's dash-joined-lowercase flat naming), `resolve_ocaml`
+//!   (single-lowercase-segment, sub-modules-in-the-same-file left
+//!   unresolved-past-the-first-segment rather than guessed at),
+//!   `resolve_perl` (`::`-separated, `lib`-rooted, same shape as
+//!   `resolve_dotted_module` but keyed on a two-character separator),
+//!   `resolve_fortran_module` (a flat filename guess -- Fortran has no
+//!   real module-to-file convention at all), `resolve_elixir` (Mix's
+//!   CamelCase-per-segment -> snake_case-per-segment convention under
+//!   `lib/`). See each function's own doc for the specific reasoning.
+//! - **Not resolved, with reasons rather than silence**: Nim (the grammar
+//!   has no import-related node at all to extract from), VHDL (no
+//!   reliable package-to-file naming convention exists to resolve
+//!   against), Prolog (directive shape too uncertain to encode safely),
+//!   and Crystal (confirmed via a real parse-tree dump that
+//!   tree-sitter-crystal 0.1.0 doesn't parse `require "..."` as a call/
+//!   macro-invocation node at all, so there's no extraction to resolve in
+//!   the first place).
 //!
 //! An import that doesn't resolve to anything is exactly as informative as
 //! one that does: it means "not indexed" (an external dependency, the
@@ -386,18 +426,29 @@ fn conventional_roots(all_paths: &HashSet<String>, conventional: &[&str]) -> Vec
     roots
 }
 
-/// Generic resolver for a hierarchical/dotted module-name language where
-/// each import names one specific class/type as its last segment (Java,
-/// Kotlin, Groovy, Scala, C#) -- `a.b.C` tried as `<root>/a/b/C.<ext>`
-/// against each candidate root. `a.b.*` (or `a.b._` for Scala, via
-/// `wildcard_char`) is a whole-package wildcard, resolved to every
-/// same-extension file directly in that directory instead (`files_by_dir`)
-/// -- the same multi-file honesty as Go's package-level resolution.
-/// `wildcard_char` of `'\0'` disables wildcard detection for a language
-/// that has none (C#) or whose "whole module" semantics this project
-/// deliberately doesn't model as a wildcard (see `extract_imports`'s
-/// D/Haskell/Julia omission).
-fn resolve_dotted_module(raw_path: &str, wildcard_char: char, ext: &str, roots: &[Vec<String>], files_by_dir: &HashMap<Vec<String>, Vec<String>>, all_paths: &HashSet<String>) -> Vec<String> {
+/// Generic resolver for a hierarchical/dotted module-name language --
+/// `a.b.C` tried as `<root>/a/b/C.<ext>` against each candidate root.
+/// `wildcard_char` of `'\0'` disables wildcard detection entirely (C#,
+/// which has no wildcard `using`).
+///
+/// `wildcard_is_package_directory` is the real distinction this project
+/// initially got wrong for Elm and had to fix: for a *package* language
+/// (Java/Kotlin/Groovy/Scala, where `a.b` genuinely names a directory that
+/// can hold many files), a wildcard (`a.b.*`, `a.b._`) resolves to every
+/// same-extension file in that directory (`files_by_dir`) -- the same
+/// multi-file honesty as Go. For a *module* language (Haskell/D/Julia/Elm,
+/// where the dotted path names exactly ONE file, one module per file,
+/// full stop -- there is no "package directory" at all), a wildcard
+/// resolves to that SAME single file a plain import of it would, via the
+/// exact same `<root>/a/b/C.<ext>` lookup -- looking up `a/b` as a
+/// directory would be wrong here (it usually doesn't even exist; `a.b`'s
+/// sibling modules living in the same directory, like `Data/Map.hs` next
+/// to `Data/List.hs`, are NOT part of what a `Data.List` wildcard exposes).
+/// The wildcard marker only still matters for `is_wildcard` itself (read
+/// separately from `imports.is_wildcard` by `callgraph::find_callers` to
+/// decide whether this import corroborates an arbitrary call) -- it does
+/// not change which file gets resolved when this flag is false.
+fn resolve_dotted_module(raw_path: &str, wildcard_char: char, ext: &str, roots: &[Vec<String>], files_by_dir: &HashMap<Vec<String>, Vec<String>>, wildcard_is_package_directory: bool, all_paths: &HashSet<String>) -> Vec<String> {
     let wildcard_suffix = if wildcard_char == '\0' { None } else { Some(format!(".{wildcard_char}")) };
     let (clean, is_wildcard) = match &wildcard_suffix {
         Some(suffix) => match raw_path.strip_suffix(suffix.as_str()) {
@@ -414,12 +465,180 @@ fn resolve_dotted_module(raw_path: &str, wildcard_char: char, ext: &str, roots: 
     for root in roots {
         let mut dir = root.clone();
         dir.extend(segs.iter().map(|s| s.to_string()));
-        if is_wildcard {
+        if is_wildcard && wildcard_is_package_directory {
             if let Some(files) = files_by_dir.get(&dir) {
                 out.extend(files.iter().cloned());
             }
         } else {
             let file = format!("{}.{}", segs_to_path(&dir), ext);
+            if all_paths.contains(&file) {
+                out.push(file);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// GNAT's Ada file-naming convention: a `with`-ed unit `Parent.Child` maps
+/// to `parent-child.ads`/`.adb` -- lowercased, and (unlike every
+/// slash-nested hierarchical resolver above) the `.` separator becomes a
+/// literal `-` in the FILENAME itself, not a directory nesting level; Ada
+/// units are conventionally flat inside one source directory regardless of
+/// how deep their dotted name is. Existing underscores inside a segment
+/// (`Text_IO`) are real identifier characters and stay untouched.
+fn resolve_ada(raw_path: &str, roots: &[Vec<String>], all_paths: &HashSet<String>) -> Vec<String> {
+    if raw_path.is_empty() {
+        return Vec::new();
+    }
+    let dashed = raw_path.to_lowercase().replace('.', "-");
+    let mut out = Vec::new();
+    for root in roots {
+        let mut dir = root.clone();
+        dir.push(dashed.clone());
+        let base = segs_to_path(&dir);
+        for ext in ["ads", "adb"] {
+            let file = format!("{base}.{ext}");
+            if all_paths.contains(&file) {
+                out.push(file);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// OCaml's `open Module`/`open Module.Sub`: only the FIRST (outermost)
+/// dotted segment is a real compilation unit that maps to a file
+/// (`module_name.ml`/`.mli`, lowercased -- OCaml's own compiler-enforced
+/// convention, not a guess); anything after the first dot names a
+/// sub-module declared *inside* that same file (or re-exported through a
+/// wrapping library, e.g. `Base.List`), which this path-based resolver has
+/// no way to look inside a file for -- so a multi-segment `open` still
+/// resolves to its outermost unit's file, honestly approximate rather than
+/// silently wrong about which file, at least.
+fn resolve_ocaml(raw_path: &str, roots: &[Vec<String>], all_paths: &HashSet<String>) -> Vec<String> {
+    let clean = raw_path.strip_suffix(".*").unwrap_or(raw_path);
+    let Some(first) = clean.split('.').next().filter(|s| !s.is_empty()) else { return Vec::new() };
+    let lower = first.to_lowercase();
+    let mut out = Vec::new();
+    for root in roots {
+        let mut dir = root.clone();
+        dir.push(lower.clone());
+        let base = segs_to_path(&dir);
+        for ext in ["ml", "mli"] {
+            let file = format!("{base}.{ext}");
+            if all_paths.contains(&file) {
+                out.push(file);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Perl's `use Foo::Bar;` -- CPAN's own `::` -> `/` directory convention
+/// (`Foo::Bar` lives at `lib/Foo/Bar.pm`), the same shape as
+/// `resolve_dotted_module` but keyed on a two-character separator that
+/// function's single-`char` `split('.')` can't express, so it gets its own
+/// small, honest duplicate rather than a generalized separator parameter
+/// bent to fit one outlier.
+fn resolve_perl(raw_path: &str, roots: &[Vec<String>], all_paths: &HashSet<String>) -> Vec<String> {
+    let clean = raw_path.strip_suffix(".*").unwrap_or(raw_path);
+    let segs: Vec<&str> = clean.split("::").filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for root in roots {
+        let mut dir = root.clone();
+        dir.extend(segs.iter().map(|s| s.to_string()));
+        let file = format!("{}.pm", segs_to_path(&dir));
+        if all_paths.contains(&file) {
+            out.push(file);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Fortran's `use module_name` names a *module*, not a file, and unlike
+/// every other module-name language here there is no standardized
+/// module-to-filename convention at all (no classpath, no GNAT naming
+/// rule) -- so this is an honest flat guess: try the module name directly
+/// as a filename (both as written and lowercased, since `gfortran`
+/// doesn't care about case but real repos are inconsistent about it) against
+/// a handful of real Fortran source extensions, no directory nesting.
+fn resolve_fortran_module(module_name: &str, roots: &[Vec<String>], all_paths: &HashSet<String>) -> Vec<String> {
+    if module_name.is_empty() {
+        return Vec::new();
+    }
+    let lower = module_name.to_lowercase();
+    let mut out = Vec::new();
+    for root in roots {
+        for name in [module_name, lower.as_str()] {
+            let mut dir = root.clone();
+            dir.push(name.to_string());
+            let base = segs_to_path(&dir);
+            for ext in ["f90", "f95", "f03", "f08", "f", "for", "F90", "F95", "F"] {
+                let file = format!("{base}.{ext}");
+                if all_paths.contains(&file) {
+                    out.push(file);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `MyModule` -> `my_module`, Elixir/Mix's own convention for mapping a
+/// CamelCase module segment to its snake_case file/directory name. Inserts
+/// an underscore before an uppercase letter only when it sits at a real
+/// word boundary (preceded or followed by a lowercase letter) so a run of
+/// capitals from an acronym (`HTTPServer`) still splits sensibly
+/// (`http_server`) instead of `h_t_t_p_server`.
+fn camel_to_snake(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() {
+            let prev_lower = i > 0 && chars[i - 1].is_lowercase();
+            let next_lower = i + 1 < chars.len() && chars[i + 1].is_lowercase();
+            if i > 0 && (prev_lower || next_lower) {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Elixir/Mix's `alias`/`import`/`require`/`use Foo.Bar` -> `lib/foo/bar.ex`:
+/// each dotted CamelCase segment becomes its own snake_case path segment
+/// (via `camel_to_snake`), joined by `/` under the conventional `lib`
+/// source root -- Mix's real, standardized module-to-file convention (not
+/// a guess the way Fortran's has to be).
+fn resolve_elixir(raw_path: &str, roots: &[Vec<String>], all_paths: &HashSet<String>) -> Vec<String> {
+    let clean = raw_path.strip_suffix(".*").unwrap_or(raw_path);
+    let segs: Vec<String> = clean.split('.').filter(|s| !s.is_empty()).map(camel_to_snake).collect();
+    if segs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for root in roots {
+        let mut dir = root.clone();
+        dir.extend(segs.iter().cloned());
+        let base = segs_to_path(&dir);
+        for ext in ["ex", "exs"] {
+            let file = format!("{base}.{ext}");
             if all_paths.contains(&file) {
                 out.push(file);
             }
@@ -498,8 +717,16 @@ pub fn resolve_all_imports(conn: &Connection, root: &Path) -> Result<usize> {
     let scala_files_by_dir = files_by_dir_for_ext(&all_paths, "scala");
     let jvm_roots = conventional_roots(&all_paths, &["src/main/java", "src/test/java", "src/main/kotlin", "src/test/kotlin", "src/main/scala", "src/main/groovy", "src"]);
     let elm_roots = conventional_roots(&all_paths, &["src"]);
-    let elm_files_by_dir = files_by_dir_for_ext(&all_paths, "elm");
     let csharp_roots = conventional_roots(&all_paths, &["src"]);
+    let haskell_roots = conventional_roots(&all_paths, &["src", "app", "lib"]);
+    let d_roots = conventional_roots(&all_paths, &["source", "src"]);
+    let julia_roots = conventional_roots(&all_paths, &["src"]);
+    let ada_roots = conventional_roots(&all_paths, &["src", "source"]);
+    let ocaml_roots = conventional_roots(&all_paths, &["src", "lib"]);
+    let perl_roots = conventional_roots(&all_paths, &["lib"]);
+    let fortran_roots = conventional_roots(&all_paths, &["src"]);
+    let elixir_roots = conventional_roots(&all_paths, &["lib"]);
+    let lua_roots = conventional_roots(&all_paths, &["lua", "src"]);
 
     let imports: Vec<(i64, i64, String, Option<String>, Option<String>)> = {
         let mut stmt = conn.prepare("SELECT id, file_id, raw_path, imported_name, module_prefix FROM imports")?;
@@ -542,22 +769,70 @@ pub fn resolve_all_imports(conn: &Connection, root: &Path) -> Result<usize> {
             // resolver can't usefully turn into "a file" -- it just stays
             // unresolved, correctly, rather than guessed at.
             "cmake" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &[]),
-            // JVM-family: one specific class/type per import, resolved
-            // against conventional Maven/Gradle source roots plus the
-            // generic repo-root/immediate-subdirectory fallback every
+            // JVM-family: real multi-file *packages* -- `a.b` is a
+            // directory that can hold many files, so a wildcard resolves
+            // to every file in it (`wildcard_is_package_directory: true`).
+            // Resolved against conventional Maven/Gradle source roots plus
+            // the generic repo-root/immediate-subdirectory fallback every
             // hierarchical resolver here uses.
-            "java" => resolve_dotted_module(&raw_path, '*', "java", &jvm_roots, &java_files_by_dir, &all_paths),
-            "kotlin" => resolve_dotted_module(&raw_path, '*', "kt", &jvm_roots, &kotlin_files_by_dir, &all_paths),
-            "groovy" => resolve_dotted_module(&raw_path, '*', "groovy", &jvm_roots, &groovy_files_by_dir, &all_paths),
-            "scala" => resolve_dotted_module(&raw_path, '_', "scala", &jvm_roots, &scala_files_by_dir, &all_paths),
+            "java" => resolve_dotted_module(&raw_path, '*', "java", &jvm_roots, &java_files_by_dir, true, &all_paths),
+            "kotlin" => resolve_dotted_module(&raw_path, '*', "kt", &jvm_roots, &kotlin_files_by_dir, true, &all_paths),
+            "groovy" => resolve_dotted_module(&raw_path, '*', "groovy", &jvm_roots, &groovy_files_by_dir, true, &all_paths),
+            "scala" => resolve_dotted_module(&raw_path, '_', "scala", &jvm_roots, &scala_files_by_dir, true, &all_paths),
             // C# has no wildcard `using` and namespaces don't reliably
             // mirror directory structure the way Java's package
-            // convention does -- still attempted, just lower-confidence,
-            // hence no dedicated `files_by_dir` (a C# wildcard can't occur
-            // anyway) and the generic root list rather than a JVM-specific
-            // one.
-            "csharp" => resolve_dotted_module(&raw_path, '\0', "cs", &csharp_roots, &HashMap::new(), &all_paths),
-            "elm" => resolve_dotted_module(&raw_path, '*', "elm", &elm_roots, &elm_files_by_dir, &all_paths),
+            // convention does -- still attempted, just lower-confidence.
+            "csharp" => resolve_dotted_module(&raw_path, '\0', "cs", &csharp_roots, &HashMap::new(), false, &all_paths),
+            // Elm/Haskell/D/Julia: one MODULE per file, not a package
+            // directory -- `wildcard_is_package_directory: false` means a
+            // wildcard/`exposing (..)`/unqualified-whole-module import
+            // still resolves to that one file, never a directory listing
+            // (an earlier version of this resolver got Elm's case wrong
+            // this same way -- see `resolve_dotted_module`'s doc).
+            "elm" => resolve_dotted_module(&raw_path, '*', "elm", &elm_roots, &HashMap::new(), false, &all_paths),
+            "haskell" => resolve_dotted_module(&raw_path, '*', "hs", &haskell_roots, &HashMap::new(), false, &all_paths),
+            "d" => resolve_dotted_module(&raw_path, '*', "d", &d_roots, &HashMap::new(), false, &all_paths),
+            "julia" => resolve_dotted_module(&raw_path, '*', "jl", &julia_roots, &HashMap::new(), false, &all_paths),
+            // Quoted/relative-literal-path languages, same family as the
+            // C/vim/bash group above.
+            "erlang" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["hrl"]),
+            "zig" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["zig"]),
+            "php" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["php"]),
+            "latex" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["tex"]),
+            "dart" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["dart"]),
+            "scheme" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["scm", "ss"]),
+            "powershell" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["ps1", "psm1"]),
+            // Dedicated per-language naming conventions -- see each
+            // resolver's own doc for why it can't just be another
+            // `resolve_dotted_module`/`resolve_relative_literal` call.
+            "ada" => resolve_ada(&raw_path, &ada_roots, &all_paths),
+            "ocaml" => resolve_ocaml(&raw_path, &ocaml_roots, &all_paths),
+            "perl" => resolve_perl(&raw_path, &perl_roots, &all_paths),
+            "elixir" => resolve_elixir(&raw_path, &elixir_roots, &all_paths),
+            // Fortran's `include 'x.inc'` is a real relative-literal path;
+            // its `use module_name` is a bare module name with no
+            // standardized file convention at all, so it's tried as a
+            // relative-literal path first (cheap, and correct on the rare
+            // repo that names files after modules verbatim) and only
+            // falls back to the flat module-name guess when that comes up
+            // empty.
+            "fortran" => {
+                let literal = resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["inc"]);
+                if literal.is_empty() {
+                    // A plain `use module_name` (no `only:` clause) carries
+                    // a trailing `.*` wildcard marker, same convention as
+                    // Haskell/D/Elixir -- strip it before treating the rest
+                    // as the module's own name.
+                    let module_name = raw_path.strip_suffix(".*").unwrap_or(&raw_path);
+                    resolve_fortran_module(module_name, &fortran_roots, &all_paths)
+                } else {
+                    literal
+                }
+            }
+            // Lua's `require("a.b")` -> `a/b.lua` via `package.path`'s dot
+            // -> slash convention; no wildcard form exists, so the
+            // wildcard char is disabled the same way C#'s is.
+            "lua" => resolve_dotted_module(&raw_path, '\0', "lua", &lua_roots, &HashMap::new(), false, &all_paths),
             _ => Vec::new(),
         };
         for p in resolved_paths {

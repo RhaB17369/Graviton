@@ -93,21 +93,48 @@ pub fn extract_imports(content: &str, language: Lang) -> Vec<ImportEdge> {
         Lang::CSharp => query_based::dotted_module_imports(&tree, bytes, "(using_directive [(qualified_name) (identifier)] @target) @import", None, true),
         Lang::Scala => query_based::scala_import(&tree, bytes),
         Lang::Elm => query_based::elm_import(&tree, bytes),
-        // D/Haskell/Julia deliberately NOT handled: their plain (non-
-        // `qualified`) import brings a whole module's exports into
-        // *unqualified* scope, unlike Java-style "import one class" --
-        // treating the module's last dotted segment as "the imported
-        // name" the way Java's resolver does would be a confidently WRONG
-        // signal (the module name itself is rarely a callable), and
-        // guessing "wildcard" risks false corroboration for the
-        // `qualified`/aliased form this project can't yet tell apart from
-        // the unqualified one. Left unresolved rather than guessed.
+        // D/Haskell/Julia: their plain (non-`qualified`) import brings a
+        // whole module's exports into *unqualified* scope, unlike Java-
+        // style "import one class" -- so each gets its own function that
+        // tells `qualified`/`hiding`/an explicit selection/`import` vs
+        // `using` apart, rather than being forced through
+        // `dotted_module_imports`'s "last segment is the name" assumption
+        // (which would be a confidently wrong signal here). See each
+        // function's doc for the exact per-language rules.
+        Lang::Haskell => query_based::haskell_import(&tree, bytes),
+        Lang::D => query_based::d_import(&tree, bytes),
+        Lang::Julia => query_based::julia_import(&tree, bytes),
         Lang::Bash => command_style::bash_source(&tree, bytes),
         Lang::Fish => command_style::fish_source(&tree, bytes),
         Lang::Ruby => command_style::ruby_require(&tree, bytes),
         Lang::R => command_style::r_source(&tree, bytes),
         Lang::Racket => command_style::racket_require(&tree, bytes),
         Lang::CMake => command_style::cmake_include(&tree, bytes),
+        Lang::Erlang => query_based::erlang_include(&tree, bytes),
+        Lang::Zig => query_based::zig_import(&tree, bytes),
+        Lang::Php => query_based::php_include(&tree, bytes),
+        Lang::Latex => query_based::latex_include(&tree, bytes),
+        Lang::Dart => query_based::dart_import(&tree, bytes),
+        Lang::Ada => query_based::ada_with(&tree, bytes),
+        Lang::OCaml => query_based::ocaml_open(&tree, bytes),
+        Lang::Perl => query_based::perl_use(&tree, bytes),
+        Lang::Fortran => query_based::fortran_include(&tree, bytes),
+        Lang::Elixir => query_based::elixir_alias(&tree, bytes),
+        Lang::Lua => command_style::lua_require(&tree, bytes),
+        Lang::Scheme => command_style::scheme_include(&tree, bytes),
+        Lang::PowerShell => command_style::powershell_dotsource(&tree, bytes),
+        // Nim (immature 0.1.0 grammar with no import-related node found in
+        // a real check -- rather than guess at an unverified shape), VHDL
+        // (no reliable package-to-file naming convention exists to
+        // resolve against at all, unlike every language above), Prolog
+        // (directive shape too uncertain to encode safely from this
+        // batch's investigation), and Crystal (confirmed via a real debug
+        // dump that tree-sitter-crystal 0.1.0 does not parse `require
+        // "..."` -- with or without parens -- as a call/macro-invocation
+        // node at all; it splits into two unrelated `expression_statement`
+        // nodes, so there is no node shape to hook a resolver onto yet)
+        // are deliberately left unhandled -- see ARCHITECTURE.md's
+        // "Import resolution" section.
         _ => Vec::new(),
     }
 }
@@ -128,6 +155,22 @@ fn find_nodes<'a>(root: Node<'a>, kind: &str, out: &mut Vec<Node<'a>>) {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         find_nodes(child, kind, out);
+    }
+}
+
+/// Like `find_nodes`, but keeps descending *into* a match too --
+/// needed wherever a node of the target kind can genuinely nest inside
+/// another one of the same kind (Elixir's `call` node: `defmodule Foo do
+/// ... end` is itself a `call`, whose `do_block` can contain more `call`s
+/// for `alias`/`import`/`require`/`use`; stopping at the outer match would
+/// silently miss every one of those).
+fn find_nodes_nested<'a>(root: Node<'a>, kind: &str, out: &mut Vec<Node<'a>>) {
+    if root.kind() == kind {
+        out.push(root);
+    }
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        find_nodes_nested(child, kind, out);
     }
 }
 
@@ -633,6 +676,375 @@ mod query_based {
         }
         out
     }
+
+    /// Haskell's `import [qualified] Module [as Alias] [hiding] (names)`.
+    /// Unlike Java-style imports, a plain (non-`qualified`) `import
+    /// Data.List` brings *all* of `Data.List`'s exports into unqualified
+    /// scope -- much closer to a wildcard than to "import one class" --
+    /// so this is handled on its own rather than forced through
+    /// `dotted_module_imports`'s "last segment is the name" assumption
+    /// (which was the whole reason D/Haskell/Julia were left unresolved
+    /// in the first place; see `resolve.rs`'s `resolve_dotted_module` doc
+    /// for the matching fix on the resolution side). An explicit `(names)`
+    /// list is captured precisely, one `imported_name` per name -- the
+    /// same real signal Python's `from X import a, b` and Elm's
+    /// `exposing (a, b)` already get. `qualified` (with or without `as`)
+    /// means names are never brought in unqualified, so it's treated like
+    /// a plain whole-module bind, not a wildcard -- and `hiding` still
+    /// exposes everything else unqualified, so it's treated as a wildcard
+    /// too (the handful of hidden names being counted as "maybe from
+    /// here" is a minor imprecision, not a wrong *file* resolution).
+    pub(super) fn haskell_import(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(import module: (module) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw = text(target, bytes);
+            let before_module = std::str::from_utf8(&bytes[import_node.start_byte()..target.start_byte()]).unwrap_or("");
+            let is_qualified = import_node.child_by_field_name("alias").is_some() || before_module.contains("qualified");
+
+            match import_node.child_by_field_name("names") {
+                Some(names_node) => {
+                    let before_names = std::str::from_utf8(&bytes[import_node.start_byte()..names_node.start_byte()]).unwrap_or("");
+                    if before_names.contains("hiding") {
+                        if is_qualified {
+                            out.push(ImportEdge { raw_path: raw.clone(), imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+                        } else {
+                            out.push(ImportEdge { raw_path: format!("{raw}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+                        }
+                    } else {
+                        let mut cursor = names_node.walk();
+                        for name_node in names_node.named_children(&mut cursor) {
+                            if name_node.kind() != "import_name" {
+                                continue;
+                            }
+                            out.push(ImportEdge { raw_path: raw.clone(), imported_name: Some(text(name_node, bytes)), is_wildcard: false, module_prefix: Vec::new(), line });
+                        }
+                    }
+                }
+                None if is_qualified => {
+                    out.push(ImportEdge { raw_path: raw.clone(), imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+                }
+                None => {
+                    out.push(ImportEdge { raw_path: format!("{raw}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+                }
+            }
+        }
+        out
+    }
+
+    /// D's `[static] import Module [: names] [= alias];`. Plain `import
+    /// std.stdio;` brings all of `stdio`'s exports into unqualified
+    /// scope -- a wildcard, same reasoning as Haskell's plain import.
+    /// `static import` and a renamed `import io = std.stdio;` both
+    /// require explicit qualification, so neither counts as a wildcard;
+    /// a selective `: writeln, write` list is captured precisely.
+    pub(super) fn d_import(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        // `module_fqn` sits inside an `imported` wrapper node -- always
+        // present (not just for the `import x = y;` alias form, as a
+        // first guess assumed; that guess was wrong and a real sample
+        // parse caught it immediately, same discipline as everywhere else
+        // in this crate). The alias itself, when present, is `imported`'s
+        // own `alias` FIELD, not a sibling of `imported`. Each selective
+        // name (`: a, b`) is its own separate `import_bind` sibling of
+        // `imported` -- not one `import_bind` holding a list.
+        for m in query_matches(tree, bytes, "(import_declaration (imported (module_fqn) @target)) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw = text(target, bytes);
+            let mut cursor = import_node.walk();
+            let children: Vec<Node> = import_node.children(&mut cursor).collect();
+            let is_static = children.iter().any(|c| c.kind() == "static");
+            let is_aliased = children
+                .iter()
+                .find(|c| c.kind() == "imported")
+                .is_some_and(|n| n.child_by_field_name("alias").is_some());
+            let binds: Vec<Node> = children.iter().filter(|c| c.kind() == "import_bind").copied().collect();
+
+            if !binds.is_empty() {
+                for bind in binds {
+                    if let Some(id) = bind.named_child(0) {
+                        out.push(ImportEdge { raw_path: raw.clone(), imported_name: Some(text(id, bytes)), is_wildcard: false, module_prefix: Vec::new(), line });
+                    }
+                }
+            } else if is_static || is_aliased {
+                out.push(ImportEdge { raw_path: raw.clone(), imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+            } else {
+                out.push(ImportEdge { raw_path: format!("{raw}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+            }
+        }
+        out
+    }
+
+    /// Julia's `using X` / `import X` / `using X: a, b` / `import X: a, b`.
+    /// `using X` (no selection) brings all of `X`'s exports into
+    /// unqualified scope -- a wildcard. `import X` alone binds only `X`
+    /// itself (`X.foo()` required) -- not a wildcard. Either form with an
+    /// explicit `: a, b` selection is captured precisely regardless of
+    /// `using`/`import`, since both forms bring exactly those names in
+    /// unqualified either way.
+    pub(super) fn julia_import(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "[(import_statement) (using_statement)] @import") {
+            let Some(&import_node) = m.get("import") else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let is_using = import_node.kind() == "using_statement";
+            let mut cursor = import_node.walk();
+            let children: Vec<Node> = import_node.named_children(&mut cursor).collect();
+
+            if let Some(sel) = children.iter().find(|c| c.kind() == "selected_import") {
+                let mut scursor = sel.walk();
+                let mut sel_children = sel.named_children(&mut scursor);
+                let Some(module_node) = sel_children.next() else { continue };
+                let module_text = text(module_node, bytes);
+                for name_node in sel_children {
+                    if name_node.kind() == "import_alias" {
+                        continue; // a renamed selection -- ambiguous which side is the real target name, skipped rather than guessed
+                    }
+                    out.push(ImportEdge { raw_path: module_text.clone(), imported_name: Some(text(name_node, bytes)), is_wildcard: false, module_prefix: Vec::new(), line });
+                }
+            } else if let Some(module_node) = children.iter().find(|c| matches!(c.kind(), "identifier" | "scoped_identifier" | "import_path")) {
+                let module_text = text(*module_node, bytes);
+                if is_using {
+                    out.push(ImportEdge { raw_path: format!("{module_text}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+                } else {
+                    out.push(ImportEdge { raw_path: module_text, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+                }
+            }
+        }
+        out
+    }
+
+    /// `-include("file.hrl").` -- Erlang's own dedicated preprocessor
+    /// node, a real relative path. `-include_lib("kernel/include/x.hrl")`
+    /// is deliberately NOT extracted: its path is rooted at an OTP
+    /// *library* name, not this repo, so treating it as repo-relative
+    /// would risk a coincidental wrong match rather than an honest
+    /// "unresolved".
+    pub(super) fn erlang_include(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(pp_include file: (_) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw_path = text(target, bytes).trim_matches('"').to_string();
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// `@import("std")` / `@import("./helper.zig")` -- Zig's builtin
+    /// import function, checked by text since (like Nix) it's an
+    /// ordinary builtin call, not special grammar.
+    pub(super) fn zig_import(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(builtin_function (builtin_identifier) @_fn (arguments (string) @target)) @import") {
+            let (Some(&fn_node), Some(&target), Some(&import_node)) = (m.get("_fn"), m.get("target"), m.get("import")) else { continue };
+            if text(fn_node, bytes) != "@import" {
+                continue;
+            }
+            let line = import_node.start_position().row as i64 + 1;
+            let raw_path = text(target, bytes).trim_matches('"').to_string();
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// PHP's `require`/`require_once`/`include`/`include_once` -- only
+    /// extracted when the argument is a literal string; a computed path
+    /// (a variable, a concatenation) can't be resolved without evaluating
+    /// PHP, so it's correctly left unextracted rather than guessed at.
+    /// `use Namespace\Class;` (PSR-4 autoloading) is deliberately NOT
+    /// handled -- real PSR-4 resolution needs `composer.json`'s autoload
+    /// map, which this project doesn't parse; guessing a directory
+    /// convention instead risks a confidently wrong signal the way the
+    /// original D/Haskell/Julia mistake did.
+    pub(super) fn php_include(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut nodes = Vec::new();
+        for kind in ["require_expression", "require_once_expression", "include_expression", "include_once_expression"] {
+            find_nodes(tree.root_node(), kind, &mut nodes);
+        }
+        for node in nodes {
+            let line = node.start_position().row as i64 + 1;
+            let Some(arg) = node.named_child(0) else { continue };
+            if !arg.kind().contains("string") {
+                continue;
+            }
+            let raw_path = text(arg, bytes).trim_matches(|c| c == '"' || c == '\'').to_string();
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// `\input{file}` / `\include{file}` -- only the two most common forms
+    /// (LaTeX has a dozen include-like commands for bibliographies,
+    /// graphics, SVGs, etc. -- see the module doc's grammar survey; the
+    /// rest are lower-value and not attempted this batch).
+    pub(super) fn latex_include(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(latex_include path: (_) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw_path = text(target, bytes).trim_matches(|c| c == '{' || c == '}').to_string();
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// Dart's `import 'uri';`. `package:x/y.dart` and `dart:core`-style
+    /// URIs are always external (a pub package or the SDK), never repo-
+    /// relative, and are correctly skipped rather than guessed at; a bare
+    /// relative URI resolves the same way JS's relative imports do (via
+    /// `resolve_relative_literal` in `resolve.rs`), including without a
+    /// leading `./` -- Dart's own relative-import resolution checks the
+    /// importing file's own directory the same way C's quoted `#include`
+    /// does.
+    pub(super) fn dart_import(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(import_specification uri: (_) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw = text(target, bytes).trim_matches(|c| c == '"' || c == '\'').to_string();
+            if raw.starts_with("package:") || raw.starts_with("dart:") {
+                continue;
+            }
+            out.push(ImportEdge { raw_path: raw, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// Ada's `with Package.Name;` -- can name several packages
+    /// comma-separated (`with A, B;`), each captured as its own edge.
+    /// `use`-clauses (bringing a `with`-ed package's names into
+    /// unqualified scope) aren't tracked separately here; `with` alone is
+    /// enough to know which file a call might come from.
+    pub(super) fn ada_with(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(with_clause [(identifier) (selected_component)] @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw_path = text(target, bytes);
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// OCaml's `open Module` / `open Module.Sub` -- brings the opened
+    /// module's names into unqualified scope, always (there's no
+    /// "selective open" or "qualified open" form the way Haskell/D have),
+    /// so this is always a wildcard.
+    pub(super) fn ocaml_open(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(open_module module: (_) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw = text(target, bytes);
+            out.push(ImportEdge { raw_path: format!("{raw}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// Perl's `use Module::Name;` / `use Module::Name qw(a b);` / `no
+    /// Module::Name;` (`use_no_statement` covers both `use` and `no`).
+    /// Perl's `Exporter`-based convention means a plain `use Module;`
+    /// typically brings a default set of names into unqualified scope --
+    /// treated as a wildcard, same reasoning as Haskell's plain import.
+    /// An explicit `qw(...)` import list is captured precisely when
+    /// present.
+    pub(super) fn perl_use(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(use_no_statement package_name: (_) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw = text(target, bytes);
+            let mut cursor = import_node.walk();
+            let qw_list = import_node.children(&mut cursor).find(|c| c.kind().starts_with("word_list"));
+            match qw_list {
+                Some(list) => {
+                    let mut lcursor = list.walk();
+                    for word in list.named_children(&mut lcursor) {
+                        out.push(ImportEdge { raw_path: raw.clone(), imported_name: Some(text(word, bytes)), is_wildcard: false, module_prefix: Vec::new(), line });
+                    }
+                }
+                None => out.push(ImportEdge { raw_path: format!("{raw}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line }),
+            }
+        }
+        out
+    }
+
+    /// Fortran's `include 'file.inc'` (a real relative path) and `use
+    /// module_name` / `use module_name, only: a, b` (module-name-based --
+    /// Fortran has no standardized module-to-file naming convention the
+    /// way Java's classpath does, so this is a plain filename guess: the
+    /// module name itself, tried directly as a filename against a few
+    /// real extensions, in `resolve.rs`).
+    pub(super) fn fortran_include(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(include_statement path: (_) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw_path = text(target, bytes).trim_matches('\'').trim_matches('"').to_string();
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        for m in query_matches(tree, bytes, "(use_statement (module_name) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw = text(target, bytes);
+            let has_only = {
+                let mut cursor = import_node.walk();
+                import_node.children(&mut cursor).any(|c| c.kind() == "included_items")
+            };
+            if has_only {
+                let included = {
+                    let mut cursor = import_node.walk();
+                    import_node.children(&mut cursor).find(|c| c.kind() == "included_items")
+                };
+                if let Some(included) = included {
+                    let mut icursor = included.walk();
+                    for name in included.named_children(&mut icursor) {
+                        out.push(ImportEdge { raw_path: raw.clone(), imported_name: Some(text(name, bytes)), is_wildcard: false, module_prefix: Vec::new(), line });
+                    }
+                }
+            } else {
+                out.push(ImportEdge { raw_path: format!("{raw}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+            }
+        }
+        out
+    }
+
+    /// Elixir's `alias`/`import`/`require`/`use Foo.Bar`. No file-based
+    /// import exists at the language level -- module-to-file mapping is
+    /// purely a Mix build-tool *convention* (CamelCase segments become
+    /// snake_case directories under `lib/`), not enforced by the compiler,
+    /// but real and near-universal in practice (Phoenix and virtually
+    /// every published Hex package follow it). Always treated as a
+    /// wildcard: `import`/`use` bring the target module's functions into
+    /// unqualified scope by design; `alias`/`require` don't, but
+    /// distinguishing them isn't worth the extra complexity when all four
+    /// share one grammar shape and the file resolved is identical either
+    /// way.
+    pub(super) fn elixir_alias(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut calls = Vec::new();
+        find_nodes_nested(tree.root_node(), "call", &mut calls);
+        for call in calls {
+            let Some(target_node) = call.child_by_field_name("target") else { continue };
+            if target_node.kind() != "identifier" {
+                continue;
+            }
+            if !matches!(text(target_node, bytes).as_str(), "alias" | "import" | "require" | "use") {
+                continue;
+            }
+            let mut mod_nodes = Vec::new();
+            find_nodes(call, "alias", &mut mod_nodes);
+            let Some(&module_node) = mod_nodes.first() else { continue };
+            let raw = text(module_node, bytes);
+            let line = call.start_position().row as i64 + 1;
+            out.push(ImportEdge { raw_path: format!("{raw}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+        }
+        out
+    }
 }
 
 /// Languages whose `source`/`require`-style import is an *ordinary*
@@ -779,6 +1191,94 @@ mod command_style {
         }
         out
     }
+
+    /// `require("module")` / `require "module"` -- Lua's `package.path`
+    /// convention converts dots to directory separators (`require("a.b")`
+    /// looks for `a/b.lua`), so the raw path is kept dotted here and
+    /// converted in `resolve.rs`, the same split-then-join approach
+    /// Python's absolute imports already use.
+    pub(super) fn lua_require(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut calls = Vec::new();
+        find_nodes(tree.root_node(), "function_call", &mut calls);
+        for call in calls {
+            let Some(name_node) = call.child_by_field_name("name") else { continue };
+            if text(name_node, bytes) != "require" {
+                continue;
+            }
+            let Some(args) = call.child_by_field_name("arguments") else { continue };
+            let mut cursor = args.walk();
+            let Some(first_str) = args.named_children(&mut cursor).find(|c| c.kind().contains("string")) else { continue };
+            let line = call.start_position().row as i64 + 1;
+            out.push(ImportEdge { raw_path: strip_quotes(&text(first_str, bytes)), imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// `(include "file.scm")` / `(load "file.scm")` -- same shape as
+    /// Racket's `require`, different head symbols (Scheme has no
+    /// standardized module system across implementations; `include`/
+    /// `load` with a literal path are the closest thing to a portable,
+    /// resolvable form).
+    pub(super) fn scheme_include(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut lists = Vec::new();
+        find_nodes(tree.root_node(), "list", &mut lists);
+        for list in lists {
+            let mut cursor = list.walk();
+            let mut children = list.named_children(&mut cursor);
+            let Some(head) = children.next() else { continue };
+            if !matches!(head.kind(), "symbol" | "identifier") || !matches!(text(head, bytes).as_str(), "include" | "load") {
+                continue;
+            }
+            let Some(arg) = children.next() else { continue };
+            if !arg.kind().contains("string") {
+                continue;
+            }
+            let line = list.start_position().row as i64 + 1;
+            out.push(ImportEdge { raw_path: strip_quotes(&text(arg, bytes)), imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// `. .\helper.ps1` (dot-sourcing -- brings the sourced script's
+    /// functions into the current scope, a real wildcard) and
+    /// `Import-Module ./Helper.psm1` (only the relative-path form; a
+    /// bare module *name*, e.g. `Import-Module ActiveDirectory`, names an
+    /// installed module, not a repo file, and is correctly left
+    /// unextracted).
+    pub(super) fn powershell_dotsource(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut cmds = Vec::new();
+        find_nodes(tree.root_node(), "command", &mut cmds);
+        for cmd in cmds {
+            let Some(name_node) = cmd.child_by_field_name("command_name") else { continue };
+            let name = text(name_node, bytes);
+            let mut cursor = cmd.walk();
+            let has_dot_operator = cmd.children(&mut cursor).any(|c| c.kind() == "command_invokation_operator" && text(c, bytes) == ".");
+            let is_wildcard = has_dot_operator;
+            let is_import_module = name.eq_ignore_ascii_case("Import-Module");
+            if !has_dot_operator && !is_import_module {
+                continue;
+            }
+            let line = cmd.start_position().row as i64 + 1;
+            let raw_path = if has_dot_operator {
+                strip_quotes(&name)
+            } else {
+                let mut ccursor = cmd.walk();
+                let Some(elements) = cmd.children_by_field_name("command_elements", &mut ccursor).next() else { continue };
+                let mut ecursor = elements.walk();
+                let Some(first) = elements.named_children(&mut ecursor).find(|c| c.kind() != "command_argument_sep") else { continue };
+                let p = strip_quotes(&text(first, bytes));
+                if !(p.starts_with("./") || p.starts_with("../") || p.starts_with(".\\") || p.starts_with("..\\")) {
+                    continue; // a bare module name, not a repo file
+                }
+                p
+            };
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard, module_prefix: Vec::new(), line });
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -915,6 +1415,38 @@ mod tests {
     }
 
     #[test]
+    fn haskell_plain_qualified_selective_and_hiding() {
+        let src = "import Data.List\nimport qualified Data.Map as M\nimport Data.Set (member, insert)\nimport Data.Text hiding (map)\n";
+        let got = edges(src, Lang::Haskell);
+        assert!(got.contains(&("Data.List.*".to_string(), None)), "plain import must be a wildcard: {got:?}");
+        assert!(got.contains(&("Data.Map".to_string(), None)) && !got.iter().any(|(p, _)| p == "Data.Map.*"), "qualified import must NOT be a wildcard: {got:?}");
+        assert!(got.contains(&("Data.Set".to_string(), Some("member".to_string()))), "{got:?}");
+        assert!(got.contains(&("Data.Set".to_string(), Some("insert".to_string()))), "{got:?}");
+        assert!(got.contains(&("Data.Text.*".to_string(), None)), "hiding still exposes the rest as a wildcard: {got:?}");
+    }
+
+    #[test]
+    fn d_plain_selective_static_and_aliased() {
+        let src = "import std.stdio;\nimport std.algorithm : map, filter;\nstatic import std.conv;\nimport io = std.stdio;\n";
+        let got = edges(src, Lang::D);
+        assert!(got.contains(&("std.stdio.*".to_string(), None)), "plain import must be a wildcard: {got:?}");
+        assert!(got.contains(&("std.algorithm".to_string(), Some("map".to_string()))), "{got:?}");
+        assert!(got.contains(&("std.algorithm".to_string(), Some("filter".to_string()))), "{got:?}");
+        assert!(got.contains(&("std.conv".to_string(), None)) && !got.iter().any(|(p, _)| p == "std.conv.*"), "static import must NOT be a wildcard: {got:?}");
+    }
+
+    #[test]
+    fn julia_using_import_and_selective() {
+        let src = "using Base\nimport Base\nusing Base: sin, cos\nimport LinearAlgebra: dot\n";
+        let got = edges(src, Lang::Julia);
+        assert!(got.contains(&("Base.*".to_string(), None)), "plain `using` must be a wildcard: {got:?}");
+        assert!(got.contains(&("Base".to_string(), None)), "plain `import` must NOT be a wildcard: {got:?}");
+        assert!(got.contains(&("Base".to_string(), Some("sin".to_string()))), "{got:?}");
+        assert!(got.contains(&("Base".to_string(), Some("cos".to_string()))), "{got:?}");
+        assert!(got.contains(&("LinearAlgebra".to_string(), Some("dot".to_string()))), "{got:?}");
+    }
+
+    #[test]
     fn bash_source_and_dot() {
         let got = edges("source ./helper.sh\n. ./other.sh\n", Lang::Bash);
         assert!(got.contains(&("./helper.sh".to_string(), None)), "{got:?}");
@@ -956,5 +1488,115 @@ mod tests {
         let got = edges(src, Lang::CMake);
         assert!(got.contains(&("helper.cmake".to_string(), None)), "{got:?}");
         assert!(got.contains(&("sub".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn erlang_include_skips_include_lib() {
+        let src = "-module(foo).\n-include(\"foo.hrl\").\n-include_lib(\"kernel/include/file.hrl\").\n";
+        let got = edges(src, Lang::Erlang);
+        assert!(got.contains(&("foo.hrl".to_string(), None)), "{got:?}");
+        assert!(!got.iter().any(|(p, _)| p.contains("kernel")), "include_lib must not be treated as repo-relative: {got:?}");
+    }
+
+    #[test]
+    fn zig_import_builtin() {
+        let src = "const std = @import(\"std\");\nconst helper = @import(\"./helper.zig\");\n";
+        let got = edges(src, Lang::Zig);
+        assert!(got.contains(&("std".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("./helper.zig".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn php_require_and_include_variants() {
+        let src = "<?php\nrequire 'a.php';\nrequire_once 'b.php';\ninclude 'c.php';\ninclude_once 'd.php';\nrequire $dynamic;\n";
+        let got = edges(src, Lang::Php);
+        assert!(got.contains(&("a.php".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("b.php".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("c.php".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("d.php".to_string(), None)), "{got:?}");
+        assert_eq!(got.len(), 4, "a dynamic (non-literal) require must not be extracted: {got:?}");
+    }
+
+    #[test]
+    fn latex_input_and_include() {
+        let src = "\\input{chapter1}\n\\include{chapter2}\n";
+        let got = edges(src, Lang::Latex);
+        assert!(got.contains(&("chapter1".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("chapter2".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn dart_import_skips_package_and_dart_schemes() {
+        let src = "import 'dart:core';\nimport 'package:foo/foo.dart';\nimport './helper.dart';\n";
+        let got = edges(src, Lang::Dart);
+        assert!(got.contains(&("./helper.dart".to_string(), None)), "{got:?}");
+        assert!(!got.iter().any(|(p, _)| p.contains("dart:") || p.contains("package:")), "{got:?}");
+    }
+
+    #[test]
+    fn ada_with_clause_multiple_packages() {
+        let src = "with Ada.Text_IO;\nwith Ada.Text_IO, Ada.Integer_Text_IO;\n";
+        let got = edges(src, Lang::Ada);
+        assert!(got.iter().any(|(p, _)| p == "Ada.Text_IO"), "{got:?}");
+        assert!(got.iter().any(|(p, _)| p == "Ada.Integer_Text_IO"), "{got:?}");
+    }
+
+    #[test]
+    fn ocaml_open_module() {
+        let got = edges("open List\nopen Core.Std\n", Lang::OCaml);
+        assert!(got.contains(&("List.*".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("Core.Std.*".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn perl_use_plain_and_qw_list() {
+        let src = "use Data::Dumper;\nuse List::Util qw(sum max);\n";
+        let got = edges(src, Lang::Perl);
+        assert!(got.contains(&("Data::Dumper.*".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("List::Util".to_string(), Some("sum".to_string()))), "{got:?}");
+        assert!(got.contains(&("List::Util".to_string(), Some("max".to_string()))), "{got:?}");
+    }
+
+    #[test]
+    fn fortran_include_and_use_with_only() {
+        let src = "include 'helper.inc'\nuse mymod\nuse othermod, only: foo, bar\n";
+        let got = edges(src, Lang::Fortran);
+        assert!(got.contains(&("helper.inc".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("mymod.*".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("othermod".to_string(), Some("foo".to_string()))), "{got:?}");
+        assert!(got.contains(&("othermod".to_string(), Some("bar".to_string()))), "{got:?}");
+    }
+
+    #[test]
+    fn elixir_alias_import_require_use() {
+        let src = "defmodule Foo do\n  alias MyApp.Helper\n  import MyApp.Util\n  require Logger\n  use GenServer\nend\n";
+        let got = edges(src, Lang::Elixir);
+        assert!(got.contains(&("MyApp.Helper.*".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("MyApp.Util.*".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("Logger.*".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("GenServer.*".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn lua_require_dotted() {
+        let got = edges("local m = require(\"a.b\")\n", Lang::Lua);
+        assert!(got.contains(&("a.b".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn scheme_include_and_load() {
+        let src = "(include \"helper.scm\")\n(load \"other.scm\")\n";
+        let got = edges(src, Lang::Scheme);
+        assert!(got.contains(&("helper.scm".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("other.scm".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn powershell_dot_source_and_import_module() {
+        let src = ". .\\helper.ps1\nImport-Module ./Other.psm1\nImport-Module ActiveDirectory\n";
+        let got = edges(src, Lang::PowerShell);
+        assert!(got.iter().any(|(p, _)| p.contains("helper.ps1")), "{got:?}");
+        assert!(got.iter().any(|(p, _)| p.contains("Other.psm1")), "{got:?}");
+        assert!(!got.iter().any(|(p, _)| p.contains("ActiveDirectory")), "a bare installed-module name must not be extracted: {got:?}");
     }
 }

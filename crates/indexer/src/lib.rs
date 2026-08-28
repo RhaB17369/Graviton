@@ -753,4 +753,358 @@ mod index_repo_tests {
         let paths: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
         assert_eq!(paths, vec!["com/example/util/A.java".to_string(), "com/example/util/B.java".to_string(), "com/example/util/Main.java".to_string()]);
     }
+
+    /// The exact case the user asked to be fixed: `import Data.List`
+    /// exposes all of `Data.List`'s own names unqualified, but that must
+    /// resolve to the ONE file `Data/List.hs` -- not a directory listing.
+    /// A sibling module (`Data/Map.hs`) living in the SAME directory is
+    /// not part of what this wildcard exposes, and must NOT appear in the
+    /// resolution (the exact mistake this project's own `resolve_dotted_module`
+    /// made for Elm before this fix -- see its module doc).
+    #[test]
+    fn haskell_wildcard_import_resolves_to_its_own_file_only_not_the_whole_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/Data")).unwrap();
+        std::fs::write(dir.path().join("src/Data/List.hs"), "module Data.List (map) where\nmap :: (a -> b) -> [a] -> [b]\nmap _ _ = []\n").unwrap();
+        std::fs::write(dir.path().join("src/Data/Map.hs"), "module Data.Map (lookup) where\nlookup :: a -> b\nlookup _ = undefined\n").unwrap();
+        std::fs::write(dir.path().join("src/Main.hs"), "module Main where\nimport Data.List\nmain :: IO ()\nmain = print (map id [1])\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'Data.List.*'",
+            )
+            .unwrap();
+        let paths: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        assert_eq!(paths, vec!["src/Data/List.hs".to_string()], "must resolve to exactly its own file, never a sibling module or a directory listing: {paths:?}");
+    }
+
+    /// `import qualified Data.Map as M` never brings names into unqualified
+    /// scope (`M.lookup`, not bare `lookup`) -- so it must not be flagged
+    /// as a wildcard, even though it still resolves to a real file (the
+    /// distinction matters for `ResolutionHint`'s corroboration logic in
+    /// `crates/cli/src/callgraph.rs`, not for whether the file is found).
+    #[test]
+    fn haskell_qualified_import_still_resolves_but_is_not_a_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/Data")).unwrap();
+        std::fs::write(dir.path().join("src/Data/Map.hs"), "module Data.Map (lookup) where\nlookup :: a -> b\nlookup _ = undefined\n").unwrap();
+        std::fs::write(dir.path().join("src/Main.hs"), "module Main where\nimport qualified Data.Map as M\nmain :: IO ()\nmain = return ()\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let (raw_path, is_wildcard, resolved_path): (String, bool, String) = conn
+            .query_row(
+                "SELECT i.raw_path, i.is_wildcard, f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(raw_path, "Data.Map");
+        assert!(!is_wildcard, "a qualified import must not be flagged as a wildcard");
+        assert_eq!(resolved_path, "src/Data/Map.hs");
+    }
+
+    /// D's `import std.stdio;` (no selection, no `static`, no alias) --
+    /// same single-file-not-directory correctness as the Haskell case
+    /// above, for the completely different grammar shape found via a real
+    /// parse dump (see `imports.rs::query_based::d_import`'s doc for the
+    /// wrong first guess that dump corrected).
+    #[test]
+    fn d_wildcard_import_resolves_to_its_own_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("source/std")).unwrap();
+        std::fs::write(dir.path().join("source/std/stdio.d"), "module std.stdio;\nvoid writeln(string s) {}\n").unwrap();
+        std::fs::write(dir.path().join("source/std/algorithm.d"), "module std.algorithm;\n").unwrap();
+        std::fs::write(dir.path().join("source/app.d"), "import std.stdio;\nvoid main() { writeln(\"hi\"); }\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'std.stdio.*'",
+            )
+            .unwrap();
+        let paths: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        assert_eq!(paths, vec!["source/std/stdio.d".to_string()]);
+    }
+
+    /// Julia's `using Base: sin` -- a real selective import resolving to
+    /// its module's file with the specific name captured, distinct from
+    /// `using Base` alone (whole-module wildcard) and `import Base` alone
+    /// (binds only `Base` itself, not a wildcard).
+    #[test]
+    fn julia_selective_using_resolves_to_the_modules_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/Helpers.jl"), "module Helpers\nfoo() = 1\nend\n").unwrap();
+        std::fs::write(dir.path().join("src/Main.jl"), "using Helpers: foo\nfoo()\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let (imported_name, resolved_path): (String, String) = conn
+            .query_row(
+                "SELECT i.imported_name, f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'Helpers'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(imported_name, "foo");
+        assert_eq!(resolved_path, "src/Helpers.jl");
+    }
+
+    /// The regression this whole fix started from: Elm's `exposing (..)`
+    /// must resolve to the ONE file the imported module names, never a
+    /// directory listing -- `resolve_dotted_module` originally treated
+    /// every wildcard as a Java-style package directory, which is simply
+    /// wrong for a language where a module is always exactly one file.
+    #[test]
+    fn elm_exposing_all_resolves_to_its_own_file_only_not_a_directory_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/Html")).unwrap();
+        std::fs::write(dir.path().join("src/Html/Events.elm"), "module Html.Events exposing (onClick)\nonClick = 1\n").unwrap();
+        std::fs::write(dir.path().join("src/Html/Attributes.elm"), "module Html.Attributes exposing (class)\nclass = 1\n").unwrap();
+        std::fs::write(dir.path().join("src/Main.elm"), "module Main exposing (main)\nimport Html.Events exposing (..)\nmain = onClick\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT f2.path FROM imports i \
+                 JOIN import_resolutions r ON r.import_id = i.id \
+                 JOIN files f2 ON f2.id = r.file_id \
+                 WHERE i.raw_path = 'Html.Events.*'",
+            )
+            .unwrap();
+        let paths: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        assert_eq!(paths, vec!["src/Html/Events.elm".to_string()], "must not also list Html/Attributes.elm: {paths:?}");
+    }
+
+    /// Ada's `with My_Pkg.Child;` -- GNAT's dash-joined-lowercase flat
+    /// naming convention, not a slash-nested directory the way Java's is.
+    #[test]
+    fn ada_with_clause_resolves_via_dash_joined_lowercase_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/my_pkg-child.ads"), "package My_Pkg.Child is\nend My_Pkg.Child;\n").unwrap();
+        std::fs::write(dir.path().join("src/main.adb"), "with My_Pkg.Child;\nprocedure Main is\nbegin\n   null;\nend Main;\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'My_Pkg.Child'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["src/my_pkg-child.ads".to_string()]);
+    }
+
+    /// OCaml's `open Helper` -- lowercased outermost segment only.
+    #[test]
+    fn ocaml_open_resolves_to_lowercase_file_for_outermost_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/helper.ml"), "let f x = x\n").unwrap();
+        std::fs::write(dir.path().join("src/main.ml"), "open Helper\nlet () = ignore (f 1)\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'Helper.*'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["src/helper.ml".to_string()]);
+    }
+
+    /// Perl's `use Foo::Bar;` -- `::` -> `/`, rooted at `lib/`.
+    #[test]
+    fn perl_use_resolves_via_double_colon_to_lib_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib/Foo")).unwrap();
+        std::fs::write(dir.path().join("lib/Foo/Bar.pm"), "package Foo::Bar;\n1;\n").unwrap();
+        std::fs::write(dir.path().join("script.pl"), "use Foo::Bar;\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'Foo::Bar.*'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["lib/Foo/Bar.pm".to_string()]);
+    }
+
+    /// Fortran's `use mod_utils` -- no naming convention exists, so it's a
+    /// flat filename guess against a handful of real extensions.
+    #[test]
+    fn fortran_use_module_resolves_via_flat_filename_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/mod_utils.f90"), "module mod_utils\ncontains\nend module mod_utils\n").unwrap();
+        std::fs::write(dir.path().join("src/main.f90"), "program p\n  use mod_utils\nend program p\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'mod_utils.*'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["src/mod_utils.f90".to_string()]);
+    }
+
+    /// Elixir's `alias MyApp.Helper` -- Mix's CamelCase-per-segment ->
+    /// snake_case-per-segment convention under `lib/`. Also the regression
+    /// test for the `find_nodes` -> `find_nodes_nested` extraction fix:
+    /// without it, nothing nested inside `defmodule ... do ... end`'s
+    /// `do_block` was ever found in the first place.
+    #[test]
+    fn elixir_alias_resolves_via_camelcase_to_snake_case_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib/my_app")).unwrap();
+        std::fs::write(dir.path().join("lib/my_app/helper.ex"), "defmodule MyApp.Helper do\n  def foo, do: 1\nend\n").unwrap();
+        std::fs::write(dir.path().join("lib/my_app.ex"), "defmodule MyApp do\n  alias MyApp.Helper\nend\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'MyApp.Helper.*'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["lib/my_app/helper.ex".to_string()]);
+    }
+
+    /// Lua's `require("a.b")` -- dotted-to-slash, `package.path`-style.
+    #[test]
+    fn lua_require_resolves_dotted_path_to_slash_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/a")).unwrap();
+        std::fs::write(dir.path().join("src/a/b.lua"), "return {}\n").unwrap();
+        std::fs::write(dir.path().join("main.lua"), "local m = require(\"a.b\")\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'a.b'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["src/a/b.lua".to_string()]);
+    }
+
+    /// Dart's relative `import 'helper.dart';` -- no leading `./` needed,
+    /// same as C's quoted `#include`, via `resolve_relative_literal`.
+    #[test]
+    fn dart_relative_import_resolves_to_sibling_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+        std::fs::write(dir.path().join("lib/helper.dart"), "int foo() => 1;\n").unwrap();
+        std::fs::write(dir.path().join("lib/main.dart"), "import 'helper.dart';\nvoid main() { foo(); }\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'helper.dart'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["lib/helper.dart".to_string()]);
+    }
+
+    /// Scheme's `(include "helper.scm")` -- a plain relative-literal path,
+    /// same shape as Racket's.
+    #[test]
+    fn scheme_include_resolves_to_sibling_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.scm"), "(define (f x) x)\n").unwrap();
+        std::fs::write(dir.path().join("main.scm"), "(include \"helper.scm\")\n(f 1)\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'helper.scm'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["helper.scm".to_string()]);
+    }
+
+    /// PowerShell's dot-source `. .\helper.ps1` -- also the regression test
+    /// for the `command_argument_sep`-vs-`generic_token` extraction fix
+    /// (the dot-source form worked before the fix; `Import-Module` didn't).
+    #[test]
+    fn powershell_import_module_resolves_relative_module_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Other.psm1"), "function F { 1 }\n").unwrap();
+        std::fs::write(dir.path().join("main.ps1"), "Import-Module ./Other.psm1\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = './Other.psm1'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["Other.psm1".to_string()]);
+    }
 }
