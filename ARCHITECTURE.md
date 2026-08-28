@@ -198,7 +198,7 @@ kind, name, parent, line }`) instead of being a bare label:
   resolved `use`/`import` naming exactly this definition's file (see
   "Import resolution" below) — genuine resolution via an actual import
   statement, not a co-location heuristic. Only produced for the languages
-  with an import resolver (47 languages as of this writing — see "Import
+  with an import resolver (50 languages as of this writing — see "Import
   resolution" below for the full list).
 - `Ambiguous(Vec<DefinitionRef>)` — multiple same-named definitions exist,
   none local, and either this language has no import resolver yet or none
@@ -424,34 +424,73 @@ plausible-looking grammar shape:
   separator tokens when looking for the argument. The dot-source form
   (`. .\file.ps1`) was unaffected — it reads a different field.
 
-**Only 4 parsed languages have no import resolver at all now**, each with
+**3 more languages** got real extraction + resolution in a final pass over
+what was left: Assembly's `.include "x"` (GAS/MASM's own dedicated `meta`
+grammar node) and NASM's `%include "x"` / bare `INCLUDE "x"` (this
+grammar's `%`-preprocessor support is broken — a real parse-tree dump
+confirmed the leading `%` becomes an `ERROR` node — but the `include "x"`
+that follows still parses as an ordinary `instruction` node with kind text
+`"include"` and one string operand, matched by that text alone since
+"include" is never a real instruction mnemonic in any assembly dialect);
+both resolved via `resolve_relative_literal`, same as C's `#include`.
+Swift's `import CoreModule` (verified via `node-types.json`: a bare
+`identifier` child, no `path` field at all) is always treated as a
+wildcard, resolved via a new `resolve_swift_module` to every `.swift` file
+under `Sources/CoreModule/` — Swift Package Manager's own convention for a
+sibling target in the same multi-target package; unlike every other
+module language here a Swift target is a whole *subtree*, not one file or
+one flat directory, so this scans by path prefix rather than reusing
+`resolve_dotted_module`/`files_by_dir`. An external framework
+(`Foundation`, `UIKit`, ...) simply has no matching directory and stays
+honestly unresolved, same as every other language's external-dependency
+imports. Terraform/HCL's `module "x" { source = "./y" }` needed its own
+hand-walked extraction (`hcl_module_source`) since `block`/`attribute` are
+fully generic, field-less, positional nodes in this grammar (verified
+against real node-types.json) — matched by walking the block's first
+`identifier` child for the `module` keyword, then its `body` for an
+`attribute` named `source`; only a literal string starting with `./`/
+`../` is extracted, a registry reference (`terraform-aws-modules/vpc/aws`)
+or git URL being unambiguously external and left unextracted. Resolved via
+a new `resolve_hcl_module` to every `.tf` file in the referenced
+directory — the same multi-file honesty Go's package imports use.
+
+**Only 8 parsed languages have no import resolver at all now**, each with
 a specific, verified reason rather than "not gotten to yet": Nim
 (tree-sitter-nim 0.1.0 has no import/include-related node type in its
 grammar at all — nothing to hook extraction onto), VHDL (no reliable
 package-to-file naming convention exists to resolve against, unlike every
 language above), Prolog (directive shape too uncertain to encode safely
-from this project's investigation), and Crystal (confirmed via a real
+from this project's investigation), Crystal (confirmed via a real
 parse-tree dump that tree-sitter-crystal 0.1.0 doesn't parse
 `require "..."` — with or without parentheses — as a call/macro-invocation
 node at all; it splits into two unrelated `expression_statement` nodes, so
 there's no node shape to extract from in the first place, the same
-category of gap as Nim's, not a shape this project got wrong).
+category of gap as Nim's, not a shape this project got wrong), GraphQL and
+WGSL (checked their real `node-types.json`: no node type name contains
+"import"/"include" at all — neither language's own spec has an import
+concept, so there's correctly nothing to extract, not a gap), and
+Svelte/Vue (their real imports live inside a `<script>` block, which both
+grammars parse as one opaque `raw_text` node — the same language-injection
+limitation already documented for their missing `def_query_src` above;
+recovering either would need a second parse pass this project doesn't do).
 
 Verified per-language against real samples (`imports.rs`'s `tests` module —
-38 tests, one or more per language/family), plus end-to-end resolution
+41 tests, one or more per language/family), plus end-to-end resolution
 integration tests through `index_repo` for a representative case of each
-resolver mechanism (`lib.rs`'s `index_repo_tests`, 155 tests total in that
+resolver mechanism (`lib.rs`'s `index_repo_tests`, 161 tests total in that
 crate: a real C `#include` resolving to a local header while a system
 header stays unrecorded, a real cross-file Java import resolving via a
 conventional Maven source root, a Java wildcard import resolving to every
 file in its package directory, the D/Haskell/Julia/Elm
-`wildcard_is_package_directory` fix, and one representative case each for
-Ada, OCaml, Perl, Fortran, Elixir, Lua, Dart, Scheme, and PowerShell from
-the newest batch) — plus a live dogfood against real synthetic
-multi-language scratch repos (Java cross-file class import, C
-local-header include, a Bash `source`, an Elixir `alias`, and an Ada
-`with` clause all resolving correctly through the actual `grv` binary, not
-just Rust unit tests).
+`wildcard_is_package_directory` fix, one representative case each for Ada,
+OCaml, Perl, Fortran, Elixir, Lua, Dart, Scheme, and PowerShell, and a
+final case each for Assembly's `.include`, Swift's Sources-directory
+convention, and Terraform's `module` block) — plus a live dogfood against
+real synthetic multi-language scratch repos (Java cross-file class import,
+C local-header include, a Bash `source`, an Elixir `alias`, an Ada `with`
+clause, a Swift Package Manager sibling-target import, and a Terraform
+`module` block all resolving correctly through the actual `grv` binary,
+not just Rust unit tests).
 
 A real bug this project's own dogfooding against its own repo caught
 (and a useful example of why "run it on yourself" stays part of this
@@ -566,7 +605,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.20)
+## Language coverage (v0.21)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its

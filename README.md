@@ -421,7 +421,7 @@ same file defines it more than once (e.g. two `impl` blocks each with
 confident label; `[unique: path:line Foo::bar]` when there's only one
 candidate anywhere even though it's not local; `[import-resolved:
 path:line Foo::bar]` when the call site's own file has a **real, resolved
-`use`/`import` statement** naming that exact definition (47 languages —
+`use`/`import` statement** naming that exact definition (50 languages —
 see "Import resolution" below) — genuine resolution via an actual import,
 not a heuristic; `[ambiguous -- N candidates, none in this
 file: ...]` listing every remaining real candidate's file and scope when
@@ -439,13 +439,13 @@ import resolver, not just a heuristic, for the languages it covers.
 `grv index` also extracts every `use`/`import`/`require`/`#include`
 statement (`crates/indexer/src/imports.rs`) and resolves it to an actual
 file in the repo where possible (`crates/indexer/src/resolve.rs`), for
-**47 languages**: Rust (crate/module tree, discovered from every
+**50 languages**: Rust (crate/module tree, discovered from every
 `Cargo.toml`'s package name), Python (relative-import directory resolution
 plus a bounded source-root guess), JavaScript/TypeScript/TSX (relative-path
 + extension resolution), Go (`go.mod`'s module path — an import can
 legitimately resolve to several files, since it names a whole package),
 C/C++/Objective-C/GLSL/HLSL/Verilog/Vim/Proto/Solidity/Nix/Bash/Fish/Ruby/
-R/Racket/CMake/Erlang/Zig/PHP/LaTeX/Dart/Scheme/PowerShell (quoted/
+R/Racket/CMake/Erlang/Zig/PHP/LaTeX/Dart/Scheme/PowerShell/Assembly (quoted/
 relative-literal path resolution — `#include "x"` resolved against the
 including file's own directory, real search-path semantics, while
 `#include <x>` is always a system header, correctly never even recorded),
@@ -458,20 +458,28 @@ resolves to that one module's own file, never a directory listing — these
 are one-module-per-file languages, not package languages; an earlier
 version of this resolver got Elm's case wrong exactly this way before the
 distinction was made explicit), Lua (dotted-to-slash `package.path`
-convention), and Ada/OCaml/Perl/Fortran/Elixir, each via its own
-genuinely different naming convention (GNAT's dash-joined-lowercase flat
-naming; OCaml's lowercase-outermost-segment; Perl's `::`-to-`/`
-CPAN convention; a flat filename guess for Fortran, which has no real
-convention at all; Mix's CamelCase-to-snake_case under `lib/` for Elixir).
-An import that can't be resolved (an external crate/package/system
-header, the stdlib, a `tsconfig.json` path alias, a non-standard Rust
-`#[path]` layout, PSR-4 autoloading for PHP `use`, a multi-segment OCaml
-`open` naming a sub-module rather than a compilation unit) is left
-unresolved — never a wrong guess. This is what powers
-`ResolutionHint::ImportResolved` above; see ARCHITECTURE.md's "Import
-resolution" section for exactly what each language's resolver can and
-can't do, and for the 4 parsed languages (Nim, VHDL, Prolog, Crystal)
-that still don't have one, with the specific reason each was left out.
+convention), Ada/OCaml/Perl/Fortran/Elixir, each via its own genuinely
+different naming convention (GNAT's dash-joined-lowercase flat naming;
+OCaml's lowercase-outermost-segment; Perl's `::`-to-`/` CPAN convention;
+a flat filename guess for Fortran, which has no real convention at all;
+Mix's CamelCase-to-snake_case under `lib/` for Elixir), Swift (Swift
+Package Manager's own target-to-directory convention: `import CoreModule`
+resolves to every file under `Sources/CoreModule/`, a whole subtree, for
+a sibling target in the same multi-target package — an external
+framework has no matching directory and stays honestly unresolved), and
+Terraform/HCL (`module "x" { source = "./y" }` resolves to every `.tf`
+file in the referenced directory — same multi-file honesty as Go; a
+registry/git reference is unambiguously external and never even
+extracted). An import that can't be resolved (an external crate/package/
+system header, the stdlib, a `tsconfig.json` path alias, a non-standard
+Rust `#[path]` layout, PSR-4 autoloading for PHP `use`, a multi-segment
+OCaml `open` naming a sub-module rather than a compilation unit, a Swift
+`import` of an external framework) is left unresolved — never a wrong
+guess. This is what powers `ResolutionHint::ImportResolved` above; see
+ARCHITECTURE.md's "Import resolution" section for exactly what each
+language's resolver can and can't do, and for the 8 parsed languages
+(Nim, VHDL, Prolog, Crystal, GraphQL, WGSL, Svelte, Vue) that still don't
+have one, with the specific reason each was left out.
 
 ### Watch mode — `grv index --watch`
 
@@ -551,7 +559,7 @@ an internet-facing service — but a passive listener on the wire can no
 longer read the token off it, which is the specific gap this
 closes.
 
-## Current scope (v0.20)
+## Current scope (v0.21)
 
 Run `grv languages` any time for the live version of this list.
 
@@ -600,5 +608,5 @@ Run `grv languages` any time for the live version of this list.
 
 ## Roadmap
 
-- Call-graph *type/full scope* resolution — still name-based by design; a real import resolver now exists for 47 languages (see "Import resolution" above, and `ResolutionHint::ImportResolved`), but true type resolution (knowing exactly which overload/trait impl a call targets) is a different order of engineering effort, on par with what a language server spends its whole existence on. 4 parsed languages still have no import resolver at all — Nim (its grammar has no import-related node to extract from), VHDL (no reliable package-to-file naming convention exists), Prolog (directive shape too uncertain to encode safely), Crystal (confirmed via a real parse-tree dump that its grammar doesn't parse `require "..."` as a call node at all) — extending to any of them needs either a grammar upgrade or genuinely new research, not just more of the same pattern.
+- Call-graph *type/full scope* resolution — still name-based by design; a real import resolver now exists for 50 languages (see "Import resolution" above, and `ResolutionHint::ImportResolved`), but true type resolution (knowing exactly which overload/trait impl a call targets) is a different order of engineering effort, on par with what a language server spends its whole existence on. 8 parsed languages still have no import resolver at all — Nim (its grammar has no import-related node to extract from), VHDL (no reliable package-to-file naming convention exists), Prolog (directive shape too uncertain to encode safely), Crystal (confirmed via a real parse-tree dump that its grammar doesn't parse `require "..."` as a call node at all), GraphQL and WGSL (no import/include concept in their own spec at all), Svelte and Vue (their real imports live inside a `<script>` block both grammars parse as one opaque `raw_text` node) — extending to any of them needs either a grammar upgrade, a language-injection parse pass, or genuinely new research, not just more of the same pattern.
 - Svelte/Vue symbol extraction would need a second, injection-based parse of their `<script>` block's embedded JS/TS — the grammars themselves only expose it as opaque text.

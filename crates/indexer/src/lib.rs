@@ -1107,4 +1107,83 @@ mod index_repo_tests {
             .collect();
         assert_eq!(paths, vec!["Other.psm1".to_string()]);
     }
+
+    /// Assembly's GAS-style `.include "helper.inc"` -- a real relative
+    /// path, resolved the same way as C's `#include "x"`.
+    #[test]
+    fn asm_include_resolves_to_sibling_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.inc"), "MACRO_X equ 1\n").unwrap();
+        std::fs::write(dir.path().join("main.asm"), ".include \"helper.inc\"\nmov eax, 1\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'helper.inc'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["helper.inc".to_string()]);
+    }
+
+    /// Swift Package Manager's `import CoreModule` -- resolves to every
+    /// `.swift` file under `Sources/CoreModule/`, recursively; a bare
+    /// `import Foundation` (no matching directory) must stay unresolved.
+    #[test]
+    fn swift_import_resolves_to_every_file_under_the_target_sources_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Sources/CoreModule/Nested")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Sources/App")).unwrap();
+        std::fs::write(dir.path().join("Sources/CoreModule/Widget.swift"), "struct Widget {}\n").unwrap();
+        std::fs::write(dir.path().join("Sources/CoreModule/Nested/Helper.swift"), "struct Helper {}\n").unwrap();
+        std::fs::write(dir.path().join("Sources/App/main.swift"), "import Foundation\nimport CoreModule\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'CoreModule.*'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["Sources/CoreModule/Nested/Helper.swift".to_string(), "Sources/CoreModule/Widget.swift".to_string()]);
+
+        let foundation_resolved: i64 = conn
+            .query_row("SELECT COUNT(*) FROM imports i JOIN import_resolutions r ON r.import_id = i.id WHERE i.raw_path = 'Foundation.*'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(foundation_resolved, 0, "an external framework must never resolve to a real file");
+    }
+
+    /// Terraform's `module "vpc" { source = "./modules/vpc" }` -- resolves
+    /// to every `.tf` file in the referenced directory.
+    #[test]
+    fn hcl_module_source_resolves_to_every_tf_file_in_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("modules/vpc")).unwrap();
+        std::fs::write(dir.path().join("modules/vpc/main.tf"), "resource \"aws_vpc\" \"this\" {}\n").unwrap();
+        std::fs::write(dir.path().join("modules/vpc/outputs.tf"), "output \"id\" {}\n").unwrap();
+        std::fs::write(dir.path().join("main.tf"), "module \"vpc\" {\n  source = \"./modules/vpc\"\n}\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let mut paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = './modules/vpc'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["modules/vpc/main.tf".to_string(), "modules/vpc/outputs.tf".to_string()]);
+    }
 }

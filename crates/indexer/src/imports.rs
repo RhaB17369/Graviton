@@ -123,6 +123,9 @@ pub fn extract_imports(content: &str, language: Lang) -> Vec<ImportEdge> {
         Lang::Lua => command_style::lua_require(&tree, bytes),
         Lang::Scheme => command_style::scheme_include(&tree, bytes),
         Lang::PowerShell => command_style::powershell_dotsource(&tree, bytes),
+        Lang::Asm => query_based::asm_include(&tree, bytes),
+        Lang::Swift => query_based::swift_import(&tree, bytes),
+        Lang::Hcl => query_based::hcl_module_source(&tree, bytes),
         // Nim (immature 0.1.0 grammar with no import-related node found in
         // a real check -- rather than guess at an unverified shape), VHDL
         // (no reliable package-to-file naming convention exists to
@@ -133,8 +136,16 @@ pub fn extract_imports(content: &str, language: Lang) -> Vec<ImportEdge> {
         // "..."` -- with or without parens -- as a call/macro-invocation
         // node at all; it splits into two unrelated `expression_statement`
         // nodes, so there is no node shape to hook a resolver onto yet)
-        // are deliberately left unhandled -- see ARCHITECTURE.md's
-        // "Import resolution" section.
+        // are deliberately left unhandled. GraphQL and WGSL have no
+        // import/include concept in their own spec at all (checked
+        // against their real node-types.json -- no node type name even
+        // contains "import"/"include") -- correctly nothing to extract,
+        // not a gap. Svelte/Vue's real imports live inside a `<script>`
+        // block that these grammars parse as one opaque `raw_text` node
+        // (same limitation already documented for `def_query_src` --
+        // recovering them needs a second, language-injection parse pass
+        // this project doesn't do). See ARCHITECTURE.md's "Import
+        // resolution" section for the full accounting.
         _ => Vec::new(),
     }
 }
@@ -1045,6 +1056,110 @@ mod query_based {
         }
         out
     }
+
+    /// Assembly's `include` directive, across the real spellings this
+    /// project's tree-sitter-asm grammar actually parses differently
+    /// (confirmed via a real debug dump, not assumed from one sample):
+    /// GAS/MASM's `.include "x"` is a dedicated `meta` node (`kind` field
+    /// text `.include`) -- extracted precisely. NASM's `%include "x"`
+    /// isn't understood by this grammar at all -- the leading `%` becomes
+    /// an `ERROR` node -- but the `include "x"` that follows it still
+    /// parses as an ordinary `instruction` node with `kind` text
+    /// `"include"` and a single `string` operand, the exact same shape a
+    /// bare `INCLUDE "x"` (no `%`, some assemblers' own spelling) parses
+    /// as too. Matched by `kind` text alone (case-insensitive, for MASM):
+    /// "include" is not a real instruction mnemonic in any assembly
+    /// dialect, so this can't collide with a genuine instruction the way
+    /// a looser heuristic might.
+    pub(super) fn asm_include(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(meta kind: (meta_ident) @kind (string) @target) @import") {
+            let (Some(&kind), Some(&target), Some(&import_node)) = (m.get("kind"), m.get("target"), m.get("import")) else { continue };
+            if text(kind, bytes) != ".include" {
+                continue;
+            }
+            let line = import_node.start_position().row as i64 + 1;
+            let raw_path = text(target, bytes).trim_matches('"').to_string();
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        for m in query_matches(tree, bytes, "(instruction kind: (word) @kind (string) @target) @import") {
+            let (Some(&kind), Some(&target), Some(&import_node)) = (m.get("kind"), m.get("target"), m.get("import")) else { continue };
+            if !text(kind, bytes).eq_ignore_ascii_case("include") {
+                continue;
+            }
+            let line = import_node.start_position().row as i64 + 1;
+            let raw_path = text(target, bytes).trim_matches('"').to_string();
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// Swift's `import Foundation` / `import MyTarget.Something`. Swift
+    /// has no per-file module concept the way Java/Python do -- a whole
+    /// compiled target/framework is one module -- so this is always
+    /// treated as a wildcard the same way a Go package import is: the
+    /// resolvable case (a Swift Package Manager multi-target package
+    /// importing a sibling target, e.g. `import CoreModule`) names a
+    /// whole `Sources/<Target>/` directory, not one file (see
+    /// `resolve_swift_module` in `resolve.rs`); an external framework
+    /// (`Foundation`, `UIKit`, ...) simply has no matching directory and
+    /// stays honestly unresolved, the same pattern every other language's
+    /// external-dependency imports already use.
+    pub(super) fn swift_import(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(import_declaration (identifier) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw = text(target, bytes);
+            out.push(ImportEdge { raw_path: format!("{raw}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// Terraform/HCL's `module "name" { source = "./path" }` -- the one
+    /// real cross-file(-directory) reference this grammar has, and a
+    /// genuinely different shape from every other language here: `block`/
+    /// `attribute` are fully generic/positional nodes (verified against
+    /// real node-types.json -- no dedicated `module_block`/`source`
+    /// field exists at all), so this walks them by hand rather than a
+    /// single declarative query. Only a literal string `source` (no
+    /// interpolation/variable) starting with `./`/`../` is extracted --
+    /// a registry reference (`terraform-aws-modules/vpc/aws`) or a git
+    /// URL is unambiguously external and correctly left unextracted
+    /// rather than guessed at. Always a wildcard: a Terraform module is a
+    /// whole directory of `.tf` files, resolved the same multi-file way
+    /// Go's package imports are (see `resolve_hcl_module`).
+    pub(super) fn hcl_module_source(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut blocks = Vec::new();
+        find_nodes(tree.root_node(), "block", &mut blocks);
+        for block in blocks {
+            let mut cursor = block.walk();
+            let Some(block_kind) = block.children(&mut cursor).find(|c| c.kind() == "identifier") else { continue };
+            if text(block_kind, bytes) != "module" {
+                continue;
+            }
+            let Some(body) = block.children(&mut block.walk()).find(|c| c.kind() == "body") else { continue };
+            let mut attrs = Vec::new();
+            find_nodes(body, "attribute", &mut attrs);
+            for attr in attrs {
+                let Some(attr_name) = attr.children(&mut attr.walk()).find(|c| c.kind() == "identifier") else { continue };
+                if text(attr_name, bytes) != "source" {
+                    continue;
+                }
+                let mut strings = Vec::new();
+                find_nodes(attr, "string_lit", &mut strings);
+                let Some(&string_node) = strings.first() else { continue };
+                let raw = text(string_node, bytes).trim_matches('"').to_string();
+                if !(raw.starts_with("./") || raw.starts_with("../")) {
+                    continue; // a registry/git reference -- unambiguously external
+                }
+                let line = attr.start_position().row as i64 + 1;
+                out.push(ImportEdge { raw_path: raw, imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+            }
+        }
+        out
+    }
 }
 
 /// Languages whose `source`/`require`-style import is an *ordinary*
@@ -1598,5 +1713,30 @@ mod tests {
         assert!(got.iter().any(|(p, _)| p.contains("helper.ps1")), "{got:?}");
         assert!(got.iter().any(|(p, _)| p.contains("Other.psm1")), "{got:?}");
         assert!(!got.iter().any(|(p, _)| p.contains("ActiveDirectory")), "a bare installed-module name must not be extracted: {got:?}");
+    }
+
+    #[test]
+    fn asm_include_gas_and_nasm_style() {
+        let src = ".include \"helper.inc\"\n%include \"other.inc\"\nINCLUDE thirdparty.inc\nmov eax, 1\n";
+        let got = edges(src, Lang::Asm);
+        assert!(got.contains(&("helper.inc".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("other.inc".to_string(), None)), "{got:?}");
+        assert!(!got.iter().any(|(p, _)| p.contains("mov")), "a real instruction must never be mistaken for an include: {got:?}");
+    }
+
+    #[test]
+    fn swift_import_plain_and_dotted() {
+        let src = "import Foundation\nimport CoreModule.Helper\n";
+        let got = edges(src, Lang::Swift);
+        assert!(got.contains(&("Foundation.*".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("CoreModule.Helper.*".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn hcl_module_source_local_only() {
+        let src = "module \"vpc\" {\n  source = \"./modules/vpc\"\n}\nmodule \"remote\" {\n  source = \"terraform-aws-modules/vpc/aws\"\n}\n";
+        let got = edges(src, Lang::Hcl);
+        assert!(got.contains(&("./modules/vpc".to_string(), None)), "{got:?}");
+        assert!(!got.iter().any(|(p, _)| p.contains("terraform-aws-modules")), "a registry reference must stay unextracted: {got:?}");
     }
 }

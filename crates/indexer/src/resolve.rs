@@ -68,14 +68,34 @@
 //!   real module-to-file convention at all), `resolve_elixir` (Mix's
 //!   CamelCase-per-segment -> snake_case-per-segment convention under
 //!   `lib/`). See each function's own doc for the specific reasoning.
+//! - **Assembly**: `.include`/`%include`/`INCLUDE` (whichever dialect an
+//!   assembler file uses) is a relative-literal path, resolved the same
+//!   way as C's `#include "x"`.
+//! - **Swift**: `import CoreModule` resolves to every `.swift` file under
+//!   `Sources/CoreModule/` (a real Swift Package Manager convention, for
+//!   a sibling target in the same multi-target package) via
+//!   `resolve_swift_module` -- a whole subtree, not one file or one flat
+//!   directory, unlike every other module language here. An external
+//!   framework (`Foundation`, `UIKit`, ...) has no matching directory and
+//!   stays honestly unresolved.
+//! - **Terraform/HCL**: `module "x" { source = "./y" }` resolves to every
+//!   `.tf` file in the referenced directory via `resolve_hcl_module` --
+//!   the same multi-file honesty Go's package imports use. A registry
+//!   reference or git URL is unambiguously external and never even
+//!   extracted (see `hcl_module_source` in `imports.rs`).
 //! - **Not resolved, with reasons rather than silence**: Nim (the grammar
 //!   has no import-related node at all to extract from), VHDL (no
 //!   reliable package-to-file naming convention exists to resolve
 //!   against), Prolog (directive shape too uncertain to encode safely),
-//!   and Crystal (confirmed via a real parse-tree dump that
+//!   Crystal (confirmed via a real parse-tree dump that
 //!   tree-sitter-crystal 0.1.0 doesn't parse `require "..."` as a call/
 //!   macro-invocation node at all, so there's no extraction to resolve in
-//!   the first place).
+//!   the first place), GraphQL and WGSL (no import/include concept in
+//!   their own spec at all -- checked against their real node-types.json,
+//!   correctly nothing to extract), and Svelte/Vue (their real imports
+//!   live inside a `<script>` block both grammars parse as one opaque
+//!   `raw_text` node -- the same language-injection gap already
+//!   documented for their missing `def_query_src`).
 //!
 //! An import that doesn't resolve to anything is exactly as informative as
 //! one that does: it means "not indexed" (an external dependency, the
@@ -481,6 +501,51 @@ fn resolve_dotted_module(raw_path: &str, wildcard_char: char, ext: &str, roots: 
     out
 }
 
+/// Swift Package Manager's own target-to-directory convention: `import
+/// CoreModule` (a sibling target in the same multi-target package, the
+/// only case that's ever repo-relative -- an external framework like
+/// `Foundation` simply has no matching directory) resolves to every
+/// `.swift` file anywhere under `Sources/<CoreModule>/`, recursively --
+/// unlike every dotted-module resolver above, a Swift target is not one
+/// file NOR a single flat directory, it's a whole subtree, so this scans
+/// `all_paths` by prefix rather than doing one `files_by_dir` lookup.
+/// Only the first (outermost) dotted segment is the real target name --
+/// `import CoreModule.Helper` still resolves via `CoreModule` alone, the
+/// same "can't see inside a file" honesty `resolve_ocaml` already states.
+fn resolve_swift_module(raw_path: &str, all_paths: &HashSet<String>) -> Vec<String> {
+    let clean = raw_path.strip_suffix(".*").unwrap_or(raw_path);
+    let Some(target) = clean.split('.').next().filter(|s| !s.is_empty()) else { return Vec::new() };
+    let prefix = format!("Sources/{target}/");
+    let mut out: Vec<String> = all_paths.iter().filter(|p| p.starts_with(&prefix) && p.ends_with(".swift")).cloned().collect();
+    out.sort();
+    out
+}
+
+/// Terraform/HCL's `module "x" { source = "./y" }`: a real relative
+/// path, joined against the importing file's own directory exactly like
+/// `resolve_relative_literal` does, but naming a whole directory of
+/// `.tf` files rather than one file -- resolved via the same
+/// `files_by_dir_for_ext`-style directory index Go's package imports use.
+fn resolve_hcl_module(raw_path: &str, importer_segs: &[String], tf_files_by_dir: &HashMap<Vec<String>, Vec<String>>) -> Vec<String> {
+    if raw_path.is_empty() {
+        return Vec::new();
+    }
+    let mut dir = parent_segs(importer_segs);
+    for part in raw_path.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                if dir.is_empty() {
+                    return Vec::new();
+                }
+                dir.pop();
+            }
+            seg => dir.push(seg.to_string()),
+        }
+    }
+    tf_files_by_dir.get(&dir).cloned().unwrap_or_default()
+}
+
 /// GNAT's Ada file-naming convention: a `with`-ed unit `Parent.Child` maps
 /// to `parent-child.ads`/`.adb` -- lowercased, and (unlike every
 /// slash-nested hierarchical resolver above) the `.` separator becomes a
@@ -727,6 +792,7 @@ pub fn resolve_all_imports(conn: &Connection, root: &Path) -> Result<usize> {
     let fortran_roots = conventional_roots(&all_paths, &["src"]);
     let elixir_roots = conventional_roots(&all_paths, &["lib"]);
     let lua_roots = conventional_roots(&all_paths, &["lua", "src"]);
+    let tf_files_by_dir = files_by_dir_for_ext(&all_paths, "tf");
 
     let imports: Vec<(i64, i64, String, Option<String>, Option<String>)> = {
         let mut stmt = conn.prepare("SELECT id, file_id, raw_path, imported_name, module_prefix FROM imports")?;
@@ -833,6 +899,17 @@ pub fn resolve_all_imports(conn: &Connection, root: &Path) -> Result<usize> {
             // -> slash convention; no wildcard form exists, so the
             // wildcard char is disabled the same way C#'s is.
             "lua" => resolve_dotted_module(&raw_path, '\0', "lua", &lua_roots, &HashMap::new(), false, &all_paths),
+            // Assembly's `include` directive is a real relative-literal
+            // path, same shape as C's `#include "x"`.
+            "asm" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["inc", "asm", "s"]),
+            // Swift Package Manager's sibling-target convention -- see
+            // `resolve_swift_module`'s doc for why this can't reuse
+            // `resolve_dotted_module` (a target is a whole subtree, not a
+            // flat directory or a single file).
+            "swift" => resolve_swift_module(&raw_path, &all_paths),
+            // Terraform/HCL's `module` block -- a relative directory
+            // reference, resolved to every `.tf` file in it.
+            "hcl" => resolve_hcl_module(&raw_path, &importer_segs, &tf_files_by_dir),
             _ => Vec::new(),
         };
         for p in resolved_paths {
