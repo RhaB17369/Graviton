@@ -39,9 +39,14 @@ tree-sitter-r = "1.3"
 tree-sitter-julia = "0.23"
 tree-sitter-ocaml = "0.25"
 tree-sitter-elm = "5.9"
-# Vendored, patched fork (not the stale crates.io 0.1.0 with no
-# import-related node at all) -- see vendor/tree-sitter-nim/NOTICE.md.
-tree-sitter-nim = { path = "../../vendor/tree-sitter-nim" }
+# Patched fork (not the stale crates.io 0.1.0, which has no
+# import-related node at all) -- one line relaxing its tree-sitter
+# version pin so it can link against this workspace's 0.26. Was
+# vendored locally at first (no repo existed yet to host it); now a
+# real `git` dependency pinned to an exact commit, same pattern as
+# `tree-sitter-vuejs` below. See that repo's own README.md for the
+# full rationale and exactly what was changed from upstream.
+tree-sitter-nim = { git = "https://github.com/RhaB17369/tree-sitter-nim", rev = "68b07d925a67472b5877f5c4bc0dd0cf50260a8c" }
 tree-sitter-erlang = "0.20"
 tree-sitter-groovy = "0.1"
 tree-sitter-vim = "0.4"

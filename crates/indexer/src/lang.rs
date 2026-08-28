@@ -1197,10 +1197,11 @@ impl Lang {
                 (function_call_expr target: (value_expr name: (value_qid (lower_case_identifier) @callee))) @call
                 "#
             }
-            // `function` field, not `name` -- this project's vendored fork
-            // (see vendor/tree-sitter-nim/NOTICE.md) renamed it relative to
-            // the stale crates.io grammar this query was originally written
-            // against; verified via a real parse-tree dump.
+            // `function` field, not `name` -- this project's fork (see
+            // https://github.com/RhaB17369/tree-sitter-nim) renamed it
+            // relative to the stale crates.io grammar this query was
+            // originally written against; verified via a real parse-tree
+            // dump.
             Lang::Nim => {
                 r#"
                 (call function: (identifier) @callee) @call

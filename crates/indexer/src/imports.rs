@@ -157,8 +157,8 @@ pub fn extract_imports(content: &str, language: Lang) -> Vec<ImportEdge> {
         Lang::Wgsl => query_based::wgsl_preproc_import(&tree, bytes),
         Lang::Svelte | Lang::Vue => script_injected_imports(&tree, bytes),
         // Every parsed language now has a real import extractor -- Nim
-        // (vendored fork, see vendor/tree-sitter-nim/NOTICE.md), VHDL
-        // (`work` library convention), Prolog (`:-` directive shape),
+        // (a patched fork, https://github.com/RhaB17369/tree-sitter-nim),
+        // VHDL (`work` library convention), Prolog (`:-` directive shape),
         // Crystal (vendored fork, see vendor/tree-sitter-crystal/NOTICE.md),
         // GraphQL (the `graphql-import` comment convention), WGSL
         // (naga_oil's `#import`, a real grammar node in the Bevy-flavored
@@ -1326,10 +1326,10 @@ mod query_based {
     }
 
     /// Nim's `import a, b`, `from a import x, y`, and `include a` --
-    /// verified against the vendored fork's real grammar (see
-    /// `vendor/tree-sitter-nim/NOTICE.md`; the stale crates.io grammar has
-    /// no import-related node at all, which is why this was previously
-    /// left unhandled). A module path can be a bare name (`strutils`), a
+    /// verified against a patched fork's real grammar
+    /// (https://github.com/RhaB17369/tree-sitter-nim; the stale crates.io
+    /// grammar has no import-related node at all, which is why this was
+    /// previously left unhandled). A module path can be a bare name (`strutils`), a
     /// `/`-joined relative path (`pkg/helper`, `../parent/helper` -- Nim's
     /// own directory-then-search-path resolution, mirrored in
     /// `resolve_nim`), or aliased (`strutils as su`) -- all three parse as

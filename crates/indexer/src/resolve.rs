@@ -83,12 +83,12 @@
 //!   the same multi-file honesty Go's package imports use. A registry
 //!   reference or git URL is unambiguously external and never even
 //!   extracted (see `hcl_module_source` in `imports.rs`).
-//! - **Nim**: `import`/`from ... import`/`include`, via a vendored,
-//!   locally-patched fork (the only crates.io release has no
-//!   import-related node in its grammar at all -- see
-//!   `vendor/tree-sitter-nim/NOTICE.md`). `resolve_nim` tries the
-//!   importing file's own directory first (Nim's real lookup order), then
-//!   a bounded source root, same shape as Python's absolute imports.
+//! - **Nim**: `import`/`from ... import`/`include`, via a patched fork
+//!   (https://github.com/RhaB17369/tree-sitter-nim -- the only crates.io
+//!   release has no import-related node in its grammar at all).
+//!   `resolve_nim` tries the importing file's own directory first (Nim's
+//!   real lookup order), then a bounded source root, same shape as
+//!   Python's absolute imports.
 //! - **VHDL**: `use work.my_pkg.all` -- only the `work` library (VHDL's
 //!   own real, unambiguous "compiled from this repo" marker, not a
 //!   guessed convention) is resolved, via `resolve_vhdl_unit`'s flat

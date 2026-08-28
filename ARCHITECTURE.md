@@ -486,13 +486,16 @@ not fundamental limitations:**
   hard build error, not assumed. Relaxing that one version constraint
   (nothing else) was verified to parse real Nim source correctly against
   0.26's actual runtime — the C-level ABI doesn't care which Rust crate
-  version generated the binding glue. The user was asked how to host this
-  one-line-patched fork (a `git` dependency to a pushed copy, matching the
-  `tree-sitter-vuejs` precedent, needs a repository this session had no
-  credentials to create) and chose to vendor it directly
-  (`vendor/tree-sitter-nim/`, ~41MB — see its `NOTICE.md`). Its call query
-  needed the same kind of fix as Crystal's (`name` field → `function`
-  field, verified via a dump).
+  version generated the binding glue. This session had no GitHub API/`gh`
+  CLI credentials to create a repository to host the one-line-patched fork
+  as a `git` dependency (the normal move, matching the `tree-sitter-vuejs`
+  precedent), so it was vendored locally at first as an interim step —
+  the user then created `github.com/RhaB17369/tree-sitter-nim` themselves,
+  the patched fork was pushed there, and `crates/indexer/Cargo.toml` now
+  depends on it via `git`, pinned to an exact commit, same as
+  `tree-sitter-vuejs`; the vendored copy was removed once that was
+  verified working. Its call query needed the same kind of fix as
+  Crystal's (`name` field → `function` field, verified via a dump).
 - **VHDL**: previously declined as "no reliable package-to-file naming
   convention exists" — true in general, but `use work.my_pkg.all` is a
   real exception: `work` is VHDL's own unambiguous "compiled from this
@@ -841,10 +844,10 @@ core:
   grammar actually has). Svelte/Vue did not — see the tier breakdown above
   for why that's a real, different limitation, not an oversight.
 
-### Vendored grammars — Nim, Crystal (`vendor/`)
+### A vendored grammar and a patched fork — Crystal, Nim
 
-The next escalation from the fork-replacement pattern above, for the two
-cases where even a `git` dependency to a better fork wasn't enough:
+The next escalation from the fork-replacement pattern above, for two
+cases where even a `git` dependency to a better fork wasn't straightforward:
 
 - **Crystal**: `crystal-lang-tools/tree-sitter-crystal` (the fix -- see
   "Import resolution" above for why the crates.io release needed
@@ -853,11 +856,14 @@ cases where even a `git` dependency to a better fork wasn't enough:
   practice, `cargo build` against it repeatedly hit a transient SSL/
   network error specific to this sandbox (`SSL error: unknown error;
   class=Ssl (16)`), even with `net.git-fetch-with-cli` enabled (added to
-  `~/.cargo/config.toml` for this reason, and harmless to leave on
+  `.cargo/config.toml` for this reason, and harmless to leave on
   regardless) -- while a plain `git clone` of the exact same commit
   succeeded reliably in well under a minute. Rather than keep fighting
   one host's flaky connectivity in this specific environment, the
-  already-cloned source was vendored directly into `vendor/tree-sitter-crystal/`.
+  already-cloned source was vendored directly into
+  `vendor/tree-sitter-crystal/` (see its `NOTICE.md` for the exact
+  upstream commit and what, if anything, was changed -- nothing, in
+  Crystal's case).
 - **Nim**: a harder case than Crystal's -- `alaviss/tree-sitter-nim`'s own
   Rust binding still depends on the pre-shim, full `tree-sitter` crate
   directly (pinned `~0.25`), which is a real `links = "tree-sitter"`
@@ -869,23 +875,33 @@ cases where even a `git` dependency to a better fork wasn't enough:
   parser exposes doesn't depend on which Rust crate version wrote the
   binding glue around it. Patching a dependency's manifest can't be done
   through a plain `git`/registry dependency at all (Cargo always honors
-  the depended-on crate's own declared version requirements) -- normally
-  this project's move would be to fork the upstream repo, apply the
-  patch, and depend on that fork via `git` (the same shape as the Vue
-  dependency above), but this session had no GitHub API/`gh` CLI
-  credentials available to create a new repository for it. Asked
-  directly, the user chose to vendor the (one-line-patched) source
-  locally instead of waiting on that -- `vendor/tree-sitter-nim/`, ~41MB,
-  by far the largest thing in this repository, a real and known tradeoff
-  the user made explicitly aware of the size.
+  the depended-on crate's own declared version requirements), so this
+  needed a real fork, hosted somewhere, the same shape as the
+  `tree-sitter-vuejs` dependency above -- this session had no GitHub API/
+  `gh` CLI credentials to create that repository itself, so the patched
+  source was vendored locally as an interim step (`vendor/tree-sitter-nim/`,
+  ~41MB, by far the largest thing in this repository at the time -- the
+  user was asked and explicitly chose to accept that size rather than
+  wait). The user then created
+  [`github.com/RhaB17369/tree-sitter-nim`](https://github.com/RhaB17369/tree-sitter-nim)
+  themselves; the patched fork was pushed there (with its own `README.md`
+  recording the same provenance the vendored copy's `NOTICE.md` had),
+  verified as a real `git` Cargo dependency end-to-end, and
+  `crates/indexer/Cargo.toml` now depends on it that way, pinned to an
+  exact commit -- the vendored copy was removed once that was confirmed
+  working, so Nim ended up on the SAME pattern as Vue/Crystal after all,
+  just via an extra intermediate step this particular session's tooling
+  gaps forced.
 
-Both `vendor/*/NOTICE.md` files record the exact upstream commit, exactly
-what (if anything) was changed from it, and why vendoring was the right
-call over every other option tried first -- read those before touching
-either directory again, especially before "helpfully" upgrading either
-grammar to a newer upstream commit without re-deriving whether the same
-patch (or no patch at all, if upstream fixes it first) is still needed.
-Swapping either grammar broke that language's *existing*
+`vendor/tree-sitter-crystal/NOTICE.md` records the exact upstream commit,
+exactly what (if anything) was changed from it, and why vendoring was the
+right call over every other option tried first -- read it before touching
+that directory again, especially before "helpfully" upgrading the grammar
+to a newer upstream commit without re-deriving whether the same
+workaround (or none at all, if the sandbox's connectivity or upstream's
+crates.io presence improves) is still needed. Swapping either grammar
+(Crystal here; Nim before it moved to `RhaB17369/tree-sitter-nim`) broke
+that language's *existing*
 `def_query_src`/`call_query_src` (different field/node names between the
 old and new grammars, e.g. Crystal's `method_definition`/`(call name:
 ...)` → `method_def`/`(call method: ...)`) -- an expected, real cost of a

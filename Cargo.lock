@@ -2910,6 +2910,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-nim"
 version = "0.6.2"
+source = "git+https://github.com/RhaB17369/tree-sitter-nim?rev=68b07d925a67472b5877f5c4bc0dd0cf50260a8c#68b07d925a67472b5877f5c4bc0dd0cf50260a8c"
 dependencies = [
  "cc",
  "tree-sitter",
