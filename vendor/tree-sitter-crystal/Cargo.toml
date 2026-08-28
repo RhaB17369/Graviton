@@ -1,0 +1,28 @@
+# Vendored copy of crystal-lang-tools/tree-sitter-crystal
+# (https://github.com/crystal-lang-tools/tree-sitter-crystal), commit
+# 50ca9e6fcfb16a2cbcad59203cfd8ad650e25c49. See NOTICE.md in this
+# directory for exactly why this is vendored instead of a normal
+# dependency.
+
+[package]
+name = "tree-sitter-crystal"
+description = "Crystal grammar for tree-sitter (vendored)"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+build = "bindings/rust/build.rs"
+include = ["bindings/rust/*", "grammar.js", "src/*"]
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1.1"
+
+[dev-dependencies]
+tree-sitter = "0.26"

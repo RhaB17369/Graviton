@@ -60,6 +60,29 @@ pub struct ImportEdge {
 /// missing resolver never breaks indexing, it just means call sites in
 /// that language don't get the extra `ResolutionHint::ImportResolved`
 /// signal yet.
+/// Whether `resolve_all_imports` (`resolve.rs`) has a real resolver for
+/// this language's raw import edges -- an EXHAUSTIVE match, not a
+/// hand-maintained list that could silently drift out of sync with
+/// `extract_imports`'s own dispatch above, so adding a language anywhere
+/// in the `Lang` enum forces an explicit true/false choice here rather
+/// than silently defaulting to one -- the same discipline `lang.rs`'s
+/// `ALL_LANGS` compile-time-exhaustive match already holds this project
+/// to. `Wgsl` is the one language with real extraction (see
+/// `query_based::wgsl_preproc_import`) but deliberately NO resolver --
+/// naga_oil modules are registered by an arbitrary name, not a
+/// file-per-module convention, so there is nothing reliable to resolve
+/// against. This is what `grv languages` reports under "import
+/// resolution" -- see `cmd_languages` in `crates/cli/src/main.rs`.
+pub fn has_import_resolver(lang: Lang) -> bool {
+    use Lang::*;
+    match lang {
+        Rust | Python | JavaScript | TypeScript | Tsx | Go | C | Cpp | ObjC | Glsl | Hlsl | Vim | Proto | Solidity | Verilog | Nix | Bash | Fish | Ruby | R | Racket
+        | CMake | Java | Kotlin | Groovy | Scala | CSharp | Elm | Haskell | D | Julia | Erlang | Zig | Php | Latex | Dart | Scheme | PowerShell | Ada | OCaml | Perl
+        | Elixir | Fortran | Lua | Crystal | Asm | Swift | Hcl | Nim | Vhdl | Prolog | GraphQL | Svelte | Vue => true,
+        Wgsl | Html | Css | Json | Yaml | Toml | Xml | Markdown | Sql | Dockerfile | Ini | Makefile | Other => false,
+    }
+}
+
 pub fn extract_imports(content: &str, language: Lang) -> Vec<ImportEdge> {
     let Some(ts_lang) = language.ts_language() else {
         return Vec::new();
@@ -93,6 +116,7 @@ pub fn extract_imports(content: &str, language: Lang) -> Vec<ImportEdge> {
         Lang::CSharp => query_based::dotted_module_imports(&tree, bytes, "(using_directive [(qualified_name) (identifier)] @target) @import", None, true),
         Lang::Scala => query_based::scala_import(&tree, bytes),
         Lang::Elm => query_based::elm_import(&tree, bytes),
+        Lang::Nim => query_based::nim_import(&tree, bytes),
         // D/Haskell/Julia: their plain (non-`qualified`) import brings a
         // whole module's exports into *unqualified* scope, unlike Java-
         // style "import one class" -- so each gets its own function that
@@ -116,36 +140,38 @@ pub fn extract_imports(content: &str, language: Lang) -> Vec<ImportEdge> {
         Lang::Latex => query_based::latex_include(&tree, bytes),
         Lang::Dart => query_based::dart_import(&tree, bytes),
         Lang::Ada => query_based::ada_with(&tree, bytes),
+        Lang::Vhdl => query_based::vhdl_use(&tree, bytes),
         Lang::OCaml => query_based::ocaml_open(&tree, bytes),
+        Lang::Prolog => query_based::prolog_directive(&tree, bytes),
         Lang::Perl => query_based::perl_use(&tree, bytes),
         Lang::Fortran => query_based::fortran_include(&tree, bytes),
         Lang::Elixir => query_based::elixir_alias(&tree, bytes),
         Lang::Lua => command_style::lua_require(&tree, bytes),
+        Lang::Crystal => command_style::crystal_require(&tree, bytes),
         Lang::Scheme => command_style::scheme_include(&tree, bytes),
         Lang::PowerShell => command_style::powershell_dotsource(&tree, bytes),
         Lang::Asm => query_based::asm_include(&tree, bytes),
         Lang::Swift => query_based::swift_import(&tree, bytes),
         Lang::Hcl => query_based::hcl_module_source(&tree, bytes),
-        // Nim (immature 0.1.0 grammar with no import-related node found in
-        // a real check -- rather than guess at an unverified shape), VHDL
-        // (no reliable package-to-file naming convention exists to
-        // resolve against at all, unlike every language above), Prolog
-        // (directive shape too uncertain to encode safely from this
-        // batch's investigation), and Crystal (confirmed via a real debug
-        // dump that tree-sitter-crystal 0.1.0 does not parse `require
-        // "..."` -- with or without parens -- as a call/macro-invocation
-        // node at all; it splits into two unrelated `expression_statement`
-        // nodes, so there is no node shape to hook a resolver onto yet)
-        // are deliberately left unhandled. GraphQL and WGSL have no
-        // import/include concept in their own spec at all (checked
-        // against their real node-types.json -- no node type name even
-        // contains "import"/"include") -- correctly nothing to extract,
-        // not a gap. Svelte/Vue's real imports live inside a `<script>`
-        // block that these grammars parse as one opaque `raw_text` node
-        // (same limitation already documented for `def_query_src` --
-        // recovering them needs a second, language-injection parse pass
-        // this project doesn't do). See ARCHITECTURE.md's "Import
-        // resolution" section for the full accounting.
+        Lang::GraphQL => query_based::graphql_import_comment(&tree, bytes),
+        Lang::Wgsl => query_based::wgsl_preproc_import(&tree, bytes),
+        Lang::Svelte | Lang::Vue => script_injected_imports(&tree, bytes),
+        // Every parsed language now has a real import extractor -- Nim
+        // (vendored fork, see vendor/tree-sitter-nim/NOTICE.md), VHDL
+        // (`work` library convention), Prolog (`:-` directive shape),
+        // Crystal (vendored fork, see vendor/tree-sitter-crystal/NOTICE.md),
+        // GraphQL (the `graphql-import` comment convention), WGSL
+        // (naga_oil's `#import`, a real grammar node in the Bevy-flavored
+        // fork this project already links), and Svelte/Vue (a real
+        // second parse pass over the `<script>` block's own text, see
+        // `script_injected_imports` above) were all previously left
+        // unhandled here for reasons that turned out to be either fixable
+        // (a stale/wrong grammar) or simply not yet investigated -- see
+        // ARCHITECTURE.md's "Import resolution" section for exactly what
+        // was wrong and how each was fixed. `_ => Vec::new()` below is
+        // now unreachable for every real parsed language; it only still
+        // matches the 11 tagged-only markup/data formats (no grammar to
+        // extract from at all) and `Lang::Other`.
         _ => Vec::new(),
     }
 }
@@ -183,6 +209,59 @@ fn find_nodes_nested<'a>(root: Node<'a>, kind: &str, out: &mut Vec<Node<'a>>) {
     for child in root.children(&mut cursor) {
         find_nodes_nested(child, kind, out);
     }
+}
+
+/// Svelte/Vue: the real imports inside a `<script>` block are ordinary
+/// JS/TS -- but both grammars parse that block's entire body as one
+/// opaque `raw_text` node (the same "language injection" limitation
+/// already documented for their missing `def_query_src`), so there is no
+/// grammar shape at the OUTER level to hook an extractor onto directly.
+/// This does a real second parse pass instead: slice out the `<script>`
+/// element's own source text, re-parse that substring with the JS or TS
+/// grammar (`lang="ts"`/`lang="typescript"` on the `<script>` tag picks
+/// TS, anything else -- including no `lang` attribute at all -- picks
+/// JS, checked against the real `attribute` shape both grammars share),
+/// run the EXISTING `js::imports` walker on that second tree (no
+/// duplicated logic), then shift every resulting line number by the
+/// script block's own starting line, since a fresh parse of a substring
+/// always starts counting its own lines from 0.
+fn script_injected_imports(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+    let mut out = Vec::new();
+    let mut scripts = Vec::new();
+    find_nodes(tree.root_node(), "script_element", &mut scripts);
+    for script in scripts {
+        let mut cursor = script.walk();
+        let Some(start_tag) = script.children(&mut cursor).find(|c| c.kind() == "start_tag") else { continue };
+        let mut attrs = Vec::new();
+        find_nodes(start_tag, "attribute", &mut attrs);
+        let is_typescript = attrs.iter().any(|attr| {
+            let mut acursor = attr.walk();
+            let children: Vec<Node> = attr.children(&mut acursor).collect();
+            let Some(name_node) = children.iter().find(|c| c.kind() == "attribute_name") else { return false };
+            if text(*name_node, bytes) != "lang" {
+                return false;
+            }
+            let Some(value_node) = children.iter().find(|c| c.kind() != "attribute_name") else { return false };
+            matches!(text(*value_node, bytes).trim_matches(|c| c == '"' || c == '\'').as_ref(), "ts" | "typescript")
+        });
+        let mut scursor = script.walk();
+        let Some(raw) = script.children(&mut scursor).find(|c| c.kind() == "raw_text") else { continue };
+        let script_bytes = &bytes[raw.start_byte()..raw.end_byte()];
+        let Ok(script_src) = std::str::from_utf8(script_bytes) else { continue };
+        let lang = if is_typescript { Lang::TypeScript } else { Lang::JavaScript };
+        let Some(ts_lang) = lang.ts_language() else { continue };
+        let mut parser = Parser::new();
+        if parser.set_language(&ts_lang).is_err() {
+            continue;
+        }
+        let Some(sub_tree) = parser.parse(script_src, None) else { continue };
+        let line_offset = raw.start_position().row as i64;
+        for mut edge in js::imports(&sub_tree, script_bytes) {
+            edge.line += line_offset;
+            out.push(edge);
+        }
+    }
+    out
 }
 
 mod rust {
@@ -941,6 +1020,28 @@ mod query_based {
         out
     }
 
+    /// VHDL's `use work.my_pkg.all;` -- only when the library is `work`
+    /// (case-insensitive, VHDL is case-insensitive throughout) is this a
+    /// reference to a unit compiled from THIS repo; `library`s named
+    /// anything else (`ieee.std_logic_1164`, a project-specific external
+    /// library) are compiled elsewhere and correctly never extracted --
+    /// `work` is VHDL's own real, unambiguous "the current design
+    /// library" marker, not a guessed convention the way Fortran's flat
+    /// filename guess has to be.
+    pub(super) fn vhdl_use(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(use_clause (selected_name_list (selected_name library: (_) @library package: (_) @package))) @import") {
+            let (Some(&library), Some(&package), Some(&import_node)) = (m.get("library"), m.get("package"), m.get("import")) else { continue };
+            if !text(library, bytes).eq_ignore_ascii_case("work") {
+                continue;
+            }
+            let line = import_node.start_position().row as i64 + 1;
+            let raw_path = text(package, bytes);
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
     /// OCaml's `open Module` / `open Module.Sub` -- brings the opened
     /// module's names into unqualified scope, always (there's no
     /// "selective open" or "qualified open" form the way Haskell/D have),
@@ -952,6 +1053,69 @@ mod query_based {
             let line = import_node.start_position().row as i64 + 1;
             let raw = text(target, bytes);
             out.push(ImportEdge { raw_path: format!("{raw}.*"), imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// Prolog's `:- use_module('path.pl').` / `:- consult('path.pl').` /
+    /// `:- ensure_loaded('path.pl').` (a quoted-atom argument -- a real
+    /// repo-relative path) and the `:- [File].` shorthand (SWI's implicit
+    /// consult, extension inferred as `.pl` in `resolve.rs`). Verified via
+    /// a real parse-tree dump: `clause`'s own grammar has no dedicated
+    /// "directive" node at all -- `:-` is just the FIRST (unnamed,
+    /// anonymous) child of a `unary_operation`, its own `kind()` literally
+    /// equal to the operator's text, which is what `op.kind() == ":-"`
+    /// checks below (as opposed to `?-`, a query, never a load directive).
+    /// `use_module(library(lists))` -- a `compound_term` argument rather
+    /// than a plain atom -- names an external/stdlib library, not a repo
+    /// file, and is correctly left unextracted rather than guessed at.
+    pub(super) fn prolog_directive(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut clauses = Vec::new();
+        find_nodes(tree.root_node(), "clause", &mut clauses);
+        for clause in clauses {
+            let Some(term) = clause.child_by_field_name("term") else { continue };
+            if term.kind() != "unary_operation" {
+                continue;
+            }
+            let Some(op) = term.child(0) else { continue };
+            if op.kind() != ":-" {
+                continue;
+            }
+            let Some(operand) = term.child_by_field_name("operand") else { continue };
+            let line = clause.start_position().row as i64 + 1;
+            match operand.kind() {
+                "compound_term" => {
+                    let Some(functor) = operand.child_by_field_name("functor") else { continue };
+                    if !matches!(text(functor, bytes).as_str(), "use_module" | "consult" | "ensure_loaded") {
+                        continue;
+                    }
+                    let mut acursor = operand.walk();
+                    let Some(arg) = operand.children_by_field_name("argument", &mut acursor).next() else { continue };
+                    if arg.kind() != "atom" {
+                        continue; // `library(Name)` or anything else computed -- external, not a literal path
+                    }
+                    let Some(inner) = arg.named_child(0) else { continue };
+                    if inner.kind() != "quoted_atom" {
+                        continue; // a bare unquoted atom here is ambiguous between a path and a library name
+                    }
+                    let raw_path = text(inner, bytes).trim_matches('\'').to_string();
+                    out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+                }
+                "list" => {
+                    let mut lcursor = operand.walk();
+                    for elem in operand.children_by_field_name("element", &mut lcursor) {
+                        let Some(inner) = elem.named_child(0) else { continue };
+                        let raw_path = match inner.kind() {
+                            "quoted_atom" => text(inner, bytes).trim_matches('\'').to_string(),
+                            "unquoted_atom" => text(inner, bytes),
+                            _ => continue,
+                        };
+                        out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+                    }
+                }
+                _ => {}
+            }
         }
         out
     }
@@ -1160,6 +1324,144 @@ mod query_based {
         }
         out
     }
+
+    /// Nim's `import a, b`, `from a import x, y`, and `include a` --
+    /// verified against the vendored fork's real grammar (see
+    /// `vendor/tree-sitter-nim/NOTICE.md`; the stale crates.io grammar has
+    /// no import-related node at all, which is why this was previously
+    /// left unhandled). A module path can be a bare name (`strutils`), a
+    /// `/`-joined relative path (`pkg/helper`, `../parent/helper` -- Nim's
+    /// own directory-then-search-path resolution, mirrored in
+    /// `resolve_nim`), or aliased (`strutils as su`) -- all three parse as
+    /// the SAME generic `infix_expression`/`prefix_expression` shape this
+    /// grammar uses for ordinary expressions (Nim's import syntax isn't a
+    /// dedicated path grammar), so `nim_module_path` walks that shape by
+    /// hand: an `infix_expression` whose operator node's own `kind()` is
+    /// literally `"/"` is a real path join (recurse into `left`, append
+    /// `/` + `right`'s text); a `kind()` of `"as"` is an alias (keep only
+    /// `left`, the real path, drop the alias name); anything else --
+    /// `identifier`, or a `prefix_expression` like `../parent` whose own
+    /// text already spans the whole `..`-prefixed path -- is used as-is.
+    fn nim_module_path(node: Node, bytes: &[u8]) -> String {
+        if node.kind() == "infix_expression" {
+            if let (Some(op), Some(left)) = (node.child_by_field_name("operator"), node.child_by_field_name("left")) {
+                if op.kind() == "operator" && text(op, bytes) == "/" {
+                    if let Some(right) = node.child_by_field_name("right") {
+                        return format!("{}/{}", nim_module_path(left, bytes), text(right, bytes));
+                    }
+                }
+                if op.kind() == "as" {
+                    return nim_module_path(left, bytes);
+                }
+            }
+        }
+        text(node, bytes)
+    }
+
+    pub(super) fn nim_import(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut imports = Vec::new();
+        find_nodes(tree.root_node(), "import_statement", &mut imports);
+        for imp in imports {
+            let line = imp.start_position().row as i64 + 1;
+            let Some(list) = imp.named_child(0) else { continue };
+            let mut cursor = list.walk();
+            for expr in list.named_children(&mut cursor) {
+                out.push(ImportEdge { raw_path: nim_module_path(expr, bytes), imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+            }
+        }
+        let mut froms = Vec::new();
+        find_nodes(tree.root_node(), "import_from_statement", &mut froms);
+        for imp in froms {
+            let Some(module) = imp.child_by_field_name("module") else { continue };
+            let mut cursor = imp.walk();
+            let Some(list) = imp.children(&mut cursor).find(|c| c.kind() == "expression_list") else { continue };
+            let raw_path = nim_module_path(module, bytes);
+            let line = imp.start_position().row as i64 + 1;
+            let mut lcursor = list.walk();
+            let mut any_name = false;
+            for name in list.named_children(&mut lcursor) {
+                if name.kind() != "identifier" {
+                    continue; // `from x import nil` -- qualified-only, no name to record
+                }
+                any_name = true;
+                out.push(ImportEdge { raw_path: raw_path.clone(), imported_name: Some(text(name, bytes)), is_wildcard: false, module_prefix: Vec::new(), line });
+            }
+            if !any_name {
+                out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+            }
+        }
+        let mut includes = Vec::new();
+        find_nodes(tree.root_node(), "include_statement", &mut includes);
+        for inc in includes {
+            let line = inc.start_position().row as i64 + 1;
+            let Some(list) = inc.named_child(0) else { continue };
+            let mut cursor = list.walk();
+            for expr in list.named_children(&mut cursor) {
+                let raw_path = match expr.kind() {
+                    "interpreted_string_literal" => expr.named_child(0).map(|c| text(c, bytes)).unwrap_or_default(),
+                    _ => nim_module_path(expr, bytes),
+                };
+                out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+            }
+        }
+        out
+    }
+
+    /// The `graphql-import`/GraphQL Modules community convention:
+    /// `# import Foo from './other.graphql'` -- a specially-shaped LINE
+    /// COMMENT, not core GraphQL syntax (the base spec has no import
+    /// concept at all -- checked against a real `node-types.json`, no
+    /// node type name contains "import"). Extracted as plain text pattern
+    /// matching over `comment` nodes rather than a grammar shape, since
+    /// there is no grammar shape here to match -- this is opt-in, only
+    /// ever produces an edge for a repo that actually uses one of these
+    /// tools' convention, and is silently absent (correctly, not a false
+    /// negative) for any GraphQL file that doesn't.
+    pub(super) fn graphql_import_comment(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut comments = Vec::new();
+        find_nodes(tree.root_node(), "comment", &mut comments);
+        for c in comments {
+            let raw = text(c, bytes);
+            let rest = raw.trim_start_matches('#').trim();
+            let Some(after) = rest.strip_prefix("import ") else { continue };
+            let Some(idx) = after.find(" from ") else { continue };
+            let raw_path = after[idx + " from ".len()..].trim().trim_matches(|ch| ch == '"' || ch == '\'').to_string();
+            if raw_path.is_empty() {
+                continue;
+            }
+            let line = c.start_position().row as i64 + 1;
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// naga_oil's (Bevy's shader composition preprocessor) `#import
+    /// a::b::c` -- a REAL dedicated `preproc_import` node in
+    /// `tree-sitter-wgsl-bevy` (this project's already-linked WGSL
+    /// grammar, chosen specifically because it's Bevy-flavored) verified
+    /// via a real parse-tree dump, not assumed from the base WGSL spec
+    /// (which has no import syntax at all). Always a wildcard: naga_oil
+    /// modules are registered by an arbitrary Rust-side name
+    /// (`load_internal_asset!`/asset registration), not a fixed
+    /// file-per-module convention the way Java's classpath is -- so
+    /// unlike every other module language here, this is extracted (real,
+    /// useful signal even unresolved) but deliberately NOT given a
+    /// resolver in `resolve.rs`: there is no reliable naming convention
+    /// to resolve against, and guessing off a same-named file anywhere in
+    /// the repo would be exactly the confident-but-fuzzy match this
+    /// project's resolvers are built to never do.
+    pub(super) fn wgsl_preproc_import(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        for m in query_matches(tree, bytes, "(preproc_import path: (_) @target) @import") {
+            let (Some(&target), Some(&import_node)) = (m.get("target"), m.get("import")) else { continue };
+            let line = import_node.start_position().row as i64 + 1;
+            let raw_path = text(target, bytes);
+            out.push(ImportEdge { raw_path, imported_name: None, is_wildcard: true, module_prefix: Vec::new(), line });
+        }
+        out
+    }
 }
 
 /// Languages whose `source`/`require`-style import is an *ordinary*
@@ -1326,6 +1628,31 @@ mod command_style {
             let Some(first_str) = args.named_children(&mut cursor).find(|c| c.kind().contains("string")) else { continue };
             let line = call.start_position().row as i64 + 1;
             out.push(ImportEdge { raw_path: strip_quotes(&text(first_str, bytes)), imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
+        }
+        out
+    }
+
+    /// `require "./file"` -- Crystal's own dedicated `require` grammar
+    /// node (`require: $ => seq('require', $.string)`), verified against
+    /// this project's vendored fork (the stale crates.io grammar this was
+    /// previously attempted against couldn't parse `require` as a node at
+    /// all -- see vendor/tree-sitter-crystal/NOTICE.md). Only a literal
+    /// string (`string` wrapping a plain `literal_content` child, not an
+    /// interpolation like `"#{x}"`) is extracted, same "can't resolve a
+    /// computed path" honesty PHP's `require`/`include` already uses.
+    pub(super) fn crystal_require(tree: &Tree, bytes: &[u8]) -> Vec<ImportEdge> {
+        let mut out = Vec::new();
+        let mut reqs = Vec::new();
+        find_nodes(tree.root_node(), "require", &mut reqs);
+        for req in reqs {
+            let mut cursor = req.walk();
+            let Some(string_node) = req.children(&mut cursor).find(|c| c.kind() == "string") else { continue };
+            let Some(content) = string_node.named_child(0) else { continue };
+            if content.kind() != "literal_content" {
+                continue;
+            }
+            let line = req.start_position().row as i64 + 1;
+            out.push(ImportEdge { raw_path: text(content, bytes), imported_name: None, is_wildcard: false, module_prefix: Vec::new(), line });
         }
         out
     }
@@ -1738,5 +2065,57 @@ mod tests {
         let got = edges(src, Lang::Hcl);
         assert!(got.contains(&("./modules/vpc".to_string(), None)), "{got:?}");
         assert!(!got.iter().any(|(p, _)| p.contains("terraform-aws-modules")), "a registry reference must stay unextracted: {got:?}");
+    }
+
+    #[test]
+    fn nim_import_from_include_and_aliased_path() {
+        let src = "import strutils, os\nfrom sequtils import map\ninclude \"helper\"\nimport pkg/helper2\nimport strutils as su\n";
+        let got = edges(src, Lang::Nim);
+        assert!(got.contains(&("strutils".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("os".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("sequtils".to_string(), Some("map".to_string()))), "{got:?}");
+        assert!(got.contains(&("helper".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("pkg/helper2".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("strutils".to_string(), None)), "alias must be dropped, keeping just the real path: {got:?}");
+    }
+
+    #[test]
+    fn vhdl_use_work_only() {
+        let src = "library ieee;\nuse ieee.std_logic_1164.all;\nuse work.my_pkg.all;\n";
+        let got = edges(src, Lang::Vhdl);
+        assert!(got.contains(&("my_pkg".to_string(), None)), "{got:?}");
+        assert!(!got.iter().any(|(p, _)| p.contains("std_logic_1164")), "an external ieee library use must stay unextracted: {got:?}");
+    }
+
+    #[test]
+    fn prolog_use_module_consult_and_bracket_shorthand() {
+        let src = ":- use_module('myfile.pl').\n:- consult('other.pl').\n:- use_module(library(lists)).\n:- [helper].\n";
+        let got = edges(src, Lang::Prolog);
+        assert!(got.contains(&("myfile.pl".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("other.pl".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("helper".to_string(), None)), "{got:?}");
+        assert!(!got.iter().any(|(p, _)| p.contains("lists")), "an external library() reference must stay unextracted: {got:?}");
+    }
+
+    #[test]
+    fn graphql_import_comment_convention() {
+        let src = "# import Foo from './other.graphql'\ntype Bar { id: ID }\n";
+        let got = edges(src, Lang::GraphQL);
+        assert!(got.contains(&("./other.graphql".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn wgsl_naga_oil_preproc_import() {
+        let src = "#import bevy_pbr::mesh_view_bindings\nfn main() {}\n";
+        let got = edges(src, Lang::Wgsl);
+        assert!(got.contains(&("bevy_pbr::mesh_view_bindings".to_string(), None)), "{got:?}");
+    }
+
+    #[test]
+    fn crystal_require_relative_and_skips_interpolated() {
+        let src = "require \"./helper\"\nrequire \"json\"\n";
+        let got = edges(src, Lang::Crystal);
+        assert!(got.contains(&("./helper".to_string(), None)), "{got:?}");
+        assert!(got.contains(&("json".to_string(), None)), "{got:?}");
     }
 }

@@ -990,6 +990,8 @@ fn cmd_languages() -> Result<()> {
     let mut full: Vec<&str> = Vec::new();
     let mut symbols_only: Vec<&str> = Vec::new();
     let mut tagged_only: Vec<&str> = Vec::new();
+    let mut import_resolved: Vec<&str> = Vec::new();
+    let mut import_extracted_only: Vec<&str> = Vec::new();
     for &lang in graviton_indexer::ALL_LANGS {
         if lang == graviton_indexer::Lang::Other {
             continue;
@@ -1006,8 +1008,17 @@ fn cmd_languages() -> Result<()> {
         } else {
             tagged_only.push(name);
         }
+        // Import resolution is tracked independently of the symbol tiers
+        // above -- a language can have real import extraction+resolution
+        // without a def/call query yet (or vice versa); see
+        // `has_import_resolver`'s own doc for the exact accounting.
+        if graviton_indexer::has_import_resolver(lang) {
+            import_resolved.push(name);
+        } else if name == "wgsl" {
+            import_extracted_only.push(name); // real extraction, deliberately no resolver -- see has_import_resolver's doc
+        }
     }
-    for v in [&mut full, &mut symbols_only, &mut tagged_only] {
+    for v in [&mut full, &mut symbols_only, &mut tagged_only, &mut import_resolved, &mut import_extracted_only] {
         v.sort_unstable();
     }
     println!("\x1b[1;32msymbols + call graph ({}):\x1b[0m {}", full.len(), full.join(", "));
@@ -1017,6 +1028,14 @@ fn cmd_languages() -> Result<()> {
         "\n{} languages total, plus any other text file (always fully searchable via `grv search`/`grv ask`, never shows up in `grv symbol`)",
         full.len() + symbols_only.len() + tagged_only.len()
     );
+    println!("\n\x1b[1;33mimport resolution ({}):\x1b[0m {}", import_resolved.len(), import_resolved.join(", "));
+    if !import_extracted_only.is_empty() {
+        println!(
+            "\x1b[2mextracted but never resolved, by design ({}):\x1b[0m {} -- no reliable file-naming convention exists to resolve against",
+            import_extracted_only.len(),
+            import_extracted_only.join(", ")
+        );
+    }
     Ok(())
 }
 

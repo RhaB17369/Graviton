@@ -83,19 +83,41 @@
 //!   the same multi-file honesty Go's package imports use. A registry
 //!   reference or git URL is unambiguously external and never even
 //!   extracted (see `hcl_module_source` in `imports.rs`).
-//! - **Not resolved, with reasons rather than silence**: Nim (the grammar
-//!   has no import-related node at all to extract from), VHDL (no
-//!   reliable package-to-file naming convention exists to resolve
-//!   against), Prolog (directive shape too uncertain to encode safely),
-//!   Crystal (confirmed via a real parse-tree dump that
-//!   tree-sitter-crystal 0.1.0 doesn't parse `require "..."` as a call/
-//!   macro-invocation node at all, so there's no extraction to resolve in
-//!   the first place), GraphQL and WGSL (no import/include concept in
-//!   their own spec at all -- checked against their real node-types.json,
-//!   correctly nothing to extract), and Svelte/Vue (their real imports
-//!   live inside a `<script>` block both grammars parse as one opaque
-//!   `raw_text` node -- the same language-injection gap already
-//!   documented for their missing `def_query_src`).
+//! - **Nim**: `import`/`from ... import`/`include`, via a vendored,
+//!   locally-patched fork (the only crates.io release has no
+//!   import-related node in its grammar at all -- see
+//!   `vendor/tree-sitter-nim/NOTICE.md`). `resolve_nim` tries the
+//!   importing file's own directory first (Nim's real lookup order), then
+//!   a bounded source root, same shape as Python's absolute imports.
+//! - **VHDL**: `use work.my_pkg.all` -- only the `work` library (VHDL's
+//!   own real, unambiguous "compiled from this repo" marker, not a
+//!   guessed convention) is resolved, via `resolve_vhdl_unit`'s flat
+//!   filename guess (no standardized unit-to-file convention exists,
+//!   same honest gap Fortran has).
+//! - **Prolog**: `use_module('x.pro')`/`consult('x.pro')`/`[File]`, a
+//!   relative-literal path (`library(Name)` references are external and
+//!   correctly never extracted -- see `prolog_directive` in `imports.rs`).
+//! - **Crystal**: `require "./x"`, a relative-literal path, via a
+//!   vendored fork of Crystal's own official tooling org's grammar (the
+//!   crates.io release can't parse `require` as a node at all -- see
+//!   `vendor/tree-sitter-crystal/NOTICE.md`).
+//! - **GraphQL**: the `graphql-import` community convention's `# import
+//!   Foo from './other.graphql'` -- a specially-shaped comment, not core
+//!   GraphQL syntax (the base spec has no import concept), but a real,
+//!   already-relative path once matched.
+//! - **Svelte/Vue**: the real imports inside a `<script>` block are
+//!   ordinary JS/TS; `script_injected_imports` (`imports.rs`) does a real
+//!   second parse pass over that block's own text and reuses `resolve_js`
+//!   unchanged for resolution -- these are literally JS/TS edges by the
+//!   time they reach this function.
+//! - **Not resolved, with a real reason rather than silence**: WGSL's
+//!   naga_oil `#import a::b` is extracted (a genuine, dedicated grammar
+//!   node in the Bevy-flavored fork this project already links) but
+//!   deliberately given no resolver -- a naga_oil module is registered
+//!   under an arbitrary Rust-side name, not a fixed file-per-module
+//!   convention, so there is nothing reliable to resolve against; a
+//!   same-named-file-anywhere-in-the-repo guess would be exactly the
+//!   fuzzy match this project's resolvers are built to never do.
 //!
 //! An import that doesn't resolve to anything is exactly as informative as
 //! one that does: it means "not indexed" (an external dependency, the
@@ -662,6 +684,68 @@ fn resolve_fortran_module(module_name: &str, roots: &[Vec<String>], all_paths: &
     out
 }
 
+/// VHDL's `use work.my_pkg.all` -- like Fortran, no standardized
+/// unit-name-to-filename convention exists (unlike Ada's GNAT rule), so
+/// this is an honest flat filename guess: the unit name, as written and
+/// lowercased, against real VHDL extensions and a couple of common
+/// project-layout roots.
+fn resolve_vhdl_unit(unit_name: &str, roots: &[Vec<String>], all_paths: &HashSet<String>) -> Vec<String> {
+    if unit_name.is_empty() {
+        return Vec::new();
+    }
+    let lower = unit_name.to_lowercase();
+    let mut out = Vec::new();
+    for root in roots {
+        for name in [unit_name, lower.as_str()] {
+            let mut dir = root.clone();
+            dir.push(name.to_string());
+            let base = segs_to_path(&dir);
+            for ext in ["vhd", "vhdl"] {
+                let file = format!("{base}.{ext}");
+                if all_paths.contains(&file) {
+                    out.push(file);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Nim's `import`/`from ... import`/`include`: a module path is either a
+/// bare name resolved via Nim's own directory-then-search-path rule
+/// (checked here as relative-to-the-importing-file first, exactly like
+/// `resolve_relative_literal`, since that's genuinely how Nim itself
+/// looks up a same-directory module) or an absolute-style path from a
+/// configured source root (`import pkg/helper`) -- tried second, against
+/// the same bounded repo-root/immediate-subdirectory roots
+/// `discover_python_roots` already computes (Nim's package layout
+/// convention is close enough to Python's to reuse it rather than
+/// duplicate it).
+fn resolve_nim(raw_path: &str, importer_segs: &[String], roots: &[Vec<String>], all_paths: &HashSet<String>) -> Vec<String> {
+    let relative = resolve_relative_literal(raw_path, importer_segs, all_paths, &["nim"]);
+    if !relative.is_empty() {
+        return relative;
+    }
+    let segs: Vec<&str> = raw_path.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for root in roots {
+        let mut dir = root.clone();
+        dir.extend(segs.iter().map(|s| s.to_string()));
+        let file = format!("{}.nim", segs_to_path(&dir));
+        if all_paths.contains(&file) {
+            out.push(file);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// `MyModule` -> `my_module`, Elixir/Mix's own convention for mapping a
 /// CamelCase module segment to its snake_case file/directory name. Inserts
 /// an underscore before an uppercase letter only when it sits at a real
@@ -793,6 +877,8 @@ pub fn resolve_all_imports(conn: &Connection, root: &Path) -> Result<usize> {
     let elixir_roots = conventional_roots(&all_paths, &["lib"]);
     let lua_roots = conventional_roots(&all_paths, &["lua", "src"]);
     let tf_files_by_dir = files_by_dir_for_ext(&all_paths, "tf");
+    let vhdl_roots = conventional_roots(&all_paths, &["src", "rtl", "hdl"]);
+    let nim_roots = discover_python_roots(&all_paths);
 
     let imports: Vec<(i64, i64, String, Option<String>, Option<String>)> = {
         let mut stmt = conn.prepare("SELECT id, file_id, raw_path, imported_name, module_prefix FROM imports")?;
@@ -899,6 +985,9 @@ pub fn resolve_all_imports(conn: &Connection, root: &Path) -> Result<usize> {
             // -> slash convention; no wildcard form exists, so the
             // wildcard char is disabled the same way C#'s is.
             "lua" => resolve_dotted_module(&raw_path, '\0', "lua", &lua_roots, &HashMap::new(), false, &all_paths),
+            // Crystal's `require "./x"` -- a real relative-literal path,
+            // same shape as Ruby's `require_relative`.
+            "crystal" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["cr"]),
             // Assembly's `include` directive is a real relative-literal
             // path, same shape as C's `#include "x"`.
             "asm" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["inc", "asm", "s"]),
@@ -910,6 +999,28 @@ pub fn resolve_all_imports(conn: &Connection, root: &Path) -> Result<usize> {
             // Terraform/HCL's `module` block -- a relative directory
             // reference, resolved to every `.tf` file in it.
             "hcl" => resolve_hcl_module(&raw_path, &importer_segs, &tf_files_by_dir),
+            "nim" => resolve_nim(&raw_path, &importer_segs, &nim_roots, &all_paths),
+            "vhdl" => resolve_vhdl_unit(&raw_path, &vhdl_roots, &all_paths),
+            // Prolog's `use_module('x.pro')`/`consult('x.pro')` is a real
+            // relative-literal path (already has its extension, so the
+            // fallback list below only matters for the `[File]`
+            // shorthand -- a bare name with none); `pro` is this
+            // project's own recognized Prolog extension (`Lang::from_path`
+            // resolves the more common but ambiguous `.pl` to Perl
+            // instead, a pre-existing, disclosed tradeoff), `pl` is tried
+            // too since real SWI-Prolog code almost always uses it even
+            // though this project can't classify such a file as Prolog
+            // itself -- the file can still be a valid RESOLUTION TARGET.
+            "prolog" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["pro", "pl"]),
+            // The `graphql-import` community convention's `from '...'` is
+            // already a real relative path, same shape as JS/Dart.
+            "graphql" => resolve_relative_literal(&raw_path, &importer_segs, &all_paths, &["graphql", "gql"]),
+            // Svelte/Vue's injected `<script>` imports are literally JS/TS
+            // edges once extracted -- resolved the exact same way.
+            "svelte" | "vue" => resolve_js(&raw_path, &importer_segs, &all_paths),
+            // WGSL's naga_oil `#import a::b` is deliberately extraction-
+            // only -- see `wgsl_preproc_import`'s doc in `imports.rs` for
+            // why no reliable resolution convention exists to try here.
             _ => Vec::new(),
         };
         for p in resolved_paths {

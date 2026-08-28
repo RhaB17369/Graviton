@@ -1,0 +1,10 @@
+# `net.git-fetch-with-cli` shells out to the system `git` binary for git
+# dependencies (currently `tree-sitter-vuejs`) instead of Cargo's bundled
+# libgit2 transport. Added after a real, repeatable failure: fetching
+# `crystal-lang-tools/tree-sitter-crystal` via libgit2 hit a transient
+# SSL/network error in one build environment, while a plain `git clone`
+# of the exact same commit worked fine every time. Harmless when it isn't
+# needed -- it just means `git` itself must be on PATH, true everywhere
+# this project is developed.
+[net]
+git-fetch-with-cli = true

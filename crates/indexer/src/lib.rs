@@ -2,7 +2,7 @@ mod imports;
 mod lang;
 mod resolve;
 
-pub use imports::{ImportEdge, extract_imports};
+pub use imports::{ImportEdge, extract_imports, has_import_resolver};
 pub use lang::{ALL_LANGS, Lang};
 pub use resolve::resolve_all_imports;
 
@@ -1185,5 +1185,145 @@ mod index_repo_tests {
             .collect();
         paths.sort();
         assert_eq!(paths, vec!["modules/vpc/main.tf".to_string(), "modules/vpc/outputs.tf".to_string()]);
+    }
+
+    /// Nim's `import pkg/helper` -- absolute-style, resolved against a
+    /// bounded source root (the same convention Python's resolver uses),
+    /// since it isn't relative to the importing file's own directory.
+    #[test]
+    fn nim_import_resolves_via_bounded_source_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/helper.nim"), "proc f*(x: int): int = x\n").unwrap();
+        std::fs::write(dir.path().join("main.nim"), "import pkg/helper\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'pkg/helper'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["pkg/helper.nim".to_string()]);
+    }
+
+    /// VHDL's `use work.my_pkg.all` -- flat filename guess, `work` library
+    /// only.
+    #[test]
+    fn vhdl_use_work_resolves_via_flat_filename_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/my_pkg.vhd"), "package my_pkg is\nend package my_pkg;\n").unwrap();
+        std::fs::write(dir.path().join("src/top.vhd"), "use work.my_pkg.all;\nentity top is\nend entity;\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'my_pkg'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["src/my_pkg.vhd".to_string()]);
+    }
+
+    /// Prolog's `:- consult('helper.pro').` -- a real relative path.
+    /// Uses the `.pro` extension deliberately, not `.pl` -- this
+    /// project's own `Lang::from_path` already resolves that ambiguous
+    /// extension to Perl (a documented, pre-existing tradeoff, not
+    /// something this batch changes).
+    #[test]
+    fn prolog_consult_resolves_to_sibling_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.pro"), ":- module(helper, [f/1]).\nf(X) :- X = 1.\n").unwrap();
+        std::fs::write(dir.path().join("main.pro"), ":- consult('helper.pro').\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = 'helper.pro'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["helper.pro".to_string()]);
+    }
+
+    /// The `graphql-import` convention's `# import Foo from './other.graphql'`.
+    #[test]
+    fn graphql_import_comment_resolves_to_sibling_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("other.graphql"), "type Foo { id: ID }\n").unwrap();
+        std::fs::write(dir.path().join("main.graphql"), "# import Foo from './other.graphql'\ntype Bar { foo: Foo }\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = './other.graphql'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["other.graphql".to_string()]);
+    }
+
+    /// Svelte's `<script>` block is real JS underneath -- the injected
+    /// second-parse-pass regression test: a relative import inside a
+    /// `.svelte` file's script block must resolve exactly like a plain
+    /// `.js` file's would.
+    #[test]
+    fn svelte_script_block_import_resolves_via_injected_js_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.js"), "export function f() { return 1; }\n").unwrap();
+        std::fs::write(dir.path().join("App.svelte"), "<script>\nimport { f } from './helper';\n</script>\n<div>{f()}</div>\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = './helper'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["helper.js".to_string()]);
+    }
+
+    /// Crystal's `require "./helper"` -- a real relative path, resolved
+    /// through the vendored fork's grammar (see
+    /// vendor/tree-sitter-crystal/NOTICE.md).
+    #[test]
+    fn crystal_require_resolves_to_sibling_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("helper.cr"), "def helper\n  1\nend\n").unwrap();
+        std::fs::write(dir.path().join("main.cr"), "require \"./helper\"\nputs helper\n").unwrap();
+
+        let db_path = dir.path().join("index.db");
+        let mut conn = graviton_core::open_db(&db_path).unwrap();
+        index_repo(&mut conn, dir.path()).unwrap();
+
+        let paths: Vec<String> = conn
+            .prepare("SELECT f2.path FROM imports i JOIN import_resolutions r ON r.import_id = i.id JOIN files f2 ON f2.id = r.file_id WHERE i.raw_path = './helper'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(paths, vec!["helper.cr".to_string()]);
     }
 }

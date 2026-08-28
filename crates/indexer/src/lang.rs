@@ -464,7 +464,7 @@ impl Lang {
             Lang::R => tree_sitter_r::LANGUAGE.into(),
             Lang::OCaml => tree_sitter_ocaml::LANGUAGE_OCAML.into(),
             Lang::Elm => tree_sitter_elm::LANGUAGE.into(),
-            Lang::Nim => tree_sitter_nim::LANGUAGE.into(),
+            Lang::Nim => tree_sitter_nim::language(),
             Lang::Erlang => tree_sitter_erlang::LANGUAGE.into(),
             Lang::Vim => tree_sitter_vim::language(),
             Lang::Nix => tree_sitter_nix::LANGUAGE.into(),
@@ -676,10 +676,17 @@ impl Lang {
                 (input_object_type_definition (name) @name) @def
                 "#
             }
+            // `method_def`/`class_def`, not `method_definition`/
+            // `class_declaration` -- this project's vendored fork (see
+            // vendor/tree-sitter-crystal/NOTICE.md) uses different node
+            // names than the stale crates.io grammar this query was
+            // originally written against; verified via a real parse-tree
+            // dump. A class name is its own `constant` node kind (Crystal
+            // lexes capitalized names distinctly from `identifier`).
             Lang::Crystal => {
                 r#"
-                (method_definition name: (identifier) @name) @def
-                (class_declaration name: (identifier) @name) @def
+                (method_def name: (identifier) @name) @def
+                (class_def name: (constant) @name) @def
                 "#
             }
             Lang::D => {
@@ -1115,9 +1122,12 @@ impl Lang {
                 (call_expression (field_expression value: (identifier) . (identifier) @callee)) @call
                 "#
             }
+            // `method` field, not `name` -- see the def_query_src comment
+            // on `Lang::Crystal` above for why (vendored fork, verified
+            // via a real parse-tree dump).
             Lang::Crystal => {
                 r#"
-                (call name: (identifier) @callee) @call
+                (call method: (identifier) @callee) @call
                 "#
             }
             Lang::D => {
@@ -1187,9 +1197,13 @@ impl Lang {
                 (function_call_expr target: (value_expr name: (value_qid (lower_case_identifier) @callee))) @call
                 "#
             }
+            // `function` field, not `name` -- this project's vendored fork
+            // (see vendor/tree-sitter-nim/NOTICE.md) renamed it relative to
+            // the stale crates.io grammar this query was originally written
+            // against; verified via a real parse-tree dump.
             Lang::Nim => {
                 r#"
-                (call name: (identifier) @callee) @call
+                (call function: (identifier) @callee) @call
                 "#
             }
             Lang::Erlang => {

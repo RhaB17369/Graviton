@@ -198,7 +198,7 @@ kind, name, parent, line }`) instead of being a bare label:
   resolved `use`/`import` naming exactly this definition's file (see
   "Import resolution" below) — genuine resolution via an actual import
   statement, not a co-location heuristic. Only produced for the languages
-  with an import resolver (50 languages as of this writing — see "Import
+  with an import resolver (54 languages as of this writing -- see "Import
   resolution" below for the full list).
 - `Ambiguous(Vec<DefinitionRef>)` — multiple same-named definitions exist,
   none local, and either this language has no import resolver yet or none
@@ -424,8 +424,8 @@ plausible-looking grammar shape:
   separator tokens when looking for the argument. The dot-source form
   (`. .\file.ps1`) was unaffected — it reads a different field.
 
-**3 more languages** got real extraction + resolution in a final pass over
-what was left: Assembly's `.include "x"` (GAS/MASM's own dedicated `meta`
+**3 languages got real extraction + resolution** via straightforward
+resolvers: Assembly's `.include "x"` (GAS/MASM's own dedicated `meta`
 grammar node) and NASM's `%include "x"` / bare `INCLUDE "x"` (this
 grammar's `%`-preprocessor support is broken — a real parse-tree dump
 confirmed the leading `%` becomes an `ERROR` node — but the `include "x"`
@@ -454,43 +454,114 @@ or git URL being unambiguously external and left unextracted. Resolved via
 a new `resolve_hcl_module` to every `.tf` file in the referenced
 directory — the same multi-file honesty Go's package imports use.
 
-**Only 8 parsed languages have no import resolver at all now**, each with
-a specific, verified reason rather than "not gotten to yet": Nim
-(tree-sitter-nim 0.1.0 has no import/include-related node type in its
-grammar at all — nothing to hook extraction onto), VHDL (no reliable
-package-to-file naming convention exists to resolve against, unlike every
-language above), Prolog (directive shape too uncertain to encode safely
-from this project's investigation), Crystal (confirmed via a real
-parse-tree dump that tree-sitter-crystal 0.1.0 doesn't parse
-`require "..."` — with or without parentheses — as a call/macro-invocation
-node at all; it splits into two unrelated `expression_statement` nodes, so
-there's no node shape to extract from in the first place, the same
-category of gap as Nim's, not a shape this project got wrong), GraphQL and
-WGSL (checked their real `node-types.json`: no node type name contains
-"import"/"include" at all — neither language's own spec has an import
-concept, so there's correctly nothing to extract, not a gap), and
-Svelte/Vue (their real imports live inside a `<script>` block, which both
-grammars parse as one opaque `raw_text` node — the same language-injection
-limitation already documented for their missing `def_query_src` above;
-recovering either would need a second parse pass this project doesn't do).
+**The remaining 8 languages this project had previously accepted as
+gaps — Nim, VHDL, Prolog, Crystal, GraphQL, WGSL, Svelte, Vue — got a
+second, harder look, and 7 of the 8 turned out to be genuinely fixable,
+not fundamental limitations:**
 
-Verified per-language against real samples (`imports.rs`'s `tests` module —
-41 tests, one or more per language/family), plus end-to-end resolution
+- **Crystal**: the crates.io `0.1.0` grammar (owned by a brand-new,
+  zero-star account, `undivisible`, that batch-published several other
+  grammar crates the same day — the same dependency-confusion pattern
+  this project already treats with suspicion for the Vue ecosystem)
+  confirmed via a real parse-tree dump to not parse `require "..."` as a
+  call/macro-invocation node at all. `crystal-lang-tools` (Crystal's own
+  official tooling org — the `crystalline` LSP lives there too) maintains
+  a real grammar with a dedicated `require` node. Its Cargo dependency
+  fetch repeatedly hit a transient SSL/network error in this sandbox
+  specifically (a plain `git clone` of the same commit worked fine in
+  well under a minute) — rather than fight that, the already-cloned
+  source was vendored directly (`vendor/tree-sitter-crystal/`, see its
+  `NOTICE.md` for the full provenance chain). Swapping the grammar broke
+  the *existing* `def_query_src`/`call_query_src` (`method_definition`/
+  `class_declaration`/`(call name: ...)` → `method_def`/`class_def`/
+  `(call method: ...)`, verified via another real dump) — a real,
+  expected cost of a grammar swap, fixed the same turn.
+- **Nim**: same root cause as Crystal — the only crates.io release has no
+  import-related node type in its grammar at all. `alaviss/tree-sitter-nim`
+  (an actively maintained, richer community grammar) DOES have real
+  `import_statement`/`import_from_statement`/`include_statement` nodes,
+  verified directly. Its Rust binding pins `tree-sitter = "~0.25"`, which
+  conflicts (`links = "tree-sitter"`, only one version allowed per binary)
+  with this workspace's `tree-sitter = "0.26"` — confirmed as a real,
+  hard build error, not assumed. Relaxing that one version constraint
+  (nothing else) was verified to parse real Nim source correctly against
+  0.26's actual runtime — the C-level ABI doesn't care which Rust crate
+  version generated the binding glue. The user was asked how to host this
+  one-line-patched fork (a `git` dependency to a pushed copy, matching the
+  `tree-sitter-vuejs` precedent, needs a repository this session had no
+  credentials to create) and chose to vendor it directly
+  (`vendor/tree-sitter-nim/`, ~41MB — see its `NOTICE.md`). Its call query
+  needed the same kind of fix as Crystal's (`name` field → `function`
+  field, verified via a dump).
+- **VHDL**: previously declined as "no reliable package-to-file naming
+  convention exists" — true in general, but `use work.my_pkg.all` is a
+  real exception: `work` is VHDL's own unambiguous "compiled from this
+  repo" marker (as opposed to `ieee.std_logic_1164` or any other named
+  library, always external). `vhdl_use` extracts only the `work`-scoped
+  case; `resolve_vhdl_unit` is a flat filename guess against `.vhd`/`.vhdl`
+  extensions, the same honest category of guess Fortran's resolver
+  already makes.
+- **Prolog**: previously declined as "directive shape too uncertain" — a
+  real parse-tree dump resolved that uncertainty directly: `clause`'s
+  grammar has no dedicated "directive" node at all, but `:-` (as opposed
+  to `?-`, a query) is simply the first, anonymous child of a
+  `unary_operation`, whose own `kind()` is literally the operator's text
+  — checkable with a plain string comparison. `prolog_directive` extracts
+  `use_module`/`consult`/`ensure_loaded`'s quoted-atom argument and the
+  `[File]` shorthand; `library(Name)` arguments are correctly left
+  unextracted (external, not a repo file).
+- **GraphQL**: the base spec genuinely has no import syntax (confirmed:
+  no node type name in its real `node-types.json` contains "import" or
+  "include") — but the `graphql-import`/GraphQL Modules community
+  convention (`# import Foo from './other.graphql'`, a specially-shaped
+  line *comment*) is real and in active use. `graphql_import_comment`
+  matches it via plain text pattern matching over `comment` nodes, since
+  there is no grammar shape to hook a query onto — opt-in by construction:
+  a GraphQL file that doesn't use this convention just produces nothing.
+- **WGSL**: same "no import in the base spec" fact, but this project's
+  already-linked grammar isn't the base spec's — `tree-sitter-wgsl-bevy`
+  was chosen specifically because it's Bevy-flavored, and Bevy's naga_oil
+  shader preprocessor extends WGSL with a REAL `#import a::b` directive
+  that this grammar models as a dedicated `preproc_import` node,
+  discovered by actually checking rather than assuming the base spec's
+  answer still applied to a fork. Extracted via `wgsl_preproc_import` --
+  but deliberately given NO resolver: naga_oil modules are registered
+  under an arbitrary Rust-side name (`load_internal_asset!`/asset
+  registration), not a fixed file-per-module convention, so there's
+  nothing reliable to resolve against. This is the one case, out of all
+  8, that stayed a genuine gap on the resolution side even after the
+  investigation — but the extraction itself (real, useful signal even
+  unresolved) was still worth doing, the same way Rust's external-crate
+  imports are extracted and correctly never resolved.
+- **Svelte/Vue**: the real imports inside a `<script>` block are ordinary
+  JS/TS, but both grammars parse that block's entire body as one opaque
+  `raw_text` node (the injection limitation already known from their
+  missing `def_query_src`). `script_injected_imports` does a real second
+  parse pass: slices out the `<script>` element's own source text,
+  re-parses it with the JS or TS grammar (`lang="ts"`/`lang="typescript"`
+  picks TS, checked against the real `attribute` shape both grammars
+  share), reuses the EXISTING `js::imports` walker on that second tree (no
+  duplicated logic), and shifts every resulting line number by the script
+  block's own starting line.
+
+Verified per-language against real samples (`imports.rs`'s `tests` module
+— 46 tests, one or more per language/family), plus end-to-end resolution
 integration tests through `index_repo` for a representative case of each
-resolver mechanism (`lib.rs`'s `index_repo_tests`, 161 tests total in that
+resolver mechanism (`lib.rs`'s `index_repo_tests`, 173 tests total in that
 crate: a real C `#include` resolving to a local header while a system
 header stays unrecorded, a real cross-file Java import resolving via a
 conventional Maven source root, a Java wildcard import resolving to every
 file in its package directory, the D/Haskell/Julia/Elm
 `wildcard_is_package_directory` fix, one representative case each for Ada,
-OCaml, Perl, Fortran, Elixir, Lua, Dart, Scheme, and PowerShell, and a
-final case each for Assembly's `.include`, Swift's Sources-directory
-convention, and Terraform's `module` block) — plus a live dogfood against
-real synthetic multi-language scratch repos (Java cross-file class import,
-C local-header include, a Bash `source`, an Elixir `alias`, an Ada `with`
-clause, a Swift Package Manager sibling-target import, and a Terraform
-`module` block all resolving correctly through the actual `grv` binary,
-not just Rust unit tests).
+OCaml, Perl, Fortran, Elixir, Lua, Dart, Scheme, PowerShell, Assembly,
+Swift, and Terraform, and a final case each for Nim, VHDL, Prolog,
+GraphQL, Crystal, and Svelte's script injection) — plus a live dogfood
+against a real synthetic multi-language scratch repo covering all 8
+newly-fixed languages at once through the actual `grv` binary (Nim's
+`import pkg/helper`, Crystal's `require "./helper"`, VHDL's `use
+work.my_pkg.all`, Prolog's `consult`, GraphQL's import-comment
+convention, and Svelte's script-injected import all resolved correctly;
+WGSL's naga_oil import extracted and correctly stayed unresolved).
 
 A real bug this project's own dogfooding against its own repo caught
 (and a useful example of why "run it on yourself" stays part of this
@@ -605,7 +676,7 @@ for that model (common for the P620's older Pascal arch depending on the
 Ollama build's compute-capability floor); this doesn't change which model
 size to pick, since RAM was always the binding constraint here anyway.
 
-## Language coverage (v0.21)
+## Language coverage (v0.22)
 
 Each parsed language is one tree-sitter grammar crate + one `def_query_src`
 entry in `crates/indexer/src/lang.rs`. Adding a language is: find its
@@ -615,7 +686,13 @@ existing "best-effort, never fatal" machinery handle version drift.
 `ALL_LANGS` (a hand-maintained `&[Lang]` const, tied to the enum by a
 compile-time-exhaustive match — see "The query safety net" below) is the
 canonical list of every recognized language; `grv languages` prints it
-split into the same tiers as here.
+split into the same tiers as here, plus a separate "import resolution"
+line driven by `imports::has_import_resolver` — its own independent
+exhaustive match (same discipline as `ALL_LANGS` itself, for the same
+reason: a language can gain/lose import support on a schedule completely
+unrelated to its symbol-extraction tier, and a hand-maintained list here
+could silently drift from `extract_imports`/`resolve_all_imports`'s real
+dispatch otherwise).
 
 GRAVITON recognizes **66 languages total**, split into three honest tiers —
 "honest" meaning the tier a language sits in reflects what was actually
@@ -640,7 +717,14 @@ verified, not what merely compiles:
   inside it are real JS/TS, but recovering them needs a second,
   "language injection" parse pass (what a real editor's own host
   application drives via a separate `.scm` query) that this project's
-  one-query-per-language design doesn't do. Still real progress over
+  one-query-per-language *symbol-extraction* design doesn't do. Import
+  extraction is a narrower problem than full symbol extraction (one
+  `<script>`-block substring, one JS/TS parse, one existing walker reused
+  unchanged, versus reconciling injected spans back into `extract_symbols`'
+  whole-file line/scope bookkeeping) and DID get exactly this treatment —
+  see "Import resolution" above's `script_injected_imports` — without
+  this gap being closed for symbols too; the two are genuinely
+  different-sized undertakings, not an inconsistency. Still real progress over
   having no grammar at all — both are now genuinely parsed, just not in a
   `grv symbol`-shaped way.
 - **11 tagged only, no grammar** — HTML, CSS, JSON, YAML, TOML, XML,
@@ -756,6 +840,57 @@ core:
   `\section{...}`/`\label{...}` are the structural "definitions" its
   grammar actually has). Svelte/Vue did not — see the tier breakdown above
   for why that's a real, different limitation, not an oversight.
+
+### Vendored grammars — Nim, Crystal (`vendor/`)
+
+The next escalation from the fork-replacement pattern above, for the two
+cases where even a `git` dependency to a better fork wasn't enough:
+
+- **Crystal**: `crystal-lang-tools/tree-sitter-crystal` (the fix -- see
+  "Import resolution" above for why the crates.io release needed
+  replacing) already uses the modern `tree-sitter-language` shim, so a
+  plain `git` dependency should have worked with zero other changes. In
+  practice, `cargo build` against it repeatedly hit a transient SSL/
+  network error specific to this sandbox (`SSL error: unknown error;
+  class=Ssl (16)`), even with `net.git-fetch-with-cli` enabled (added to
+  `~/.cargo/config.toml` for this reason, and harmless to leave on
+  regardless) -- while a plain `git clone` of the exact same commit
+  succeeded reliably in well under a minute. Rather than keep fighting
+  one host's flaky connectivity in this specific environment, the
+  already-cloned source was vendored directly into `vendor/tree-sitter-crystal/`.
+- **Nim**: a harder case than Crystal's -- `alaviss/tree-sitter-nim`'s own
+  Rust binding still depends on the pre-shim, full `tree-sitter` crate
+  directly (pinned `~0.25`), which is a real `links = "tree-sitter"`
+  conflict with this workspace's `0.26` (confirmed via an actual failed
+  build, not assumed from the version numbers alone). The fix needed is
+  exactly one line in that crate's own `Cargo.toml` (`tree-sitter =
+  "0.26"` instead of `"~0.25"`) -- verified to parse real Nim source
+  correctly with zero other changes, since the C-level ABI a generated
+  parser exposes doesn't depend on which Rust crate version wrote the
+  binding glue around it. Patching a dependency's manifest can't be done
+  through a plain `git`/registry dependency at all (Cargo always honors
+  the depended-on crate's own declared version requirements) -- normally
+  this project's move would be to fork the upstream repo, apply the
+  patch, and depend on that fork via `git` (the same shape as the Vue
+  dependency above), but this session had no GitHub API/`gh` CLI
+  credentials available to create a new repository for it. Asked
+  directly, the user chose to vendor the (one-line-patched) source
+  locally instead of waiting on that -- `vendor/tree-sitter-nim/`, ~41MB,
+  by far the largest thing in this repository, a real and known tradeoff
+  the user made explicitly aware of the size.
+
+Both `vendor/*/NOTICE.md` files record the exact upstream commit, exactly
+what (if anything) was changed from it, and why vendoring was the right
+call over every other option tried first -- read those before touching
+either directory again, especially before "helpfully" upgrading either
+grammar to a newer upstream commit without re-deriving whether the same
+patch (or no patch at all, if upstream fixes it first) is still needed.
+Swapping either grammar broke that language's *existing*
+`def_query_src`/`call_query_src` (different field/node names between the
+old and new grammars, e.g. Crystal's `method_definition`/`(call name:
+...)` → `method_def`/`(call method: ...)`) -- an expected, real cost of a
+grammar swap, not a regression that slipped through; both were re-verified
+against real samples and fixed the same turn, not left broken.
 
 ### Text-predicate-based queries (Elixir, Racket, Scheme)
 

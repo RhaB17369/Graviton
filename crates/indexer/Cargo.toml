@@ -39,7 +39,9 @@ tree-sitter-r = "1.3"
 tree-sitter-julia = "0.23"
 tree-sitter-ocaml = "0.25"
 tree-sitter-elm = "5.9"
-tree-sitter-nim = "0.1"
+# Vendored, patched fork (not the stale crates.io 0.1.0 with no
+# import-related node at all) -- see vendor/tree-sitter-nim/NOTICE.md.
+tree-sitter-nim = { path = "../../vendor/tree-sitter-nim" }
 tree-sitter-erlang = "0.20"
 tree-sitter-groovy = "0.1"
 tree-sitter-vim = "0.4"
@@ -58,7 +60,19 @@ tree-sitter-objc = "3.0"
 tree-sitter-glsl = "0.2"
 tree-sitter-hlsl = "0.2"
 tree-sitter-d = "0.8"
-tree-sitter-crystal = "0.1"
+# The crates.io "0.1.0" release is from a brand-new, zero-star account
+# ("undivisible") that batch-published several grammar crates the same
+# day, and (confirmed via a real parse-tree dump) can't even parse
+# `require "..."` as a call node at all. crystal-lang-tools is Crystal's
+# own official tooling org (crystalline, the LSP, lives there too),
+# actively maintained, and its real grammar DOES have a dedicated
+# `require` node -- verified directly, not assumed. Vendored (this
+# sandbox's git fetch to this specific host repeatedly failed on
+# transient SSL/network errors, even with `net.git-fetch-with-cli`; a
+# plain `git clone` of the same commit worked fine, so the source is
+# real and verified, just not reliably fetchable as a live `git`
+# Cargo dependency from here) -- see vendor/tree-sitter-crystal/NOTICE.md.
+tree-sitter-crystal = { path = "../../vendor/tree-sitter-crystal" }
 tree-sitter-asm = "0.24"
 tree-sitter-ada = "0.1"
 # The original tree-sitter-kotlin/-svelte/-vue/-wgsl/-latex crates on
