@@ -294,7 +294,7 @@ async fn run_leaf(cfg: &Config, client: &OllamaClient, root: &Path, context_bloc
     let model = cfg.model_for_tier(spec.tier);
     let tools = agentic::read_only_tool_defs();
     let mut messages = vec![
-        ChatMessage::system(spec.system_prompt),
+        ChatMessage::system(spec.base_prompt()),
         ChatMessage::user(format!("Task: {task}\n\nRetrieved context:\n{context_block}")),
     ];
     println!("\x1b[1;35m═══ {} (leaf) ═══\x1b[0m", spec.display);

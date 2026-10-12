@@ -1097,7 +1097,7 @@ pub async fn run(
              task done — a change that hasn't been run isn't verified, it's a guess. \
              When the task is complete, stop calling tools and give a final summary of \
              what you did and the result.",
-            agent.system_prompt
+            agent.base_prompt()
         );
         push_and_record(&mut messages, &state, ChatMessage::system(system));
         let user_msg = match initial_context {

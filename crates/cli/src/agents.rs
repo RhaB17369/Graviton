@@ -22,6 +22,33 @@ pub struct AgentSpec {
     pub tier: ModelTier,
 }
 
+impl AgentSpec {
+    /// `system_prompt` plus [`CONTEXT_RELEVANCE_GUARD`] — every call site \
+    /// that sends a system message to the model should go through this \
+    /// instead of reading `system_prompt` directly, so the guard can't \
+    /// silently go missing from one entry point (`ask`, `crew`/`review`, \
+    /// `swarm`, `mission`, `run`, or the `serve` daemon) while present in \
+    /// the others.
+    pub fn base_prompt(&self) -> String {
+        format!("{}{}", self.system_prompt, CONTEXT_RELEVANCE_GUARD)
+    }
+}
+
+/// Appended to every agent's prompt, everywhere it reaches the model.
+/// `build_context`'s retrieval (FTS/semantic) returns whatever ranked
+/// highest for the question, with no relevance floor — confirmed in
+/// practice: asking an agent to say hello in French pulled back unrelated
+/// Rust indexing code, and several agents' own base prompts end in some
+/// form of "say exactly what you still need instead of guessing" (written
+/// for *missing* context, not irrelevant context), so the model concluded
+/// it couldn't produce a greeting. Without this guard that failure mode
+/// hits any question that doesn't happen to match the index.
+pub const CONTEXT_RELEVANCE_GUARD: &str = "\n\nThe \"Retrieved context\" accompanying the \
+question is whatever the index's search ranked highest for it — it is not guaranteed to be \
+relevant, and a question is not always about this codebase at all. If the retrieved context \
+doesn't actually bear on the question, ignore it and answer directly and normally; don't \
+refuse or claim you can't answer just because nothing indexed applies.";
+
 pub const ARCHITECT: AgentSpec = AgentSpec {
     key: "architect",
     display: "ARCHITECT",

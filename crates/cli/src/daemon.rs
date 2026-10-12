@@ -592,7 +592,7 @@ async fn prepare_ask(ctx: &DaemonCtx, params: &Value) -> Result<(&'static crate:
     let context_text = crate::finish_context(&ctx.cfg, &question, groups, semantic_src).await?;
     let model = ctx.cfg.model_for_tier(spec.tier).to_string();
     let user_msg = format!("Question: {question}\n\nRetrieved context:\n{context_text}");
-    Ok((spec, model, spec.system_prompt.to_string(), user_msg))
+    Ok((spec, model, spec.base_prompt(), user_msg))
 }
 
 /// Shared prep for `review`. `Ok((spec, model, system, None))` means there
@@ -613,7 +613,7 @@ fn prepare_review(ctx: &DaemonCtx, params: &Value) -> Result<(&'static crate::ag
     let model = ctx.cfg.model_for_tier(spec.tier).to_string();
     let diff = crate::agentic::run_git(&ctx.root, &diff_args.iter().map(String::as_str).collect::<Vec<_>>())?;
     let user_msg = if diff.trim().is_empty() { None } else { Some(format!("Review this git diff:\n\n{diff}")) };
-    Ok((spec, model, spec.system_prompt.to_string(), user_msg))
+    Ok((spec, model, spec.base_prompt(), user_msg))
 }
 
 /// `ask`/`review` with `params.stream: true`: writes `{"jsonrpc":"2.0",

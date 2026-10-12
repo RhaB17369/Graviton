@@ -703,9 +703,9 @@ pub(crate) async fn build_context(cfg: &Config, root: &std::path::Path, conn: &r
 
 fn agent_system_prompt(agent: &AgentSpec, investigate: bool) -> String {
     if investigate {
-        format!("{}{}", agent.system_prompt, agents::INVESTIGATE_FORMAT)
+        format!("{}{}", agent.base_prompt(), agents::INVESTIGATE_FORMAT)
     } else {
-        agent.system_prompt.to_string()
+        agent.base_prompt()
     }
 }
 
@@ -768,7 +768,7 @@ async fn run_pipeline(cfg: &Config, root: &std::path::Path, prompt: &str, contex
         } else {
             format!("{prompt}\n\n{context_block}\n\n{handoff_label}\n{prior}")
         };
-        let output = agentic::run_read_only_loop(&client, cfg, root, cfg.model_for_tier(spec.tier), spec.system_prompt, &user_msg, true).await?;
+        let output = agentic::run_read_only_loop(&client, cfg, root, cfg.model_for_tier(spec.tier), &spec.base_prompt(), &user_msg, true).await?;
         prior.push_str(&format!("\n--- {} ---\n{}\n", spec.display, output.trim()));
         let cap = cfg.context_char_budget();
         if prior.len() > cap {
@@ -871,7 +871,7 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
         let cfg_owned = cfg.clone();
         let root_owned = root.clone();
         let model = cfg.model_for_tier(spec.tier).to_string();
-        let system = spec.system_prompt.to_string();
+        let system = spec.base_prompt();
         let user_msg = format!("Question: {question}\n\n{context_block}");
         let display = spec.display;
         let tagline = spec.tagline;
