@@ -10,7 +10,15 @@
 //!
 //! Two different constraints, both real, neither fake-solved here:
 //! - **RAM** bounds how many distinct models can be resident *at all* —
-//!   this we estimate, from `/api/tags` sizes vs. total system memory.
+//!   this we estimate, from `/api/tags` sizes vs. *available* system
+//!   memory right now (not total — this machine isn't a dedicated
+//!   inference box; whatever the desktop, browser, IDE, or another
+//!   already-resident model is holding is RAM a new model can't use
+//!   either, and a budget computed off the total figure will size a
+//!   swarm into a crash the first time something else on the machine is
+//!   actually using it — confirmed live: a 3-agent swarm sized this way
+//!   loaded two ~4.5GB models when under 7GB was genuinely free, and
+//!   `ollama serve` stopped responding to all three partway through).
 //! - **CPU** bounds how fast concurrent generations run *once resident* —
 //!   on a 6C/12T laptop with no big GPU, three agents generating at once
 //!   split the same cores three ways; that's still a net win when the
@@ -95,7 +103,12 @@ pub fn pick_concurrency(cap: &Capacity, models: &[&str], sizes: &HashMap<String,
     let mut costs: Vec<u64> = models.iter().map(|m| sizes.get(*m).copied().unwrap_or(FALLBACK_MODEL_MB)).collect();
     costs.sort_unstable();
 
-    let budget = (cap.total_ram_mb as f64 * RAM_SAFETY_FRACTION) as u64;
+    // `available_ram_mb`, not `total_ram_mb` -- this machine isn't
+    // dedicated to GRAVITON, and RAM something else already holds isn't
+    // RAM a new model can load into regardless of what the *total*
+    // figure says (see this module's doc comment for the live crash that
+    // caught the previous, total-based version of this line).
+    let budget = (cap.available_ram_mb as f64 * RAM_SAFETY_FRACTION) as u64;
     let mut resident = 0usize;
     let mut used = 0u64;
     for c in &costs {
