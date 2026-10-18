@@ -199,28 +199,37 @@ pub async fn cmd_models_recommend(cfg: &Config) -> Result<()> {
     let standard = pick(Kind::CodeStandard).or(fast);
     let defensive_deep = pick(Kind::SecurityDefensive);
     let offensive_deep = pick(Kind::SecurityOffensive);
-    // CRYPTOGRAPHER/QUANTUMCRYPTO used to get `defensive_deep` (the
-    // security-tagged, not-deliberately-uncensored pick) on the
-    // assumption that a "defensive" agent calls for a "defensive"-flavored
-    // model. Verified live against a real question (a JWT-secret fallback
-    // already correctly guarded by an env check) across both: the
-    // uncensored pick gave the only answer that correctly scoped the risk
-    // to the misconfiguration case instead of claiming unconditional
-    // exploitability, quoted the code's own doc comment verbatim, and
-    // produced none of the other candidates' checklist-pattern
-    // hallucinations (a "no MAC/AEAD" finding against HMAC-signed JWTs,
-    // which already is a MAC). "Uncensored" turned out to mean "won't
-    // refuse to write an exploit," not "less careful" -- there's no
-    // reason to assume a crypto *reviewer* needs the refusal-trained
-    // variant, so it now gets the same pick offensive agents do, falling
-    // back to the defensive-tagged one only if no uncensored model is
-    // pulled at all.
-    let crypto_deep = offensive_deep.or(defensive_deep);
     // Design-deep (ARCHITECT/CLOUDARCH): prefer the largest otherwise-
     // unclassified generalist (distinct from the code-tuned standard
     // model, broader reasoning being more the point for design than code
     // completion), falling back to `standard` if nothing else fits.
     let design_deep = pick(Kind::Unclassified).or(standard);
+
+    // CRYPTOGRAPHER/QUANTUMCRYPTO/REAPER/BINEXP used to get auto-assigned
+    // to `defensive_deep`/`offensive_deep` -- the security-tagged picks.
+    // Verified live, twice, why that's worse than it sounds: asked a
+    // read_file-requiring question, REAPER on the uncensored pick threw a
+    // hard `HTTP 500` from Ollama on the *second* turn every time
+    // (`Jinja Exception: No user query found in messages` -- its chat
+    // template, inspected via `ollama show --template`, turned out to be
+    // a vision-model template with multi-step-tool macros that don't
+    // match how Ollama structures a generic tool-result turn, not a
+    // template meant for this model's normal use at all). The
+    // "defensive"-tagged pick doesn't crash, but never actually calls a
+    // tool either -- `tool_calls` came back empty every time and a
+    // tool-call-shaped JSON blob showed up as plain text instead, meaning
+    // Ollama's chosen template for it doesn't support function-calling
+    // signaling. Every agent here reaches the model through the same
+    // tool loop everything else uses (`read_file`/`search_code`/
+    // `web_search`/...) specifically because that's what makes answers
+    // grounded instead of guessed -- a model that silently can't call
+    // tools, or hard-crashes the moment it tries, is a worse default than
+    // one that can, even if (per the one-shot, --file-only comparison
+    // that motivated routing crypto agents here in the first place) it's
+    // more careful when it happens to stay within a single turn. Neither
+    // is assigned by default any more; both are still recognized and
+    // surfaced below so a one-shot/--file-heavy workflow can opt in with
+    // `grv models set`.
 
     let mut routing = ModelRouting::default();
     if let Some(c) = fast {
@@ -234,14 +243,6 @@ pub async fn cmd_models_recommend(cfg: &Config) -> Result<()> {
         routing.agents.insert("architect".to_string(), c.tag.clone());
         routing.agents.insert("cloudarch".to_string(), c.tag.clone());
     }
-    if let Some(c) = crypto_deep {
-        routing.agents.insert("cryptographer".to_string(), c.tag.clone());
-        routing.agents.insert("quantumcrypto".to_string(), c.tag.clone());
-    }
-    if let Some(c) = offensive_deep {
-        routing.agents.insert("reaper".to_string(), c.tag.clone());
-        routing.agents.insert("binexp".to_string(), c.tag.clone());
-    }
     routing.save()?;
 
     println!("wrote {}\n", ModelRouting::path()?.display());
@@ -252,28 +253,34 @@ pub async fn cmd_models_recommend(cfg: &Config) -> Result<()> {
     if let Some(c) = standard {
         println!("  tier.standard = {} ({} MB)", c.tag, c.size_mb);
     }
-    println!("\ndeep, split by what the work actually needs instead of one shared slot:");
+    println!(
+        "\ndeep (architect, cloudarch -- everyone else here, including \
+         cryptographer/quantumcrypto/reaper/binexp, shares this too; see below for why):"
+    );
     if let Some(c) = design_deep {
-        println!("  architect, cloudarch (design)        -> {} ({} MB)", c.tag, c.size_mb);
+        println!("  {} ({} MB)", c.tag, c.size_mb);
     }
-    if let Some(c) = crypto_deep {
-        let uncensored_note = if offensive_deep.is_some_and(|o| o.tag == c.tag) {
-            " — uncensored, verified more accurate here than the defensive-tagged pick, not just less restricted"
-        } else {
-            ""
-        };
-        println!("  cryptographer, quantumcrypto             -> {} ({} MB){}", c.tag, c.size_mb, uncensored_note);
-    } else {
-        println!("  cryptographer, quantumcrypto             -> no security-tagged model found, left on tier.deep/model_deep");
+    if let Some(c) = defensive_deep {
+        println!(
+            "\nfound but NOT auto-assigned — {} ({} MB): recognized as security-tagged, but it \
+             never actually signals a tool call through Ollama (tool_calls came back empty and a \
+             tool-call-shaped JSON blob leaked into plain text instead) when tested live. Usable \
+             for a one-shot/--file-only question with `grv models set <agent> {0}`, not recommended \
+             for anything that leans on read_file/search_code/web_search.",
+            c.tag, c.size_mb
+        );
     }
     if let Some(c) = offensive_deep {
         println!(
-            "  reaper, binexp (offensive)            -> {} ({} MB) — uncensored; use only in \
-             authorized engagements, same as any other offensive-security tooling here",
+            "\nfound but NOT auto-assigned — {} ({} MB): recognized as uncensored (use only in \
+             authorized engagements, same as any other offensive-security tooling here), but its \
+             chat template hard-crashes Ollama (`HTTP 500`, confirmed reproducible) the instant a \
+             second turn follows a tool call. More careful than the alternatives in a one-shot \
+             test with no tool calls (see git log), but that makes it a `--file`-only tool, not a \
+             safe default for `ask`/`run`'s normal tool loop. Opt in per agent with `grv models \
+             set <agent> {0}` if you mainly feed it complete context up front.",
             c.tag, c.size_mb
         );
-    } else {
-        println!("  reaper, binexp (offensive)             -> no uncensored model found, left on tier.deep/model_deep");
     }
 
     let vision: Vec<&Candidate> = candidates.iter().filter(|c| c.kind == Kind::Vision).collect();
