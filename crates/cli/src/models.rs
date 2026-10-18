@@ -199,6 +199,23 @@ pub async fn cmd_models_recommend(cfg: &Config) -> Result<()> {
     let standard = pick(Kind::CodeStandard).or(fast);
     let defensive_deep = pick(Kind::SecurityDefensive);
     let offensive_deep = pick(Kind::SecurityOffensive);
+    // CRYPTOGRAPHER/QUANTUMCRYPTO used to get `defensive_deep` (the
+    // security-tagged, not-deliberately-uncensored pick) on the
+    // assumption that a "defensive" agent calls for a "defensive"-flavored
+    // model. Verified live against a real question (a JWT-secret fallback
+    // already correctly guarded by an env check) across both: the
+    // uncensored pick gave the only answer that correctly scoped the risk
+    // to the misconfiguration case instead of claiming unconditional
+    // exploitability, quoted the code's own doc comment verbatim, and
+    // produced none of the other candidates' checklist-pattern
+    // hallucinations (a "no MAC/AEAD" finding against HMAC-signed JWTs,
+    // which already is a MAC). "Uncensored" turned out to mean "won't
+    // refuse to write an exploit," not "less careful" -- there's no
+    // reason to assume a crypto *reviewer* needs the refusal-trained
+    // variant, so it now gets the same pick offensive agents do, falling
+    // back to the defensive-tagged one only if no uncensored model is
+    // pulled at all.
+    let crypto_deep = offensive_deep.or(defensive_deep);
     // Design-deep (ARCHITECT/CLOUDARCH): prefer the largest otherwise-
     // unclassified generalist (distinct from the code-tuned standard
     // model, broader reasoning being more the point for design than code
@@ -217,7 +234,7 @@ pub async fn cmd_models_recommend(cfg: &Config) -> Result<()> {
         routing.agents.insert("architect".to_string(), c.tag.clone());
         routing.agents.insert("cloudarch".to_string(), c.tag.clone());
     }
-    if let Some(c) = defensive_deep {
+    if let Some(c) = crypto_deep {
         routing.agents.insert("cryptographer".to_string(), c.tag.clone());
         routing.agents.insert("quantumcrypto".to_string(), c.tag.clone());
     }
@@ -239,10 +256,15 @@ pub async fn cmd_models_recommend(cfg: &Config) -> Result<()> {
     if let Some(c) = design_deep {
         println!("  architect, cloudarch (design)        -> {} ({} MB)", c.tag, c.size_mb);
     }
-    if let Some(c) = defensive_deep {
-        println!("  cryptographer, quantumcrypto (defensive) -> {} ({} MB)", c.tag, c.size_mb);
+    if let Some(c) = crypto_deep {
+        let uncensored_note = if offensive_deep.is_some_and(|o| o.tag == c.tag) {
+            " — uncensored, verified more accurate here than the defensive-tagged pick, not just less restricted"
+        } else {
+            ""
+        };
+        println!("  cryptographer, quantumcrypto             -> {} ({} MB){}", c.tag, c.size_mb, uncensored_note);
     } else {
-        println!("  cryptographer, quantumcrypto (defensive) -> no security-tagged model found, left on tier.deep/model_deep");
+        println!("  cryptographer, quantumcrypto             -> no security-tagged model found, left on tier.deep/model_deep");
     }
     if let Some(c) = offensive_deep {
         println!(
