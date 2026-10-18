@@ -23,14 +23,15 @@ pub struct AgentSpec {
 }
 
 impl AgentSpec {
-    /// `system_prompt` plus [`CONTEXT_RELEVANCE_GUARD`] — every call site \
-    /// that sends a system message to the model should go through this \
-    /// instead of reading `system_prompt` directly, so the guard can't \
-    /// silently go missing from one entry point (`ask`, `crew`/`review`, \
-    /// `swarm`, `mission`, `run`, or the `serve` daemon) while present in \
-    /// the others.
+    /// `system_prompt` plus [`CONTEXT_RELEVANCE_GUARD`] and
+    /// [`VERIFY_BEFORE_ASSERTING_GUARD`] — every call site that sends a
+    /// system message to the model should go through this instead of
+    /// reading `system_prompt` directly, so neither guard can silently go
+    /// missing from one entry point (`ask`, `crew`/`review`, `swarm`,
+    /// `mission`, `run`, or the `serve` daemon) while present in the
+    /// others.
     pub fn base_prompt(&self) -> String {
-        format!("{}{}", self.system_prompt, CONTEXT_RELEVANCE_GUARD)
+        format!("{}{}{}", self.system_prompt, CONTEXT_RELEVANCE_GUARD, VERIFY_BEFORE_ASSERTING_GUARD)
     }
 }
 
@@ -48,6 +49,32 @@ question is whatever the index's search ranked highest for it — it is not guar
 relevant, and a question is not always about this codebase at all. If the retrieved context \
 doesn't actually bear on the question, ignore it and answer directly and normally; don't \
 refuse or claim you can't answer just because nothing indexed applies.";
+
+/// Appended to every agent's prompt, everywhere it reaches the model.
+/// Confirmed in practice on a real question ("can a CASHIER delete an
+/// event?"): a retrieved snippet of the *controller* (one `@Roles`
+/// decorator) looked sufficient on its own, so the model answered from it
+/// without calling the `read_file` tool it had available on the actual
+/// *service* method that holds the real, different, more specific guard —
+/// and then "recommended" reinventing that exact guard under an invented
+/// name, having never read it. The retrieval/tool machinery was never the
+/// gap (`read_file`/`web_search`/`web_fetch` are offered in every
+/// read-only loop — see `agentic::read_only_tool_defs`); nothing was
+/// telling the model those extra steps were worth spending before
+/// answering a question whose cost of being *confidently wrong* is high.
+pub const VERIFY_BEFORE_ASSERTING_GUARD: &str = "\n\nBefore stating a definitive fact about \
+this codebase's actual behavior — what a specific function/guard/check does or doesn't allow, \
+whether a vulnerability exists, whether a fix is already in place — read_file the specific \
+file(s) that would actually prove it, even when a retrieved snippet already looks sufficient: \
+a search hit can be one piece of a multi-layered mechanism (e.g. a controller-level check is \
+rarely the only one — a service underneath it may enforce something stricter and more \
+specific), partial, or stale. Say exactly what you read (path:line) to back the claim. Never \
+propose adding a check/guard/validation without first confirming via read_file that it doesn't \
+already exist elsewhere in the path — recommending a fix for something already fixed, under a \
+different name, is worse than not reviewing it at all. For a claim about a third-party \
+framework/library's own behavior (not this repo's code) that you're not fully certain of, \
+web_search/web_fetch its official docs instead of answering from training memory, which can be \
+outdated or just wrong on specifics.";
 
 pub const ARCHITECT: AgentSpec = AgentSpec {
     key: "architect",

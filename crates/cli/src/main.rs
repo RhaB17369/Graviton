@@ -683,9 +683,14 @@ pub(crate) fn build_context_sync(
         .iter()
         .filter_map(|f| context::read_whole_file(root, f))
         .collect();
-    let symbol_hits = context::search_symbols(conn, root, question, 8)?;
-    let chunk_hits = context::search_chunks(conn, question, 12)?;
-    let groups = vec![explicit, symbol_hits, chunk_hits];
+    let mut symbol_hits = context::search_symbols(conn, root, question, 8)?;
+    let mut chunk_hits = context::search_chunks(conn, question, 12)?;
+    // Mechanical fix, not a behavioral one: upgrade a snippet-sized hit to
+    // its whole file (small ones only) instead of counting on the model
+    // to notice it's incomplete and call read_file itself — verified live
+    // that it doesn't reliably do that. See `promote_full_files`.
+    let promoted = context::promote_full_files(root, &mut [&mut symbol_hits, &mut chunk_hits], 3);
+    let groups = vec![explicit, promoted, symbol_hits, chunk_hits];
 
     let semantic_src = match cfg.embed_model.as_deref() {
         Some(model) if semantic::has_embeddings(conn) => match semantic::prepare_query_source(conn, root, &cfg.index_dir, model) {
@@ -717,6 +722,7 @@ pub(crate) async fn finish_context(
                     .map(|h| context::ContextBlock {
                         header: format!("{}:{}-{} (semantic, score {:.2})", h.path, h.start_line, h.end_line, h.score),
                         body: h.body,
+                        path: Some(h.path),
                     })
                     .collect(),
             ),
