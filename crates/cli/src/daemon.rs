@@ -590,7 +590,7 @@ async fn prepare_ask(ctx: &DaemonCtx, params: &Value) -> Result<(&'static crate:
     let (groups, semantic_src) = crate::build_context_sync(&ctx.cfg, &ctx.root, &conn, &question, &files)?;
     drop(conn); // see semantic::EmbeddedChunk's doc comment: no Connection across the await below
     let context_text = crate::finish_context(&ctx.cfg, &question, groups, semantic_src).await?;
-    let model = ctx.cfg.model_for_tier(spec.tier).to_string();
+    let model = ctx.cfg.model_for(spec.tier, spec.key).to_string();
     let user_msg = format!("Question: {question}\n\nRetrieved context:\n{context_text}");
     Ok((spec, model, spec.base_prompt(), user_msg))
 }
@@ -610,7 +610,7 @@ fn prepare_review(ctx: &DaemonCtx, params: &Value) -> Result<(&'static crate::ag
         None if staged => diff_args.push("--staged".to_string()),
         None => diff_args.push("HEAD".to_string()),
     }
-    let model = ctx.cfg.model_for_tier(spec.tier).to_string();
+    let model = ctx.cfg.model_for(spec.tier, spec.key).to_string();
     let diff = crate::agentic::run_git(&ctx.root, &diff_args.iter().map(String::as_str).collect::<Vec<_>>())?;
     let user_msg = if diff.trim().is_empty() { None } else { Some(format!("Review this git diff:\n\n{diff}")) };
     Ok((spec, model, spec.base_prompt(), user_msg))

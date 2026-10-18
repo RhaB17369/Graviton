@@ -482,33 +482,25 @@ pub const INVESTIGATE_FORMAT: &str = "\n\nFor this request specifically, structu
 (symbol name, file, or search term) needed to keep going if context was \
 insufficient.";
 
-fn tier_label(t: ModelTier) -> &'static str {
-    match t {
-        ModelTier::Fast => "fast",
-        ModelTier::Standard => "standard",
-        ModelTier::Deep => "deep",
-    }
-}
-
 pub fn list_text() -> String {
     let mut out = String::from("GRAVITON agent roster:\n\nprogramming:\n");
     for a in [&ARCHITECT, &TESTER, &DEBUGGER, &PERFORMANCE] {
-        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, tier_label(a.tier), a.tagline));
+        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, a.tier.label(), a.tagline));
     }
     out.push_str("\ninfrastructure & engineering:\n");
     for a in [&NETARCH, &DEVOPS, &CLOUDARCH, &DEPLOY, &AUTOMATOR, &DOCUMENTOR] {
-        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, tier_label(a.tier), a.tagline));
+        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, a.tier.label(), a.tagline));
     }
     out.push_str("\ndefensive security:\n");
     for a in [&SENTINEL, &CRYPTOGRAPHER, &QUANTUMCRYPTO, &SUPPLYCHAIN, &CLOUDSEC, &IDENTITY] {
-        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, tier_label(a.tier), a.tagline));
+        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, a.tier.label(), a.tagline));
     }
     out.push_str("\noffensive security:\n");
     for a in [&REAPER, &WEBHUNTER, &BINEXP, &ADVERSARY, &OSINT] {
-        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, tier_label(a.tier), a.tagline));
+        out.push_str(&format!("  {:<14} [{:<8}] {}\n", a.key, a.tier.label(), a.tagline));
     }
     out.push_str("\ncoordinator:\n");
-    out.push_str(&format!("  {:<14} [{:<8}] {}\n", SINGULARITY.key, tier_label(SINGULARITY.tier), SINGULARITY.tagline));
+    out.push_str(&format!("  {:<14} [{:<8}] {}\n", SINGULARITY.key, SINGULARITY.tier.label(), SINGULARITY.tagline));
     out.push_str(
         "\n[tier] is which model this agent calls if `grv config` has model_fast/\n\
          model_deep set (grv config --model-fast <tag> --model-deep <tag>) — unset,\n\

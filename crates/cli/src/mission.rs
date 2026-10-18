@@ -104,7 +104,7 @@ pub async fn run(
     // agents the planner ends up picking — sizes the scheduler once,
     // up front, for the whole run.
     let all_models: Vec<String> = {
-        let mut m: Vec<String> = agents::ALL_AGENTS.iter().map(|a| cfg.model_for_tier(a.tier).to_string()).collect();
+        let mut m: Vec<String> = agents::ALL_AGENTS.iter().map(|a| cfg.model_for(a.tier, a.key).to_string()).collect();
         m.sort();
         m.dedup();
         m
@@ -291,7 +291,7 @@ async fn call_model(client: &OllamaClient, cfg: &Config, model: &str, system: &s
 /// other call in the tree.
 async fn run_leaf(cfg: &Config, client: &OllamaClient, root: &Path, context_block: &str, task: &str, agent_key: &str, scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<String> {
     let spec = agents::find(agent_key).unwrap_or(&agents::ARCHITECT);
-    let model = cfg.model_for_tier(spec.tier);
+    let model = cfg.model_for(spec.tier, spec.key);
     let tools = agentic::read_only_tool_defs();
     let mut messages = vec![
         ChatMessage::system(spec.base_prompt()),

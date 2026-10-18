@@ -1114,7 +1114,7 @@ pub async fn run(
 
     for step in 0..MAX_STEPS {
         let result = client
-            .chat_stream(cfg.model_for_tier(agent.tier), &messages, cfg.num_ctx, &tools, |tok| io.on_token(tok))
+            .chat_stream(cfg.model_for(agent.tier, agent.key), &messages, cfg.num_ctx, &tools, |tok| io.on_token(tok))
             .await?;
         io.emit(String::new()); // blank line after the streamed answer, matching the terminal's old unconditional println!()
 

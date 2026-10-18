@@ -22,6 +22,18 @@ pub enum ModelTier {
     Deep,
 }
 
+impl ModelTier {
+    /// Lowercase name used both for display (`grv agents`) and as the
+    /// `tier.<name>` key in `models.toml`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelTier::Fast => "fast",
+            ModelTier::Standard => "standard",
+            ModelTier::Deep => "deep",
+        }
+    }
+}
+
 /// Runtime configuration, loaded from `~/.config/graviton/config.toml`
 /// (created with sane defaults on first run).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,19 +64,31 @@ pub struct Config {
     pub context_budget_fraction: f32,
     /// Directory name (relative to a repo root) holding the SQLite index.
     pub index_dir: String,
+    /// Per-tier/per-agent-key model overrides loaded from the separate
+    /// `models.toml` (see [`ModelRouting`]) — never read from or written
+    /// to `config.toml` itself, so it's skipped here.
+    #[serde(skip, default)]
+    pub routing: ModelRouting,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             ollama_host: "http://127.0.0.1:11434".to_string(),
-            model: "qwen3:8b".to_string(),
+            // qwen3:8b was the original default but turned out, in
+            // practice on the 4GB-VRAM/CPU-only class of hardware this
+            // project targets, to be too slow for interactive use (~1.4
+            // tok/s generation observed) without actually being more
+            // capable at code tasks than a model built for code — a
+            // code-specialized 7B now ships as the default instead.
+            model: "qwen2.5-coder:7b".to_string(),
             model_fast: None,
             model_deep: None,
             embed_model: None,
             num_ctx: 8192,
             context_budget_fraction: 0.55,
             index_dir: ".graviton".to_string(),
+            routing: ModelRouting::default(),
         }
     }
 }
@@ -75,20 +99,25 @@ impl Config {
         Ok(base.join("graviton").join("config.toml"))
     }
 
-    /// Load config from disk, writing defaults if none exists yet.
+    /// Load config from disk, writing defaults if none exists yet. Also
+    /// loads the separate, optional `models.toml` routing file (missing =
+    /// no overrides, not an error) — see [`ModelRouting`] and
+    /// [`Config::model_for`].
     pub fn load_or_init() -> Result<Self> {
         let path = Self::config_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if !path.exists() {
+        let mut cfg = if !path.exists() {
             let cfg = Self::default();
             cfg.save()?;
-            return Ok(cfg);
-        }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config = toml_from_str(&raw)?;
+            cfg
+        } else {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            toml_from_str(&raw)?
+        };
+        cfg.routing = ModelRouting::load()?;
         Ok(cfg)
     }
 
@@ -109,10 +138,15 @@ impl Config {
         tokens * 4
     }
 
-    /// Resolve which model tag an agent in the given tier should call.
-    /// `Fast`/`Deep` fall back to `model` when no override is configured,
-    /// so an untouched config runs everything on one model exactly as v0.4
-    /// did — tiering is opt-in.
+    /// Resolve which model tag an agent in the given tier should call,
+    /// ignoring any per-agent override — i.e. just the `model`/
+    /// `model_fast`/`model_deep` fallback layer. `Fast`/`Deep` fall back to
+    /// `model` when no override is configured, so an untouched config runs
+    /// everything on one model exactly as v0.4 did — tiering is opt-in.
+    /// Most call sites want [`Config::model_for`] instead, which also
+    /// checks `models.toml`; this stays public for the handful of calls
+    /// (the mission planner/judge) that only have a tier, no specific
+    /// agent, to key an override on.
     pub fn model_for_tier(&self, tier: ModelTier) -> &str {
         match tier {
             ModelTier::Fast => self.model_fast.as_deref().unwrap_or(&self.model),
@@ -121,9 +155,27 @@ impl Config {
         }
     }
 
-    /// The distinct model tags this config would actually call across all
-    /// three tiers (deduplicated) — used to size concurrent-capacity
-    /// estimates without guessing at agent assignments.
+    /// Resolve which model tag a specific agent should call: `models.toml`
+    /// `[agent]` override for `agent_key` first, then its `[tier]`
+    /// override, then the plain `model_for_tier` fallback above. This is
+    /// the one lever that lets two agents sharing `ModelTier::Deep` (say
+    /// ARCHITECT's design work and REAPER's exploit dev) run on two
+    /// different models without a new `ModelTier` variant — see
+    /// `grv models`.
+    pub fn model_for(&self, tier: ModelTier, agent_key: &str) -> &str {
+        if let Some(m) = self.routing.agents.get(agent_key) {
+            return m;
+        }
+        if let Some(m) = self.routing.tiers.get(tier.label()) {
+            return m;
+        }
+        self.model_for_tier(tier)
+    }
+
+    /// The distinct model tags this config would actually call — every
+    /// `models.toml` override plus the three tier-fallback slots
+    /// (deduplicated) — used to size concurrent-capacity estimates without
+    /// guessing at agent assignments.
     pub fn distinct_models(&self) -> Vec<&str> {
         let mut out = vec![self.model.as_str()];
         for m in [self.model_fast.as_deref(), self.model_deep.as_deref()].into_iter().flatten() {
@@ -131,7 +183,102 @@ impl Config {
                 out.push(m);
             }
         }
+        for m in self.routing.tiers.values().chain(self.routing.agents.values()) {
+            if !out.contains(&m.as_str()) {
+                out.push(m.as_str());
+            }
+        }
         out
+    }
+}
+
+/// Per-tier and per-agent-key model overrides, loaded from the separate
+/// `~/.config/graviton/models.toml` — `config.toml`'s `model`/
+/// `model_fast`/`model_deep` keep working untouched for anyone who never
+/// looks at this file. Two agents that share one `ModelTier` today can
+/// still end up on two different models by each getting an `[agent]`
+/// entry here, so splitting (say) "deep design" from "deep offensive" is
+/// a config edit, not a recompile — see `Config::model_for` and
+/// `grv models`, which can write this file automatically from whatever's
+/// actually pulled in Ollama and this machine's RAM (`grv models
+/// recommend`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelRouting {
+    pub tiers: std::collections::BTreeMap<String, String>,
+    pub agents: std::collections::BTreeMap<String, String>,
+}
+
+impl ModelRouting {
+    pub fn path() -> Result<PathBuf> {
+        let base = dirs::config_dir().context("no config dir on this platform")?;
+        Ok(base.join("graviton").join("models.toml"))
+    }
+
+    /// Missing file = no overrides at all, not an error — every agent
+    /// falls straight through to `Config::model_for_tier` exactly as
+    /// before this file existed.
+    pub fn load() -> Result<Self> {
+        let path = Self::path()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Ok(Self::parse(&raw))
+    }
+
+    /// Flat `tier.<name> = "..."` / `agent.<key> = "..."` lines rather than
+    /// real `[section]` tables — same hand-rolled-parser philosophy as
+    /// `Config`'s own `config.toml` (no `toml` crate dependency for a
+    /// handful of scalar entries), just with a dotted prefix standing in
+    /// for the two logical tables.
+    fn parse(raw: &str) -> Self {
+        let mut out = Self::default();
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let key = key.trim();
+            let value = value.trim().trim_matches('"');
+            if value.is_empty() {
+                continue;
+            }
+            if let Some(rest) = key.strip_prefix("tier.") {
+                out.tiers.insert(rest.to_string(), value.to_string());
+            } else if let Some(rest) = key.strip_prefix("agent.") {
+                out.agents.insert(rest.to_string(), value.to_string());
+            }
+        }
+        out
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = String::from(
+            "# GRAVITON model routing -- per-tier and per-agent-key overrides.\n\
+             # Resolution order per agent: agent.<key> > tier.<fast|standard|deep>\n\
+             # > config.toml's model_fast/model/model_deep.\n\
+             #\n\
+             # Hand-edit this directly (`grv models set <key> <model>`), or let\n\
+             # GRAVITON propose it from whatever's actually pulled in Ollama and\n\
+             # this machine's RAM: `grv models recommend`.\n\n",
+        );
+        if !self.tiers.is_empty() {
+            for (k, v) in &self.tiers {
+                out.push_str(&format!("tier.{k} = \"{v}\"\n"));
+            }
+            out.push('\n');
+        }
+        for (k, v) in &self.agents {
+            out.push_str(&format!("agent.{k} = \"{v}\"\n"));
+        }
+        std::fs::write(&path, out)?;
+        Ok(())
     }
 }
 

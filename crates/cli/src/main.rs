@@ -8,6 +8,7 @@ mod context;
 mod custom_tools;
 mod daemon;
 mod mission;
+mod models;
 mod permissions;
 mod resources;
 mod run_io;
@@ -239,6 +240,16 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Show or edit per-tier/per-agent-key model routing
+    /// (~/.config/graviton/models.toml) — the finer-grained alternative to
+    /// `grv config`'s single model_fast/model_deep slots: lets two agents
+    /// that share a tier (e.g. ARCHITECT's design work and REAPER's
+    /// exploit dev, both ModelTier::Deep) run on two different models.
+    /// With no subcommand, shows the resolved model for every agent.
+    Models {
+        #[command(subcommand)]
+        action: Option<ModelsCommand>,
+    },
     /// Run recon/security tools and index their output for `ask`/`search`
     Tool {
         #[command(subcommand)]
@@ -272,6 +283,20 @@ enum Command {
         #[arg(long)]
         tcp_token: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ModelsCommand {
+    /// Pin an agent key (e.g. `architect`) or a tier name (fast/standard/
+    /// deep) to a specific Ollama model tag
+    Set { key: String, model: String },
+    /// Remove an override, letting that key fall through to the next
+    /// level (agent override -> tier override -> config.toml fallback)
+    Unset { key: String },
+    /// Inspect what's pulled in Ollama and this machine's RAM, and write a
+    /// full routing sized not to thrash into swap — overwrites the whole
+    /// file, so a manual edit since the last `recommend` is lost
+    Recommend,
 }
 
 #[derive(Subcommand)]
@@ -420,6 +445,12 @@ async fn main() -> Result<()> {
         Command::Config { model, model_fast, model_deep, embed_model, num_ctx, host } => {
             cmd_config(model, model_fast, model_deep, embed_model, num_ctx, host)
         }
+        Command::Models { action } => match action {
+            None => models::cmd_models_show(&cfg).await,
+            Some(ModelsCommand::Set { key, model }) => models::cmd_models_set(&key, &model),
+            Some(ModelsCommand::Unset { key }) => models::cmd_models_unset(&key),
+            Some(ModelsCommand::Recommend) => models::cmd_models_recommend(&cfg).await,
+        },
         Command::Tool { action } => cmd_tool(&cfg, action),
         Command::Custom { action } => cmd_custom(action),
         Command::Serve { socket, tcp, tcp_token } => daemon::serve(&cfg, repo_root()?, socket, tcp, tcp_token).await,
@@ -726,7 +757,7 @@ async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &Agen
 
     println!("\x1b[1;35m═══ {} ═══\x1b[0m", agent.display);
     let client = OllamaClient::new(&cfg.ollama_host);
-    agentic::run_read_only_loop(&client, cfg, &root, cfg.model_for_tier(agent.tier), &system, &user_msg, true)
+    agentic::run_read_only_loop(&client, cfg, &root, cfg.model_for(agent.tier, agent.key), &system, &user_msg, true)
         .await
         .map(|_| ())
 }
@@ -768,7 +799,7 @@ async fn run_pipeline(cfg: &Config, root: &std::path::Path, prompt: &str, contex
         } else {
             format!("{prompt}\n\n{context_block}\n\n{handoff_label}\n{prior}")
         };
-        let output = agentic::run_read_only_loop(&client, cfg, root, cfg.model_for_tier(spec.tier), &spec.base_prompt(), &user_msg, true).await?;
+        let output = agentic::run_read_only_loop(&client, cfg, root, cfg.model_for(spec.tier, spec.key), &spec.base_prompt(), &user_msg, true).await?;
         prior.push_str(&format!("\n--- {} ---\n{}\n", spec.display, output.trim()));
         let cap = cfg.context_char_budget();
         if prior.len() > cap {
@@ -850,7 +881,7 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
 
     let client = OllamaClient::new(&cfg.ollama_host);
     let models: Vec<String> = {
-        let mut m: Vec<String> = specs.iter().map(|s| cfg.model_for_tier(s.tier).to_string()).collect();
+        let mut m: Vec<String> = specs.iter().map(|s| cfg.model_for(s.tier, s.key).to_string()).collect();
         m.dedup();
         m
     };
@@ -870,7 +901,7 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
         let client = OllamaClient::new(&cfg.ollama_host);
         let cfg_owned = cfg.clone();
         let root_owned = root.clone();
-        let model = cfg.model_for_tier(spec.tier).to_string();
+        let model = cfg.model_for(spec.tier, spec.key).to_string();
         let system = spec.base_prompt();
         let user_msg = format!("Question: {question}\n\n{context_block}");
         let display = spec.display;
