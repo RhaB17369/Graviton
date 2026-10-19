@@ -78,7 +78,19 @@ already exist elsewhere in the path — recommending a fix for something already
 different name, is worse than not reviewing it at all. For a claim about a third-party \
 framework/library's own behavior (not this repo's code) that you're not fully certain of, \
 web_search/web_fetch its official docs instead of answering from training memory, which can be \
-outdated or just wrong on specifics.";
+outdated or just wrong on specifics.
+
+A specific CVE/GHSA/advisory ID is the single most checkable claim you can make — and the one \
+most tempting to produce from memory when you can't recall one that actually fits, because any \
+plausible-looking ID reads as authoritative. Confirmed live: asked to assess a package.json, an \
+agent cited a specific CVE number against a specific dependency version that turned out, \
+checked against the real advisory databases, not to exist at all — a fabricated citation is a \
+worse answer than no citation, because it invites someone to trust it exactly because it looks \
+verifiable. Never state a CVE/GHSA/advisory ID unless you reached it via an actual web_search/ \
+web_fetch call in this same conversation — not from training memory, even when you're confident \
+you remember one. If you have a real concern about a dependency but haven't verified a specific \
+ID, say so as a concern (\"worth checking for known CVEs against openssl 1.1.1 via npm audit/ \
+Snyk/the GHSA database\"), not as a specific, numbered finding you didn't actually verify.";
 
 /// Appended to every agent's prompt, everywhere it reaches the model.
 /// Confirmed in practice: asked CRYPTOGRAPHER whether an already-guarded
@@ -93,10 +105,15 @@ outdated or just wrong on specifics.";
 /// its security property. Separately, asked about two distinct mechanisms
 /// in one question, it addressed only the first and silently dropped the
 /// second.
-pub const NO_FINDING_IS_A_VALID_ANSWER_GUARD: &str = "\n\nState your verdict in the first \
+pub const NO_FINDING_IS_A_VALID_ANSWER_GUARD: &str = "\n\nState your verdict as the first \
 sentence, in direct, unhedged language (vulnerable/not vulnerable, exploitable/not exploitable, \
 safe/unsafe) — don't bury it after a list of findings or leave the reader to infer it from the \
-details. If the question names more than one specific mechanism, file, or line, address every \
+details. That sentence is where the answer *starts*, never where it ends: a bare verdict with \
+no path:line, no mechanism, and no reasoning is as useless as no answer at all, and confirmed \
+live to be a real failure mode on its own — asked to review a manifest, one agent's entire reply \
+was the single word \"vulnerable,\" nothing else. Always follow the verdict with the specific \
+file/line/dependency and the concrete reason, even when the verdict is \"safe\" or \"no issue \
+found.\" If the question names more than one specific mechanism, file, or line, address every \
 one of them explicitly; don't answer only the part that was easiest to match and silently drop \
 the rest. \"Already correctly handled, no fix needed\" is a complete, successful answer, not a \
 failure to find something — and manufacturing a change to a mechanism that's already sound \

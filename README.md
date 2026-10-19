@@ -181,6 +181,29 @@ close all of them:
    prompt to say explicitly: most categories won't apply to most code,
    and reporting one that isn't present is a false positive like any
    other.
+4. **A verdict-first instruction got followed so literally the answer
+   stopped there.** Telling agents to lead with a direct verdict (fix
+   #1 above's sibling guard) backfired once in testing: asked to review a
+   manifest, one agent's entire reply was the single word "vulnerable" —
+   no file, no line, no reasoning, nothing to act on. Reworded the guard
+   to say the verdict is where the answer *starts*, never where it ends,
+   and that a bare verdict is as useless as no answer. It's not a
+   guaranteed fix — a 3B (`Fast`-tier) model was observed producing both
+   a full, substantive answer and this exact one-word failure on the
+   *identical* question across separate runs, consistent with normal
+   sampling variance at that model size rather than the wording alone
+   deciding it either way.
+5. **A specific CVE number, stated with total confidence, that doesn't
+   exist.** A supply-chain review cited a CVE ID against a real
+   dependency and version as if confirmed — checked against the real
+   advisory databases, it isn't a real CVE at all. A fabricated,
+   specific-looking citation is worse than a vague one: it reads as
+   independently verifiable precisely because it has a number. Added an
+   explicit guard: never state a CVE/GHSA/advisory ID unless it came
+   from an actual `web_search`/`web_fetch` call in that same
+   conversation, not training memory — phrase an unverified concern as a
+   concern ("worth checking via npm audit/the GHSA database"), not as a
+   numbered finding.
 
 What's still an open, honest limitation: even after all three fixes, a
 small (3B–9B) local model given already-correctly-guarded code will
