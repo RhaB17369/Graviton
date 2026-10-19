@@ -580,10 +580,20 @@ broader shell-execution path.
 - **Svelte/Vue symbol extraction** — needs a second, injection-based
   parse of their `<script>` block; their own grammars expose it as
   opaque text with no def query to write against.
-- **A reliable way to stop a small model from confidently asserting a
-  false positive against already-correct code.** Three real fixes (see
-  above) reduced how often this happens; none eliminated it. This is the
-  project's single most important open problem, stated plainly instead
-  of buried — every agent's output is a lead, not a verdict, until a
-  human (or `promote_full_files`-style mechanical grounding, which is
-  the only category of fix that's actually worked so far) confirms it.
+- **A reliable way to stop a small *local* model from confidently
+  asserting a false positive against already-correct code.** Three real
+  prompt-level fixes (see above) reduced how often this happens at the
+  3B–9B scale this project targets; none eliminated it. Isolated by
+  swapping only the model on an otherwise-identical question: a 31B
+  model (`gemma4:31b-cloud`) got the verdict right, cited accurate
+  evidence, and investigated a second file on its own where every local
+  model tested had not — so this is a model-*capacity* ceiling the
+  prompts and guards can't push past on their own, not an architecture
+  flaw. `grv models recommend` still never auto-assigns a `:cloud` tag
+  (see above) — the fix for a question that needs that accuracy is a
+  deliberate, per-agent `grv models set`, not a silent default, because
+  it trades this project's core "nothing leaves the machine" property
+  for it. On the hardware class this project actually targets, every
+  agent's local-model output stays a lead, not a verdict, until a human
+  (or `promote_full_files`-style mechanical grounding, the only
+  *local* fix that's actually worked so far) confirms it.

@@ -183,15 +183,33 @@ close all of them:
    other.
 
 What's still an open, honest limitation: even after all three fixes, a
-small model given already-correctly-guarded code will sometimes still
-assert a false positive, confidently, with a specific (wrong) line
-citation. Verified repeatedly across qwen2.5-coder, qwen3.5, DeepHat, and
-an uncensored fine-tune, against a Dockerfile with an explicit, correctly
-placed `USER node` — more than one model still reported "running as
-root," once citing specific lines that do neither. **Treat every finding
-from every agent as a lead to verify, never as a verdict** — that's not
-a disclaimer, it's the one thing this whole testing effort couldn't make
-go away.
+small (3B–9B) local model given already-correctly-guarded code will
+sometimes still assert a false positive, confidently, with a specific
+(wrong) line citation. Verified repeatedly across qwen2.5-coder, qwen3.5,
+DeepHat, and an uncensored fine-tune, against a Dockerfile with an
+explicit, correctly placed `USER node` — more than one model still
+reported "running as root," once citing specific lines that do neither.
+**Treat every finding from a small local model as a lead to verify,
+never as a verdict.**
+
+That specific failure turned out to be a model-*capacity* problem, not a
+prompt or architecture problem — confirmed by swapping just the model.
+The exact same question, same agent, same three guards, pointed at a
+31B model (`gemma4:31b-cloud`, free-tier on Ollama's cloud) instead of a
+local 3B–9B one: correct verdict ("not running as root") on the first
+try, the right lines quoted, and it went on to `read_file` a second,
+*unprompted* file on its own and surface a real, verified-accurate
+finding (default secrets with a weak fallback value in a
+`docker-compose.yml` never mentioned in the question) that no local
+model had found. The guards work; local models at this size don't
+reliably have the capacity to follow them. If accuracy matters more than
+keeping every byte on this machine for a given question, pin that one
+agent to a cloud model (`grv models set <agent> gemma4:31b-cloud`, free
+at the time of writing) — but know what that trade is: the code in that
+question, and whatever it reads on its own, leaves the machine. Nothing
+here does that by default, and nothing should without you choosing it
+per-agent, deliberately — which is exactly why `grv models recommend`
+never auto-assigns a `:cloud` tag.
 
 Two more things learned the hard way, not from a code bug but from how
 *models themselves* behave through Ollama, worth knowing before you pick
