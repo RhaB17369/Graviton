@@ -23,14 +23,14 @@ use agents::AgentSpec;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use graviton_core::Config;
-use graviton_llm::OllamaClient;
+use graviton_llm::{ChatMessage, OllamaClient};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "grv", version, about = "GRAVITON — local multi-agent framework for high-level programming, infrastructure, and offensive & defensive security, powered by Ollama")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Command,
+    cmd: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -382,7 +382,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = Config::load_or_init()?;
 
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        return cmd_chat(&cfg).await;
+    };
+    match cmd {
         Command::Index { path, force, watch } => cmd_index(&cfg, path, force, watch),
         Command::Search { query, limit, semantic } => cmd_search(&cfg, &query, limit, semantic).await,
         Command::Embed { force, model } => cmd_embed(&cfg, force, model).await,
@@ -766,6 +769,98 @@ async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &Agen
     agentic::run_read_only_loop(&client, cfg, &root, cfg.model_for(agent.tier, agent.key), &system, &user_msg, true)
         .await
         .map(|_| ())
+}
+
+/// Bare `grv`, no subcommand: a real multi-turn chat REPL instead of
+/// printing help and exiting (clap's default for a missing subcommand,
+/// and this project's own behavior until this was added). Read-only —
+/// the same tool loop `ask` uses (`read_file`/`search_code`/`web_search`/
+/// ...), never the acting one `grv run` has, so there's no write/edit/
+/// delete/shell call a chat session could make without `grv run`'s own
+/// confirm/checkpoint safety net around it.
+///
+/// What makes this a *chat*, not just `ask` asked in a loop: one running
+/// `Vec<ChatMessage>` (`agentic::run_read_only_loop_on`) that every turn
+/// appends to — the model's own prior answers, and any tool calls/
+/// results, stay in context for the next question, the way a real
+/// conversation does. Plain `stdin().lines()`, deliberately: no new
+/// dependency for arrow-key history/editing, consistent with this
+/// project's existing minimal-dependency choices elsewhere (the
+/// hand-rolled `config.toml`/`models.toml` parsers instead of pulling in
+/// a crate for a handful of scalar fields) — a real gap next to a
+/// terminal that does have that, not an oversight.
+async fn cmd_chat(cfg: &Config) -> Result<()> {
+    let root = repo_root()?;
+    let conn = open_or_init_repo_db(cfg, &root)?;
+    let mut agent = resolve_agent("architect")?;
+    let client = OllamaClient::new(&cfg.ollama_host);
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(agent.base_prompt())];
+
+    println!("\x1b[1;35mGRAVITON\x1b[0m — chatting with {} [{}]", agent.display, cfg.model_for(agent.tier, agent.key));
+    println!(
+        "\x1b[2m/agent <key> switch specialist (grv agents for the list) · /clear reset · /exit quit\x1b[0m\n"
+    );
+
+    let stdin = std::io::stdin();
+    loop {
+        print!("\x1b[1;36myou›\x1b[0m ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            println!(); // EOF (Ctrl+D) -- leave cleanly, same as /exit
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "/exit" || line == "/quit" {
+            break;
+        }
+        if line == "/clear" {
+            messages = vec![ChatMessage::system(agent.base_prompt())];
+            println!("\x1b[2m(conversation cleared)\x1b[0m\n");
+            continue;
+        }
+        if let Some(key) = line.strip_prefix("/agent ") {
+            match resolve_agent(key.trim()) {
+                Ok(a) => {
+                    agent = a;
+                    messages = vec![ChatMessage::system(agent.base_prompt())];
+                    println!(
+                        "\x1b[2m(switched to {} [{}] — conversation reset)\x1b[0m\n",
+                        agent.display,
+                        cfg.model_for(agent.tier, agent.key)
+                    );
+                }
+                Err(e) => println!("\x1b[31m{e:#}\x1b[0m\n"),
+            }
+            continue;
+        }
+
+        let (groups, semantic_src) = build_context_sync(cfg, &root, &conn, line, &[])?;
+        let context_text = finish_context(cfg, line, groups, semantic_src).await?;
+        let user_msg = if context_text.is_empty() {
+            line.to_string()
+        } else {
+            format!("Question: {line}\n\nRetrieved context:\n{context_text}")
+        };
+        messages.push(ChatMessage::user(user_msg));
+
+        print!("\x1b[1;35m{}›\x1b[0m ", agent.display);
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let model = cfg.model_for(agent.tier, agent.key).to_string();
+        let on_token = |tok: &str| {
+            print!("{tok}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        };
+        let on_tool_call = |name: &str, args: &serde_json::Value| println!("\x1b[2m  → {name}({args})\x1b[0m");
+        match agentic::run_read_only_loop_on(&client, cfg, &root, &model, &mut messages, on_token, on_tool_call).await {
+            Ok(_) => println!("\n"),
+            Err(e) => println!("\x1b[31mError: {e:#}\x1b[0m\n"),
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &str) -> Result<()> {

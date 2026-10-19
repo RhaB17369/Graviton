@@ -369,15 +369,39 @@ pub async fn run_read_only_loop_with(
     model: &str,
     system: &str,
     user_msg: &str,
+    on_token: impl FnMut(&str),
+    on_tool_call: impl FnMut(&str, &Value),
+) -> Result<String> {
+    let mut messages = vec![ChatMessage::system(system), ChatMessage::user(user_msg)];
+    run_read_only_loop_on(client, cfg, root, model, &mut messages, on_token, on_tool_call).await
+}
+
+/// The part `run_read_only_loop_with` actually needed factored out: takes
+/// the running conversation directly instead of building a fresh
+/// system+user pair, so a true multi-turn session (`grv`'s bare-invocation
+/// chat REPL, `main.rs::cmd_chat`) can keep pushing onto the *same*
+/// history across turns — including the model's own prior answers and any
+/// tool calls/results — while still sharing every bit of tool-dispatch
+/// logic with the one-shot callers (`ask`/`crew`/`swarm`/`mission`) that
+/// go through `run_read_only_loop_with` above instead. The final answer
+/// (and nothing else — tool-call turns are already pushed as they happen)
+/// is appended to `messages` before returning, so the caller's next turn
+/// sees it without having to re-append it itself.
+pub async fn run_read_only_loop_on(
+    client: &OllamaClient,
+    cfg: &Config,
+    root: &Path,
+    model: &str,
+    messages: &mut Vec<ChatMessage>,
     mut on_token: impl FnMut(&str),
     mut on_tool_call: impl FnMut(&str, &Value),
 ) -> Result<String> {
     let tools = read_only_tool_defs();
-    let mut messages = vec![ChatMessage::system(system), ChatMessage::user(user_msg)];
 
     for _ in 0..MAX_READONLY_TOOL_STEPS {
-        let result = client.chat_stream(model, &messages, cfg.num_ctx, &tools, &mut on_token).await?;
+        let result = client.chat_stream(model, messages, cfg.num_ctx, &tools, &mut on_token).await?;
         if result.tool_calls.is_empty() {
+            messages.push(ChatMessage::assistant(result.content.clone()));
             return Ok(result.content);
         }
         messages.push(ChatMessage::assistant_tool_calls(result.tool_calls.clone()));
@@ -390,7 +414,8 @@ pub async fn run_read_only_loop_with(
     // Used up the tool-call budget without a final answer -- ask once
     // more with no tools offered, forcing a text response instead of
     // silently returning nothing.
-    let result = client.chat_stream(model, &messages, cfg.num_ctx, &[], &mut on_token).await?;
+    let result = client.chat_stream(model, messages, cfg.num_ctx, &[], &mut on_token).await?;
+    messages.push(ChatMessage::assistant(result.content.clone()));
     Ok(result.content)
 }
 
