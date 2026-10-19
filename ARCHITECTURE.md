@@ -32,6 +32,47 @@ a resource-planning mistake turn a slow machine into a crashed one.
 
 Four crates, 15 183 lines of Rust:
 
+```mermaid
+graph TD
+    subgraph cli["graviton-cli — the grv binary (22 files)"]
+        MAIN[main.rs<br/>command dispatch]
+        AGENTS[agents.rs<br/>22-agent roster + 3 shared guards]
+        CONTEXT[context.rs<br/>retrieval + promote_full_files]
+        AGENTIC[agentic.rs<br/>read-only loop + full run loop]
+        MODELS[models.rs<br/>per-agent routing + recommend]
+        RESOURCES[resources.rs<br/>RAM/CPU concurrency gate]
+        DAEMON[daemon.rs<br/>grv serve, JSON-RPC]
+    end
+    subgraph llm["graviton-llm"]
+        OLLAMA[OllamaClient<br/>chat_stream / list_models / embed<br/>think:false always]
+    end
+    subgraph indexer["graviton-indexer"]
+        LANG[lang.rs<br/>tree-sitter queries, 66 languages]
+        IMPORTS[imports.rs<br/>per-file import extraction]
+        RESOLVE[resolve.rs<br/>repo-wide import resolution]
+    end
+    subgraph core["graviton-core — leaf dependency"]
+        CONFIG[Config / ModelRouting]
+        SCHEMA[SQLite schema: files, symbols,<br/>calls, imports, embeddings]
+    end
+
+    MAIN --> AGENTS
+    MAIN --> CONTEXT
+    MAIN --> MODELS
+    AGENTIC --> CONTEXT
+    AGENTIC --> OLLAMA
+    AGENTS --> MODELS
+    MODELS --> OLLAMA
+    MODELS --> RESOURCES
+    CONTEXT --> SCHEMA
+    DAEMON --> AGENTIC
+    cli --> llm
+    cli --> indexer
+    cli --> core
+    indexer --> core
+    llm --> core
+```
+
 - **`graviton-core`** (`crates/core`) — `Config`/`ModelRouting` (load/
   save/resolve), the SQLite schema (`open_db`), and the handful of types
   (`Symbol`, `FileRecord`, `ModelTier`) every other crate depends on. No
@@ -159,14 +200,21 @@ match every other resolver here is built to never do.
 
 ### Context assembly (`context.rs`)
 
-```
-build_context_sync: explicit --file reads, symbol-name hits, FTS chunk hits
-       ↓
-promote_full_files: upgrade any file a hit landed in to the whole file
-       ↓
-finish_context (async): rank semantic hits against the question if embeddings are on
-       ↓
-assemble: greedy concat under the char budget, highest-priority group first
+```mermaid
+flowchart TD
+    Q[question + optional --file paths] --> SYNC[build_context_sync]
+    SYNC --> EXPLICIT["explicit --file reads<br/>(whole file, 20KB cap)"]
+    SYNC --> SYMS["search_symbols<br/>(name match)"]
+    SYNC --> CHUNKS["search_chunks<br/>(FTS5 bm25)"]
+    SYMS --> PROMOTE[promote_full_files]
+    CHUNKS --> PROMOTE
+    PROMOTE -->|"any file a hit landed in,<br/>≤20KB, up to 3 files"| FULL[whole-file blocks<br/>replace their own snippets]
+    EXPLICIT --> FINISH[finish_context — async]
+    FULL --> FINISH
+    FINISH -->|only if embed_model configured| SEMANTIC["rank_by_query<br/>(cosine similarity)"]
+    FINISH --> ASSEMBLE[assemble]
+    SEMANTIC --> ASSEMBLE
+    ASSEMBLE -->|"greedy concat under char_budget,<br/>priority: explicit > promoted > symbols > chunks > semantic"| OUT[final context string → model]
 ```
 
 **`promote_full_files` exists because of a live failure, not a
@@ -222,6 +270,22 @@ tier) beats a `[tier]` override, which beats the three-slot fallback —
 `Config::model_for(tier, agent_key)` is the one function every call site
 in the codebase goes through to resolve a model, so the two axes can
 never silently disagree between entry points.
+
+```mermaid
+flowchart LR
+    A["Config::model_for(tier, agent_key)"] --> B{"models.toml<br/>[agent] has agent_key?"}
+    B -->|yes| R1[use it — done]
+    B -->|no| C{"models.toml<br/>[tier] has tier.label()?"}
+    C -->|yes| R2[use it — done]
+    C -->|no| D["model_for_tier(tier)"]
+    D --> E{tier}
+    E -->|Fast| F["model_fast, else model"]
+    E -->|Standard| G[model]
+    E -->|Deep| H["model_deep, else model"]
+    F --> R3[config.toml fallback]
+    G --> R3
+    H --> R3
+```
 
 That finer axis exists because the coarse one hit a real wall: two
 agents sharing `ModelTier::Deep` — `architect` (software design) and
@@ -384,6 +448,30 @@ reason `promote_full_files` (a mechanical, not behavioral, fix) exists
 at all — see above.
 
 ## The agentic loop (`grv run`, `agentic.rs`)
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant L as agentic loop
+    participant M as Model (Ollama)
+    participant T as Tools
+
+    U->>L: grv run "task" (or ask/crew/swarm — read-only subset)
+    L->>M: system (base_prompt) + user (task + retrieved context)
+    loop up to MAX_READONLY_TOOL_STEPS (6), no cap for grv run
+        M->>L: tool_calls[] (read_file, search_code, write_file, run_shell, ...)
+        alt write/edit/delete/run_shell
+            L->>U: confirm? (skipped under --yolo)
+            U-->>L: approve / deny
+            L->>L: checkpoint.rs snapshots file state first
+        end
+        L->>T: dispatch_read_only / dispatch_acting
+        T-->>L: tool result (truncated to MAX_TOOL_OUTPUT)
+        L->>M: tool result appended to messages
+    end
+    M->>L: final content (no more tool_calls)
+    L->>U: answer (checkpointed session persists to disk for --continue)
+```
 
 ### Tools
 
