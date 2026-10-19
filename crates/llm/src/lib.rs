@@ -90,6 +90,18 @@ struct ChatRequest<'a> {
     options: ChatOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ToolDef]>,
+    /// `false` for every call GRAVITON makes. A "thinking"-capable model
+    /// (confirmed live: qwen3.5, on by default per `ollama show`) streams
+    /// its reasoning in a separate `message.thinking` field, not
+    /// `message.content` -- nothing here ever reads or surfaces that
+    /// field, so a turn that spends its whole token budget reasoning
+    /// before it would otherwise have reached a final answer completes
+    /// with `done: true` and an empty `content`, silently, no error at
+    /// all (confirmed live: 80 generated tokens, `truncated: false`, and
+    /// nothing printed). Disabling it is strictly better for every one of
+    /// GRAVITON's call sites, which only ever consume the final answer or
+    /// a tool call, never a reasoning trace.
+    think: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +117,15 @@ struct ChatChunk {
 struct ChatChunkMessage {
     #[serde(default)]
     content: String,
+    // Belt-and-suspenders alongside `think: false` on the request: parsed
+    // but deliberately not surfaced as a tool-callable answer anywhere --
+    // a reasoning trace isn't a final response, and `chat_stream` not
+    // reading this field at all was exactly how a thinking model's turn
+    // went silently empty (see `ChatRequest::think`'s doc comment). If a
+    // model streams here anyway despite `think: false`, at least it's a
+    // field that exists now instead of bytes serde quietly drops.
+    #[serde(default)]
+    thinking: String,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
 }
@@ -138,6 +159,13 @@ struct EmbeddingsResponse {
 pub struct ChatResult {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// A thinking-capable model's reasoning trace, if it sent one despite
+    /// `think: false` on the request -- not currently surfaced by any
+    /// caller, kept only so it's never silently dropped the way it used
+    /// to be when `ChatChunkMessage` didn't deserialize this field at
+    /// all (see that struct's doc comment for the live failure this
+    /// fixed).
+    pub thinking: String,
 }
 
 #[derive(Clone)]
@@ -227,6 +255,7 @@ impl OllamaClient {
             stream: true,
             options: ChatOptions { num_ctx },
             tools: if tools.is_empty() { None } else { Some(tools) },
+            think: false,
         };
 
         let resp = self
@@ -265,6 +294,9 @@ impl OllamaClient {
                     if !msg.content.is_empty() {
                         on_token(&msg.content);
                         result.content.push_str(&msg.content);
+                    }
+                    if !msg.thinking.is_empty() {
+                        result.thinking.push_str(&msg.thinking);
                     }
                     if !msg.tool_calls.is_empty() {
                         result.tool_calls.extend(msg.tool_calls);
