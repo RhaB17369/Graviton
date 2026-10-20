@@ -69,6 +69,15 @@ pub struct Config {
     /// to `config.toml` itself, so it's skipped here.
     #[serde(skip, default)]
     pub routing: ModelRouting,
+    /// `grv`'s chat TUI accent colors, as 6-digit hex (e.g. `"22d3ee"`,
+    /// no `#`). Unset means the built-in defaults (cyan for you, magenta
+    /// for the agent) — these two are the only themeable colors, since
+    /// borders/dim text/errors carry semantic meaning (scrolled-back,
+    /// in-flight, failed) that a palette shouldn't override.
+    #[serde(default)]
+    pub tui_user_color: Option<String>,
+    #[serde(default)]
+    pub tui_agent_color: Option<String>,
 }
 
 impl Default for Config {
@@ -89,6 +98,8 @@ impl Default for Config {
             context_budget_fraction: 0.55,
             index_dir: ".graviton".to_string(),
             routing: ModelRouting::default(),
+            tui_user_color: None,
+            tui_agent_color: None,
         }
     }
 }
@@ -302,6 +313,12 @@ fn toml_to_string(cfg: &Config) -> Result<String> {
         "num_ctx = {}\ncontext_budget_fraction = {}\nindex_dir = \"{}\"\n",
         cfg.num_ctx, cfg.context_budget_fraction, cfg.index_dir
     ));
+    if let Some(c) = &cfg.tui_user_color {
+        out.push_str(&format!("tui_user_color = \"{c}\"\n"));
+    }
+    if let Some(c) = &cfg.tui_agent_color {
+        out.push_str(&format!("tui_agent_color = \"{c}\"\n"));
+    }
     Ok(out)
 }
 
@@ -328,6 +345,8 @@ fn toml_from_str(raw: &str) -> Result<Config> {
                 cfg.context_budget_fraction = value.parse().unwrap_or(cfg.context_budget_fraction)
             }
             "index_dir" => cfg.index_dir = value.to_string(),
+            "tui_user_color" => cfg.tui_user_color = (!value.is_empty()).then(|| value.to_string()),
+            "tui_agent_color" => cfg.tui_agent_color = (!value.is_empty()).then(|| value.to_string()),
             _ => {}
         }
     }

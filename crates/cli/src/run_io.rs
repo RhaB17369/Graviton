@@ -28,6 +28,14 @@ pub trait RunIo: Send + Sync {
     /// content, only tool_calls).
     fn on_token(&self, tok: &str);
 
+    /// One incremental piece of a thinking-capable model's reasoning
+    /// trace (`message.thinking`, not `message.content` -- see
+    /// `graviton_llm::chat_stream`'s doc comment). Default no-op: a
+    /// reasoning trace isn't the final answer `grv run`'s terminal
+    /// output is built around, so only callers that want to show it
+    /// (the chat TUI) override this.
+    fn on_thinking(&self, _tok: &str) {}
+
     /// Once known (right after `checkpoint::Session` is created/reopened),
     /// the session id `grv checkpoints`/`grv rollback`/`grv plan` use.
     /// Default no-op — `TerminalIo` doesn't need it (it's already printed

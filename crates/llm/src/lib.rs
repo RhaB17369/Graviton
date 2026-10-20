@@ -93,14 +93,18 @@ struct ChatRequest<'a> {
     /// `false` for every call GRAVITON makes. A "thinking"-capable model
     /// (confirmed live: qwen3.5, on by default per `ollama show`) streams
     /// its reasoning in a separate `message.thinking` field, not
-    /// `message.content` -- nothing here ever reads or surfaces that
-    /// field, so a turn that spends its whole token budget reasoning
-    /// before it would otherwise have reached a final answer completes
-    /// with `done: true` and an empty `content`, silently, no error at
-    /// all (confirmed live: 80 generated tokens, `truncated: false`, and
-    /// nothing printed). Disabling it is strictly better for every one of
-    /// GRAVITON's call sites, which only ever consume the final answer or
-    /// a tool call, never a reasoning trace.
+    /// `message.content`. The bug this guards against: on top of a model
+    /// that ignores this flag and keeps reasoning anyway, `chat_stream`
+    /// used to not read `thinking` at all, so a turn that spent its whole
+    /// token budget reasoning before it would otherwise have reached a
+    /// final answer completed with `done: true` and an empty `content`,
+    /// silently, no error at all (confirmed live: 80 generated tokens,
+    /// `truncated: false`, and nothing printed). `chat_stream` now
+    /// streams `thinking` to its own callback (`on_thinking`) as it
+    /// arrives -- the chat TUI shows it as a dim, provisional line so a
+    /// long reasoning phase isn't silence, same as a real answer's
+    /// tokens -- so disabling it here is a latency/clutter choice for
+    /// GRAVITON's one-shot callers, not a correctness requirement.
     think: bool,
 }
 
@@ -247,6 +251,7 @@ impl OllamaClient {
         num_ctx: usize,
         tools: &[ToolDef],
         mut on_token: impl FnMut(&str),
+        mut on_thinking: impl FnMut(&str),
     ) -> Result<ChatResult> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let req = ChatRequest {
@@ -296,6 +301,7 @@ impl OllamaClient {
                         result.content.push_str(&msg.content);
                     }
                     if !msg.thinking.is_empty() {
+                        on_thinking(&msg.thinking);
                         result.thinking.push_str(&msg.thinking);
                     }
                     if !msg.tool_calls.is_empty() {

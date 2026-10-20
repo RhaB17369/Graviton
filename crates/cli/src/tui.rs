@@ -16,7 +16,7 @@
 //! `visible_rows` doc comment below for the fix).
 
 use crate::agentic;
-use crate::agents::AgentSpec;
+use crate::agents::{AgentSpec, ALL_AGENTS};
 use crate::{build_context_sync, finish_context, open_or_init_repo_db, repo_root, resolve_agent};
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -43,6 +43,12 @@ use tokio::sync::mpsc;
 enum TLine {
     You(String),
     Agent { label: String, text: String },
+    /// A thinking-capable model's reasoning trace (`message.thinking`,
+    /// streamed live exactly like an answer's tokens -- see
+    /// `graviton_llm::chat_stream`), shown dim and separate from the
+    /// final answer so the (sometimes long) reasoning phase is visibly
+    /// *something happening* instead of silence before the real reply.
+    Thinking(String),
     /// Every tool call (and its result, once back) from one agentic
     /// turn, grouped together rather than one flat line per call --
     /// `ChatEvent::ToolCall` appends to this same entry as long as it's
@@ -62,6 +68,7 @@ struct ToolEntry {
 
 enum ChatEvent {
     Token(String),
+    Thinking(String),
     ToolCall(String, serde_json::Value),
     ToolResult(String),
     Done(Vec<ChatMessage>),
@@ -91,7 +98,32 @@ struct ChatState {
     /// once -- simpler than per-group expand state, and there's only
     /// ever one in-flight group to look at at a time anyway.
     tools_expanded: bool,
+    /// Highlighted row in the `/agent` autocomplete popup, clamped to
+    /// the *current* filtered list every time it's read (see `drive`) --
+    /// never reset explicitly, since whatever it pointed at a keystroke
+    /// ago may not exist in a narrower filter any more.
+    suggestion_idx: usize,
+    /// The only two themeable colors (`config.toml`'s `tui_user_color`/
+    /// `tui_agent_color`); everything else (borders, errors, the
+    /// in-flight spinner) carries semantic meaning a palette shouldn't
+    /// override, so it stays fixed.
+    user_color: Color,
+    agent_color: Color,
     should_quit: bool,
+}
+
+/// Parses a 6-digit hex color (no `#`, e.g. `"22d3ee"`) into an RGB
+/// `Color`, falling back to `default` on anything else -- missing
+/// config, wrong length, non-hex characters.
+fn theme_color(hex: Option<&str>, default: Color) -> Color {
+    let Some(hex) = hex.filter(|h| h.len() == 6) else {
+        return default;
+    };
+    let parse = |s: &str| u8::from_str_radix(s, 16).ok();
+    match (parse(&hex[0..2]), parse(&hex[2..4]), parse(&hex[4..6])) {
+        (Some(r), Some(g), Some(b)) => Color::Rgb(r, g, b),
+        _ => default,
+    }
 }
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -112,6 +144,9 @@ pub async fn run_chat_tui(cfg: &Config) -> Result<()> {
         waiting_since: Instant::now(),
         scroll: 0,
         tools_expanded: false,
+        suggestion_idx: 0,
+        user_color: theme_color(cfg.tui_user_color.as_deref(), Color::Cyan),
+        agent_color: theme_color(cfg.tui_agent_color.as_deref(), Color::Magenta),
         should_quit: false,
     };
 
@@ -127,7 +162,6 @@ pub async fn run_chat_tui(cfg: &Config) -> Result<()> {
     disable_raw_mode().ok();
     crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
-
     result
 }
 
@@ -154,8 +188,42 @@ async fn drive(
                 let Some(Ok(ev)) = maybe_ev else { continue };
                 match ev {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+                        // The autocomplete popup, when showing, steals
+                        // Up/Down/Tab/Enter/Esc for its own navigation --
+                        // computed fresh from the current input on every
+                        // keystroke, never stored, so there's nothing to
+                        // go stale.
+                        let input_text: String = state.input.iter().collect();
+                        let suggestions = if state.waiting { Vec::new() } else { command_suggestions(&input_text) };
+                        let popup_active = !suggestions.is_empty();
+                        if popup_active {
+                            state.suggestion_idx = state.suggestion_idx.min(suggestions.len() - 1);
+                        }
+
+                        if popup_active && key.code == KeyCode::Esc {
+                            state.input.clear();
+                            state.cursor = 0;
+                        } else if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
                             state.should_quit = true;
+                        } else if popup_active && key.code == KeyCode::Up {
+                            state.suggestion_idx = state.suggestion_idx.saturating_sub(1);
+                        } else if popup_active && key.code == KeyCode::Down {
+                            state.suggestion_idx = (state.suggestion_idx + 1).min(suggestions.len() - 1);
+                        } else if popup_active && key.code == KeyCode::Tab {
+                            state.input = suggestions[state.suggestion_idx].complete.chars().collect();
+                            state.cursor = state.input.len();
+                        } else if popup_active && key.code == KeyCode::Enter {
+                            let complete = &suggestions[state.suggestion_idx].complete;
+                            state.input = complete.chars().collect();
+                            state.cursor = state.input.len();
+                            // "/agent " alone (no key yet, just the
+                            // generic placeholder entry) isn't a
+                            // submittable command -- land the cursor
+                            // ready to keep typing instead of sending
+                            // a bare "/agent" question to the model.
+                            if complete != "/agent " {
+                                submit(state, cfg, client, root, &tx);
+                            }
                         } else {
                             match key.code {
                                 // Vertical motion scrolls the transcript; it's
@@ -173,6 +241,18 @@ async fn drive(
                                 // on the input you're typing, which only
                                 // exists while not waiting on a reply.
                                 _ if !state.waiting => match key.code {
+                                    // Alt, not Shift: most terminals collapse
+                                    // Shift+Enter to plain Enter in raw mode
+                                    // (no distinct escape sequence without
+                                    // extra keyboard-protocol negotiation),
+                                    // while Alt reliably arrives as its own
+                                    // modifier bit everywhere since it's just
+                                    // the ESC-prefix trick terminals have
+                                    // used for Alt since forever.
+                                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                                        state.input.insert(state.cursor, '\n');
+                                        state.cursor += 1;
+                                    }
                                     KeyCode::Enter => submit(state, cfg, client, root, &tx),
                                     KeyCode::Backspace => {
                                         if state.cursor > 0 {
@@ -284,6 +364,10 @@ fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std
             let on_token = move |tok: &str| {
                 let _ = tx_tok.send(ChatEvent::Token(tok.to_string()));
             };
+            let tx_think = tx.clone();
+            let on_thinking = move |tok: &str| {
+                let _ = tx_think.send(ChatEvent::Thinking(tok.to_string()));
+            };
             let tx_tool = tx.clone();
             let on_tool_call = move |name: &str, args: &serde_json::Value| {
                 let _ = tx_tool.send(ChatEvent::ToolCall(name.to_string(), args.clone()));
@@ -292,7 +376,7 @@ fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std
             let on_tool_result = move |_name: &str, out: &str| {
                 let _ = tx_res.send(ChatEvent::ToolResult(agentic::tool_result_preview(out)));
             };
-            agentic::run_read_only_loop_on(&client, &cfg, &root, &model, &mut local_messages, on_token, on_tool_call, on_tool_result).await?;
+            agentic::run_read_only_loop_on(&client, &cfg, &root, &model, &mut local_messages, on_token, on_thinking, on_tool_call, on_tool_result).await?;
             Ok(local_messages)
         }
         .await;
@@ -345,6 +429,10 @@ fn apply(state: &mut ChatState, ev: ChatEvent) {
                 _ => state.transcript.push(TLine::Agent { label: state.agent.display.to_string(), text: tok }),
             }
         }
+        ChatEvent::Thinking(tok) => match state.transcript.last_mut() {
+            Some(TLine::Thinking(text)) => text.push_str(&tok),
+            _ => state.transcript.push(TLine::Thinking(tok)),
+        },
         ChatEvent::ToolCall(name, args) => {
             let call = format_tool_call(&name, &args);
             match state.transcript.last_mut() {
@@ -370,28 +458,133 @@ fn apply(state: &mut ChatState, ev: ChatEvent) {
     }
 }
 
+/// `/agent` autocomplete candidates for the current input, or empty if
+/// One row of the autocomplete popup -- an agent to switch to, or one of
+/// the plain slash-commands, unified so the popup/Tab/Enter/↑↓ handling
+/// in `drive` doesn't need to know which kind it's looking at.
+struct Suggestion {
+    label: String,
+    description: String,
+    /// What Tab fills the input with (Enter does the same, then submits).
+    complete: String,
+}
+
+/// Every chat-REPL command besides `/agent`, which gets its own, richer
+/// listing (every agent, with its tagline) below.
+const PLAIN_COMMANDS: &[(&str, &str)] = &[("/clear", "reset the conversation"), ("/exit", "quit"), ("/quit", "quit")];
+
+/// Autocomplete candidates for the current input, or empty if it
+/// doesn't look like a command at all. Three cases:
+/// - `/agent` or `/agent <partial>`: every agent matching on key or
+///   display name (bare `/agent` matches everyone).
+/// - `/<partial>` with no space yet: the plain commands and `/agent`
+///   itself, filtered by prefix -- still typing which command this is.
+/// - anything else (including a `/agent ...`-prefixed line that isn't
+///   followed by a space, e.g. "/agentic workflows...", which is a
+///   message that merely starts with that text, not the command):
+///   nothing, so an ordinary question never spuriously triggers a popup.
+fn command_suggestions(input: &str) -> Vec<Suggestion> {
+    if let Some(rest) = input.strip_prefix("/agent") {
+        if !rest.is_empty() && !rest.starts_with(' ') {
+            return Vec::new();
+        }
+        let query = rest.trim_start().to_lowercase();
+        return ALL_AGENTS
+            .iter()
+            .filter(|a| a.key.to_lowercase().contains(&query) || a.display.to_lowercase().contains(&query))
+            .map(|a| Suggestion { label: a.key.to_string(), description: a.tagline.to_string(), complete: format!("/agent {} ", a.key) })
+            .collect();
+    }
+    if input.starts_with('/') && !input.contains(' ') {
+        let query = input.to_lowercase();
+        let mut out: Vec<Suggestion> = Vec::new();
+        if "/agent".starts_with(&query) {
+            out.push(Suggestion { label: "/agent <key>".into(), description: "switch to a specialist agent".into(), complete: "/agent ".into() });
+        }
+        for (cmd, desc) in PLAIN_COMMANDS {
+            if cmd.starts_with(&query) {
+                out.push(Suggestion { label: cmd.to_string(), description: desc.to_string(), complete: cmd.to_string() });
+            }
+        }
+        return out;
+    }
+    Vec::new()
+}
+
 fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
     let area = f.area();
+    let inner_width = area.width.saturating_sub(2).max(5) as usize;
+    // The 2 extra columns are the "› "/indent every input row carries
+    // (see `draw_input`) -- same accounting `wrapped_rows` does for the
+    // transcript's own prefixes.
+    let wrap_width = inner_width.saturating_sub(2).max(5);
+    let (input_rows, cursor_row, cursor_col) = wrap_input_for_display(&state.input, state.cursor, wrap_width);
+    let visible_input_rows = if state.waiting { 1 } else { input_rows.len().min(6) };
+    let input_height = (visible_input_rows + 2) as u16;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(input_height)])
         .split(area);
 
     draw_header(f, chunks[0], state);
     let rows = draw_transcript(f, chunks[1], state);
-    draw_input(f, chunks[2], state);
+    draw_input(f, chunks[2], state, &input_rows, cursor_row, cursor_col);
+
+    if !state.waiting {
+        let input_text: String = state.input.iter().collect();
+        let suggestions = command_suggestions(&input_text);
+        if !suggestions.is_empty() {
+            draw_command_popup(f, chunks[2], state, &suggestions);
+        }
+    }
     rows
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
     let line = Line::from(vec![
-        Span::styled("GRAVITON", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled("GRAVITON", Style::default().fg(state.agent_color).add_modifier(Modifier::BOLD)),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(state.agent.display, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(state.agent.display, Style::default().fg(state.agent_color).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" [{}]", state.cfg_model), Style::default().fg(Color::DarkGray)),
-        Span::styled("   /agent switch · /clear reset · ↑↓ PgUp/PgDn scroll · Tab tools · Esc quit", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "   /agent switch · /clear reset · ↑↓ PgUp/PgDn scroll · Tab tools · Alt+Enter newline · Esc quit",
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// A floating autocomplete popup (agents, or the plain commands),
+/// drawn after -- so visually on top of -- everything else, anchored
+/// just above the input box.
+fn draw_command_popup(f: &mut ratatui::Frame, input_area: Rect, state: &ChatState, suggestions: &[Suggestion]) {
+    let visible = suggestions.len().min(6);
+    let height = (visible + 2) as u16;
+    let area = Rect { x: input_area.x, y: input_area.y.saturating_sub(height), width: input_area.width, height };
+    let idx = state.suggestion_idx.min(suggestions.len().saturating_sub(1));
+    let inner_width = area.width.saturating_sub(4) as usize;
+
+    let lines: Vec<Line> = suggestions
+        .iter()
+        .take(visible)
+        .enumerate()
+        .map(|(i, s)| {
+            let style = if i == idx { Style::default().fg(Color::Black).bg(state.agent_color) } else { Style::default() };
+            let mut label = format!(" {:<14} {}", s.label, s.description);
+            if label.chars().count() > inner_width {
+                label = label.chars().take(inner_width.max(4)).collect::<String>() + "…";
+            }
+            Line::from(Span::styled(label, style))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(state.agent_color))
+        .title(" ↑↓ pick · Tab/Enter choose ");
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Builds every visual row (label + wrapped continuation rows) up front
@@ -623,14 +816,22 @@ fn wrapped_rows(state: &ChatState, width: usize) -> Vec<Line<'static>> {
     for t in &state.transcript {
         match t {
             TLine::You(s) => {
-                push_wrapped(&mut out, width, Some(("you   ".into(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))), s, Style::default());
+                push_wrapped(&mut out, width, Some(("you   ".into(), Style::default().fg(state.user_color).add_modifier(Modifier::BOLD))), s, Style::default());
             }
             TLine::Agent { label, text } => {
                 if text.is_empty() {
                     continue;
                 }
                 let prefix = format!("{label:<6}");
-                push_markdown(&mut out, width, (prefix, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)), text);
+                push_markdown(&mut out, width, (prefix, Style::default().fg(state.agent_color).add_modifier(Modifier::BOLD)), text);
+                out.push(Line::from(""));
+            }
+            TLine::Thinking(text) => {
+                if text.is_empty() {
+                    continue;
+                }
+                let dim = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+                push_wrapped(&mut out, width, Some(("~     ".into(), dim)), text, dim);
                 out.push(Line::from(""));
             }
             TLine::Tools(entries) => {
@@ -696,35 +897,100 @@ fn draw_transcript(f: &mut ratatui::Frame, area: Rect, state: &ChatState) -> usi
     height
 }
 
-fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
+/// Word-wraps the input for display and reports exactly which wrapped
+/// row/column the cursor lands in. Rather than replaying `textwrap`'s
+/// internal break/trim decisions by hand to derive that position (the
+/// same class of mismatch `wrapped_rows` had with ratatui's own
+/// `.scroll()`), a sentinel character is inserted at the cursor index,
+/// the whole thing is wrapped once, and whichever output row the
+/// sentinel survived into *is* the answer -- `textwrap` only trims
+/// whitespace at a break point, it never drops a real character, so
+/// the sentinel always reappears in exactly one row except when the
+/// cursor sits in trailing whitespace at the very end (the `!found`
+/// fallback below: the last row, one past its last character).
+fn wrap_input_for_display(input: &[char], cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
+    const MARK: char = '\u{0}';
+    let width = width.max(1);
+    let mut marked: Vec<char> = input.to_vec();
+    marked.insert(cursor.min(marked.len()), MARK);
+    let text: String = marked.into_iter().collect();
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut cursor_row = 0;
+    let mut cursor_col = 0;
+    let mut found = false;
+    for line in text.split('\n') {
+        let wrapped = textwrap::wrap(line, width);
+        let wrapped: Vec<String> = if wrapped.is_empty() { vec![String::new()] } else { wrapped.iter().map(|c| c.to_string()).collect() };
+        for seg in wrapped {
+            if !found {
+                if let Some(byte_pos) = seg.find(MARK) {
+                    cursor_row = rows.len();
+                    cursor_col = seg[..byte_pos].chars().count();
+                    found = true;
+                    rows.push(seg.replace(MARK, ""));
+                    continue;
+                }
+            }
+            rows.push(seg);
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    if !found {
+        cursor_row = rows.len() - 1;
+        cursor_col = rows[cursor_row].chars().count();
+    }
+    (rows, cursor_row, cursor_col)
+}
+
+fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &ChatState, rows: &[String], cursor_row: usize, cursor_col: usize) {
     let border_color = if state.waiting { Color::Yellow } else { Color::DarkGray };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
-    let line = if state.waiting {
+    let lines: Vec<Line> = if state.waiting {
         let frame = SPINNER_FRAMES[(state.waiting_since.elapsed().as_millis() / 120) as usize % SPINNER_FRAMES.len()];
-        Line::from(vec![
+        vec![Line::from(vec![
             Span::styled(format!("{frame} "), Style::default().fg(Color::Yellow)),
             Span::styled(format!("{} is thinking… {}s", state.agent.display, state.waiting_since.elapsed().as_secs()), Style::default().fg(Color::DarkGray)),
-        ])
+        ])]
     } else {
-        // A real cursor position (Left/Right/Home/End-addressable), drawn
-        // as a reversed-video cell rather than relying on the terminal's
-        // own cursor -- we never move that (no `f.set_cursor_position`),
-        // so this is the only visible insertion point there is.
-        let before: String = state.input[..state.cursor].iter().collect();
-        let at: String = state.input.get(state.cursor).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
-        let after: String = state.input[state.cursor.min(state.input.len())..].iter().skip(1).collect();
-        Line::from(vec![
-            Span::styled("› ", Style::default().fg(Color::Cyan)),
-            Span::raw(before),
-            Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)),
-            Span::raw(after),
-        ])
+        // Cap the visible window and keep the cursor's row inside it --
+        // same idea as `scroll_window` for the transcript, just always
+        // "following" the cursor instead of a user-controlled offset.
+        const CAP: usize = 6;
+        let total = rows.len();
+        let start = if total > CAP { cursor_row.saturating_sub(CAP - 1).min(total - CAP) } else { 0 };
+        let visible = &rows[start..(start + CAP).min(total)];
+        let visible_cursor_row = cursor_row.saturating_sub(start);
+
+        visible
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                // A real cursor position (Left/Right/Home/End-addressable),
+                // drawn as a reversed-video cell rather than relying on the
+                // terminal's own cursor -- we never move that (no
+                // `f.set_cursor_position`), so this is the only visible
+                // insertion point there is.
+                let marker = if i == 0 { Span::styled("› ", Style::default().fg(state.user_color)) } else { Span::raw("  ") };
+                if i == visible_cursor_row {
+                    let chars: Vec<char> = row.chars().collect();
+                    let before: String = chars[..cursor_col.min(chars.len())].iter().collect();
+                    let at = chars.get(cursor_col).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
+                    let after: String = if cursor_col < chars.len() { chars[cursor_col + 1..].iter().collect() } else { String::new() };
+                    Line::from(vec![marker, Span::raw(before), Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)), Span::raw(after)])
+                } else {
+                    Line::from(vec![marker, Span::raw(row.clone())])
+                }
+            })
+            .collect()
     };
-    f.render_widget(Paragraph::new(line).block(block), area);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 #[cfg(test)]
@@ -846,5 +1112,99 @@ mod tests {
         let joined: String = out.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("fn long_function_name_here"), "code block content missing: {joined}");
         assert!(joined.contains("more prose after"));
+    }
+
+    #[test]
+    fn theme_color_parses_valid_hex_and_falls_back_otherwise() {
+        assert_eq!(theme_color(Some("22d3ee"), Color::Cyan), Color::Rgb(0x22, 0xd3, 0xee));
+        assert_eq!(theme_color(None, Color::Cyan), Color::Cyan);
+        assert_eq!(theme_color(Some("not-a-color"), Color::Cyan), Color::Cyan);
+        assert_eq!(theme_color(Some("abcd"), Color::Cyan), Color::Cyan); // wrong length
+    }
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn wrap_input_cursor_tracks_through_a_wrapped_word() {
+        let input = chars("hello world from graviton");
+        // Cursor at index 11 sits right after "world" (0-indexed: "hello "
+        // is 6 chars, "world" the next 5, so index 11 is the space right
+        // after it, before "from"). At width 10 that lands on the row
+        // "world from" -- the cursor must land right after "world" on
+        // *that* row (col 5), not get lost to wherever textwrap broke
+        // the line, and inserting the zero-width sentinel must not have
+        // perturbed the wrap decision itself (same rows either way).
+        let (rows, row, col) = wrap_input_for_display(&input, 11, 10);
+        assert_eq!(rows, vec!["hello".to_string(), "world from".to_string(), "graviton".to_string()]);
+        assert_eq!(row, 1);
+        assert_eq!(col, 5);
+    }
+
+    #[test]
+    fn wrap_input_cursor_at_very_end_lands_on_the_last_row() {
+        let input = chars("short");
+        let (rows, row, col) = wrap_input_for_display(&input, 5, 40);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row, 0);
+        assert_eq!(col, 5);
+    }
+
+    #[test]
+    fn wrap_input_cursor_at_zero_is_column_zero_of_first_row() {
+        let input = chars("hello");
+        let (_, row, col) = wrap_input_for_display(&input, 0, 40);
+        assert_eq!((row, col), (0, 0));
+    }
+
+    #[test]
+    fn wrap_input_respects_explicit_newlines() {
+        let input = chars("first line\nsecond line");
+        let (rows, row, col) = wrap_input_for_display(&input, input.len(), 80);
+        assert_eq!(rows, vec!["first line".to_string(), "second line".to_string()]);
+        assert_eq!((row, col), (1, "second line".len()));
+    }
+
+    #[test]
+    fn command_suggestions_lists_every_agent_on_bare_command() {
+        let all = command_suggestions("/agent");
+        assert_eq!(all.len(), ALL_AGENTS.len());
+    }
+
+    #[test]
+    fn command_suggestions_filters_agents_by_key_substring() {
+        let matches = command_suggestions("/agent crypto");
+        let labels: Vec<&str> = matches.iter().map(|s| s.label.as_str()).collect();
+        assert!(labels.iter().any(|l| l.contains("crypto")), "expected a crypto-ish agent in {labels:?}");
+        for s in &matches {
+            assert_eq!(s.complete, format!("/agent {} ", s.label));
+        }
+    }
+
+    #[test]
+    fn command_suggestions_ignores_an_unrelated_message() {
+        // "/agentic workflows are great" isn't the /agent command -- no
+        // space (or end-of-input) right after "/agent".
+        assert!(command_suggestions("/agentic workflows are great").is_empty());
+        assert!(command_suggestions("just a normal question").is_empty());
+    }
+
+    #[test]
+    fn command_suggestions_lists_plain_commands_while_typing_the_slash() {
+        // "/e" is a prefix of "/exit" only (not "/agent" or "/clear"/"/quit").
+        let matches = command_suggestions("/e");
+        assert_eq!(matches.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), vec!["/exit"]);
+        assert_eq!(matches[0].complete, "/exit");
+    }
+
+    #[test]
+    fn command_suggestions_bare_slash_offers_agent_and_every_plain_command() {
+        let matches = command_suggestions("/");
+        let labels: Vec<&str> = matches.iter().map(|s| s.label.as_str()).collect();
+        assert!(labels.contains(&"/agent <key>"));
+        for (cmd, _) in PLAIN_COMMANDS {
+            assert!(labels.contains(cmd), "missing {cmd} in {labels:?}");
+        }
     }
 }

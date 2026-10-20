@@ -651,7 +651,7 @@ async fn handle_streaming<W: AsyncWrite + Unpin>(ctx: &DaemonCtx, req: &RpcReque
     };
 
     let _permit = ctx.scheduler.acquire().await;
-    let loop_fut = crate::agentic::run_read_only_loop_with(&ctx.client, &ctx.cfg, &ctx.root, &model, &system, &user_msg, on_token, on_tool_call, |_, _| {});
+    let loop_fut = crate::agentic::run_read_only_loop_with(&ctx.client, &ctx.cfg, &ctx.root, &model, &system, &user_msg, on_token, |_| {}, on_tool_call, |_, _| {});
     tokio::pin!(loop_fut);
     let result = loop {
         tokio::select! {
@@ -838,7 +838,7 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
         "ask" => {
             let (spec, model, system, user_msg) = prepare_ask(ctx, params).await?;
             let _permit = ctx.scheduler.acquire().await;
-            let answer = crate::agentic::run_read_only_loop_with(&ctx.client, &ctx.cfg, &ctx.root, &model, &system, &user_msg, |_| {}, log_tool_call, |_, _| {}).await?;
+            let answer = crate::agentic::run_read_only_loop_with(&ctx.client, &ctx.cfg, &ctx.root, &model, &system, &user_msg, |_| {}, |_| {}, log_tool_call, |_, _| {}).await?;
             Ok(json!({"agent": spec.key, "model": model, "answer": answer}))
         }
         "review" => {
@@ -847,7 +847,7 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
                 return Ok(json!({"agent": spec.key, "model": model, "answer": "(no diff -- nothing to review)"}));
             };
             let _permit = ctx.scheduler.acquire().await;
-            let answer = crate::agentic::run_read_only_loop_with(&ctx.client, &ctx.cfg, &ctx.root, &model, &system, &user_msg, |_| {}, log_tool_call, |_, _| {}).await?;
+            let answer = crate::agentic::run_read_only_loop_with(&ctx.client, &ctx.cfg, &ctx.root, &model, &system, &user_msg, |_| {}, |_| {}, log_tool_call, |_, _| {}).await?;
             Ok(json!({"agent": spec.key, "model": model, "answer": answer}))
         }
         "run_start" => {

@@ -279,7 +279,7 @@ fn record_synthesis(checkpoint: &MissionCheckpoint, node_path: &str, task: &str,
 async fn call_model(client: &OllamaClient, cfg: &Config, model: &str, system: &str, user_msg: &str, scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<String> {
     let _permit = scheduler.acquire().await;
     let result = client
-        .chat_stream(model, &[ChatMessage::system(system), ChatMessage::user(user_msg)], cfg.num_ctx, &[], |_| {})
+        .chat_stream(model, &[ChatMessage::system(system), ChatMessage::user(user_msg)], cfg.num_ctx, &[], |_| {}, |_| {})
         .await?;
     Ok(result.content)
 }
@@ -302,7 +302,7 @@ async fn run_leaf(cfg: &Config, client: &OllamaClient, root: &Path, context_bloc
     for _ in 0..MAX_LEAF_TOOL_STEPS {
         let result = {
             let _permit = scheduler.acquire().await;
-            client.chat_stream(model, &messages, cfg.num_ctx, &tools, |_| {}).await?
+            client.chat_stream(model, &messages, cfg.num_ctx, &tools, |_| {}, |_| {}).await?
         };
         if result.tool_calls.is_empty() {
             let out = result.content;

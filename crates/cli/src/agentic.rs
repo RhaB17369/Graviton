@@ -368,13 +368,24 @@ pub async fn run_read_only_loop(
             let _ = lock.flush();
         }
     };
+    let thinking_started = std::sync::atomic::AtomicBool::new(false);
+    let on_thinking = |tok: &str| {
+        if stream_final_answer {
+            if !thinking_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                print!("\x1b[2m");
+            }
+            let mut lock = stdout.lock();
+            let _ = lock.write_all(tok.as_bytes());
+            let _ = lock.flush();
+        }
+    };
     let on_tool_call = |name: &str, args: &Value| {
         println!("\x1b[2m  → {name}({args})\x1b[0m");
     };
     let on_tool_result = |_name: &str, out: &str| {
         println!("\x1b[2m  ← {}\x1b[0m", tool_result_preview(out));
     };
-    let out = run_read_only_loop_with(client, cfg, root, model, system, user_msg, on_token, on_tool_call, on_tool_result).await?;
+    let out = run_read_only_loop_with(client, cfg, root, model, system, user_msg, on_token, on_thinking, on_tool_call, on_tool_result).await?;
     if stream_final_answer {
         println!();
     }
@@ -394,11 +405,12 @@ pub async fn run_read_only_loop_with(
     system: &str,
     user_msg: &str,
     on_token: impl FnMut(&str),
+    on_thinking: impl FnMut(&str),
     on_tool_call: impl FnMut(&str, &Value),
     on_tool_result: impl FnMut(&str, &str),
 ) -> Result<String> {
     let mut messages = vec![ChatMessage::system(system), ChatMessage::user(user_msg)];
-    run_read_only_loop_on(client, cfg, root, model, &mut messages, on_token, on_tool_call, on_tool_result).await
+    run_read_only_loop_on(client, cfg, root, model, &mut messages, on_token, on_thinking, on_tool_call, on_tool_result).await
 }
 
 /// The part `run_read_only_loop_with` actually needed factored out: takes
@@ -419,13 +431,14 @@ pub async fn run_read_only_loop_on(
     model: &str,
     messages: &mut Vec<ChatMessage>,
     mut on_token: impl FnMut(&str),
+    mut on_thinking: impl FnMut(&str),
     mut on_tool_call: impl FnMut(&str, &Value),
     mut on_tool_result: impl FnMut(&str, &str),
 ) -> Result<String> {
     let tools = read_only_tool_defs();
 
     for _ in 0..MAX_READONLY_TOOL_STEPS {
-        let result = client.chat_stream(model, messages, cfg.num_ctx, &tools, &mut on_token).await?;
+        let result = client.chat_stream(model, messages, cfg.num_ctx, &tools, &mut on_token, &mut on_thinking).await?;
         if result.tool_calls.is_empty() {
             messages.push(ChatMessage::assistant(result.content.clone()));
             return Ok(result.content);
@@ -441,7 +454,7 @@ pub async fn run_read_only_loop_on(
     // Used up the tool-call budget without a final answer -- ask once
     // more with no tools offered, forcing a text response instead of
     // silently returning nothing.
-    let result = client.chat_stream(model, messages, cfg.num_ctx, &[], &mut on_token).await?;
+    let result = client.chat_stream(model, messages, cfg.num_ctx, &[], &mut on_token, &mut on_thinking).await?;
     messages.push(ChatMessage::assistant(result.content.clone()));
     Ok(result.content)
 }
@@ -1166,7 +1179,7 @@ pub async fn run(
 
     for step in 0..MAX_STEPS {
         let result = client
-            .chat_stream(cfg.model_for(agent.tier, agent.key), &messages, cfg.num_ctx, &tools, |tok| io.on_token(tok))
+            .chat_stream(cfg.model_for(agent.tier, agent.key), &messages, cfg.num_ctx, &tools, |tok| io.on_token(tok), |tok| io.on_thinking(tok))
             .await?;
         io.emit(String::new()); // blank line after the streamed answer, matching the terminal's old unconditional println!()
 
