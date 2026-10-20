@@ -28,6 +28,27 @@ use std::sync::Arc;
 const MAX_STEPS: usize = 40;
 const MAX_TOOL_OUTPUT: usize = 8_000;
 
+/// A one-line summary of a tool's result for UIs that show `on_tool_call`
+/// (the request) and want to show what came back without dumping the
+/// whole (possibly multi-KB) body: first non-empty line, length-capped,
+/// plus how much more there was.
+pub(crate) fn tool_result_preview(out: &str) -> String {
+    let total_len = out.len();
+    let first_line = out.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    const CAP: usize = 160;
+    let truncated_line = if first_line.chars().count() > CAP {
+        let head: String = first_line.chars().take(CAP).collect();
+        format!("{head}…")
+    } else {
+        first_line.to_string()
+    };
+    if total_len > truncated_line.len() {
+        format!("{truncated_line} ({total_len} bytes total)")
+    } else {
+        truncated_line
+    }
+}
+
 pub struct AgentLoopConfig {
     pub auto_approve: bool,
     pub enable_browser: bool,
@@ -350,7 +371,10 @@ pub async fn run_read_only_loop(
     let on_tool_call = |name: &str, args: &Value| {
         println!("\x1b[2m  → {name}({args})\x1b[0m");
     };
-    let out = run_read_only_loop_with(client, cfg, root, model, system, user_msg, on_token, on_tool_call).await?;
+    let on_tool_result = |_name: &str, out: &str| {
+        println!("\x1b[2m  ← {}\x1b[0m", tool_result_preview(out));
+    };
+    let out = run_read_only_loop_with(client, cfg, root, model, system, user_msg, on_token, on_tool_call, on_tool_result).await?;
     if stream_final_answer {
         println!();
     }
@@ -371,9 +395,10 @@ pub async fn run_read_only_loop_with(
     user_msg: &str,
     on_token: impl FnMut(&str),
     on_tool_call: impl FnMut(&str, &Value),
+    on_tool_result: impl FnMut(&str, &str),
 ) -> Result<String> {
     let mut messages = vec![ChatMessage::system(system), ChatMessage::user(user_msg)];
-    run_read_only_loop_on(client, cfg, root, model, &mut messages, on_token, on_tool_call).await
+    run_read_only_loop_on(client, cfg, root, model, &mut messages, on_token, on_tool_call, on_tool_result).await
 }
 
 /// The part `run_read_only_loop_with` actually needed factored out: takes
@@ -395,6 +420,7 @@ pub async fn run_read_only_loop_on(
     messages: &mut Vec<ChatMessage>,
     mut on_token: impl FnMut(&str),
     mut on_tool_call: impl FnMut(&str, &Value),
+    mut on_tool_result: impl FnMut(&str, &str),
 ) -> Result<String> {
     let tools = read_only_tool_defs();
 
@@ -408,6 +434,7 @@ pub async fn run_read_only_loop_on(
         for tc in &result.tool_calls {
             on_tool_call(&tc.function.name, &tc.function.arguments);
             let out = dispatch_read_only(cfg, root, &tc.function.name, &tc.function.arguments).await;
+            on_tool_result(&tc.function.name, &out);
             messages.push(ChatMessage::tool_result(&tc.function.name, out));
         }
     }
