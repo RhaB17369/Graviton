@@ -364,6 +364,197 @@ fn push_wrapped(out: &mut Vec<Line<'static>>, width: usize, prefix: Option<(Stri
     }
 }
 
+/// A paragraph-or-code-fence chunk of a markdown-lite message. Only
+/// fenced ` ``` ` blocks are block-level; everything else is prose that
+/// still gets inline `**bold**`/`` `code` `` parsed within it.
+enum MdBlock<'a> {
+    Prose(String),
+    Code(Vec<&'a str>),
+}
+
+/// Split on ` ``` ` fences. An unterminated trailing fence is still
+/// treated as code rather than dropped or shown with its marker — a
+/// token budget cutting a reply off mid-block is the likely cause, and
+/// losing the formatting is better than losing the content.
+fn split_code_fences(text: &str) -> Vec<MdBlock<'_>> {
+    let mut blocks = Vec::new();
+    let mut in_code = false;
+    let mut prose = String::new();
+    let mut code: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_code {
+                blocks.push(MdBlock::Code(std::mem::take(&mut code)));
+            } else if !prose.is_empty() {
+                blocks.push(MdBlock::Prose(std::mem::take(&mut prose)));
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            code.push(line);
+        } else {
+            if !prose.is_empty() {
+                prose.push('\n');
+            }
+            prose.push_str(line);
+        }
+    }
+    if in_code && !code.is_empty() {
+        blocks.push(MdBlock::Code(code));
+    } else if !prose.is_empty() {
+        blocks.push(MdBlock::Prose(prose));
+    }
+    blocks
+}
+
+/// Pull `**bold**` and `` `code` `` out of one line of prose into styled
+/// runs. Deliberately not a real markdown parser (no nesting, no links,
+/// no lists) -- just the two inline forms a model's running text
+/// actually uses, parsed by hand instead of pulling in a markdown crate
+/// for it.
+fn parse_inline(line: &str, base: Style, code_style: Style, bold_style: Style) -> Vec<(String, Style)> {
+    let mut spans = Vec::new();
+    let mut chars = line.chars().peekable();
+    let mut buf = String::new();
+    while let Some(c) = chars.next() {
+        if c == '`' {
+            if !buf.is_empty() {
+                spans.push((std::mem::take(&mut buf), base));
+            }
+            let mut inner = String::new();
+            while let Some(&c2) = chars.peek() {
+                chars.next();
+                if c2 == '`' {
+                    break;
+                }
+                inner.push(c2);
+            }
+            if !inner.is_empty() {
+                spans.push((inner, code_style));
+            }
+        } else if c == '*' && chars.peek() == Some(&'*') {
+            chars.next();
+            if !buf.is_empty() {
+                spans.push((std::mem::take(&mut buf), base));
+            }
+            let mut inner = String::new();
+            loop {
+                match chars.next() {
+                    Some('*') if chars.peek() == Some(&'*') => {
+                        chars.next();
+                        break;
+                    }
+                    Some(c2) => inner.push(c2),
+                    None => break,
+                }
+            }
+            if !inner.is_empty() {
+                spans.push((inner, bold_style));
+            }
+        } else {
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        spans.push((buf, base));
+    }
+    spans
+}
+
+/// Greedy word-wrap over *styled* runs -- `textwrap` only wraps plain
+/// strings, so once a run of text needs per-word styling (bold/code)
+/// this does the wrapping by hand instead. A single word wider than
+/// `avail` on its own (a long identifier, a URL) gets its own row and
+/// is left to overflow/clip rather than hard-broken mid-word.
+fn wrap_styled(spans: Vec<(String, Style)>, avail: usize) -> Vec<Vec<(String, Style)>> {
+    let mut rows: Vec<Vec<(String, Style)>> = Vec::new();
+    let mut current: Vec<(String, Style)> = Vec::new();
+    let mut current_len = 0usize;
+    for (text, style) in spans {
+        for word in text.split(' ') {
+            if word.is_empty() {
+                continue;
+            }
+            let wlen = word.chars().count();
+            let sep = if current.is_empty() { 0 } else { 1 };
+            if current_len + sep + wlen > avail && !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+                current_len = 0;
+            }
+            if !current.is_empty() {
+                current.push((" ".to_string(), Style::default()));
+                current_len += 1;
+            }
+            current.push((word.to_string(), style));
+            current_len += wlen;
+        }
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
+}
+
+/// Renders an agent reply with fenced code blocks pulled out into their
+/// own un-wrapped, left-barred rows, and `**bold**`/`` `code` `` parsed
+/// within the remaining prose -- the markdown-lite rendering a model's
+/// replies actually need, since raw `**`/backtick characters otherwise
+/// show up literally in the transcript.
+fn push_markdown(out: &mut Vec<Line<'static>>, width: usize, prefix: (String, Style), text: &str) {
+    let indent_width = prefix.0.chars().count();
+    let avail = width.saturating_sub(indent_width).max(10);
+    let base = Style::default();
+    let code_style = Style::default().fg(Color::Yellow);
+    let bold_style = Style::default().add_modifier(Modifier::BOLD);
+    let mut first_row = true;
+
+    let mut emit = |out: &mut Vec<Line<'static>>, row_spans: Vec<Span<'static>>| {
+        if first_row {
+            let mut spans = vec![Span::styled(prefix.0.clone(), prefix.1)];
+            spans.extend(row_spans);
+            out.push(Line::from(spans));
+            first_row = false;
+        } else {
+            let mut spans = vec![Span::raw(" ".repeat(indent_width))];
+            spans.extend(row_spans);
+            out.push(Line::from(spans));
+        }
+    };
+
+    for block in split_code_fences(text) {
+        match block {
+            MdBlock::Prose(paragraph) => {
+                for line in paragraph.split('\n') {
+                    if line.trim().is_empty() {
+                        emit(out, vec![]);
+                        continue;
+                    }
+                    let spans = parse_inline(line, base, code_style, bold_style);
+                    for row in wrap_styled(spans, avail) {
+                        let row_spans = row.into_iter().map(|(t, s)| Span::styled(t, s)).collect();
+                        emit(out, row_spans);
+                    }
+                }
+            }
+            MdBlock::Code(lines) => {
+                for code_line in lines {
+                    emit(
+                        out,
+                        vec![
+                            Span::styled("▏", Style::default().fg(Color::DarkGray)),
+                            Span::styled(code_line.to_string(), Style::default().fg(Color::Cyan)),
+                        ],
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn wrapped_rows(state: &ChatState, width: usize) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
 
@@ -377,7 +568,7 @@ fn wrapped_rows(state: &ChatState, width: usize) -> Vec<Line<'static>> {
                     continue;
                 }
                 let prefix = format!("{label:<6}");
-                push_wrapped(&mut out, width, Some((prefix, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))), text, Style::default());
+                push_markdown(&mut out, width, (prefix, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)), text);
                 out.push(Line::from(""));
             }
             TLine::ToolCall(s) => push_wrapped(&mut out, width, Some(("  → ".into(), Style::default().fg(Color::DarkGray))), s, Style::default().fg(Color::DarkGray)),
@@ -502,5 +693,70 @@ mod tests {
         // push_wrapped is ever called for an Agent entry.
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].spans.iter().map(|s| s.content.as_ref()).collect::<String>(), "");
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn split_code_fences_separates_prose_from_code() {
+        let blocks = split_code_fences("before\n```\nlet x = 1;\n```\nafter");
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], MdBlock::Prose(p) if p == "before"));
+        assert!(matches!(&blocks[1], MdBlock::Code(c) if c == &["let x = 1;"]));
+        assert!(matches!(&blocks[2], MdBlock::Prose(p) if p == "after"));
+    }
+
+    #[test]
+    fn split_code_fences_keeps_an_unterminated_fence_as_code() {
+        // A reply cut off mid-block (token budget) shouldn't lose its
+        // content just because the closing ``` never arrived.
+        let blocks = split_code_fences("```\nfn main() {}");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], MdBlock::Code(c) if c == &["fn main() {}"]));
+    }
+
+    #[test]
+    fn parse_inline_extracts_bold_and_code_runs() {
+        let base = Style::default();
+        let code = Style::default().fg(Color::Yellow);
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let spans = parse_inline("use **bold** and `code`", base, code, bold);
+        let texts: Vec<&str> = spans.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(texts, vec!["use ", "bold", " and ", "code"]);
+        assert_eq!(spans[1].1, bold);
+        assert_eq!(spans[3].1, code);
+    }
+
+    #[test]
+    fn wrap_styled_never_exceeds_the_available_width() {
+        let base = Style::default();
+        let spans = vec![("word ".repeat(30), base)];
+        let rows = wrap_styled(spans, 20);
+        for row in &rows {
+            let width: usize = row.iter().map(|(t, _)| t.chars().count()).sum();
+            assert!(width <= 20, "row {width} chars exceeds avail 20");
+        }
+    }
+
+    #[test]
+    fn markdown_reply_renders_within_width_and_marks_code_lines() {
+        let width = 30;
+        let mut out = Vec::new();
+        let text = "Explanation with **bold** and `inline`.\n```\nfn long_function_name_here() {}\n```\nmore prose after";
+        push_markdown(&mut out, width, ("AGENT ".into(), Style::default()), text);
+        for line in &out {
+            let rendered: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            // Code lines are allowed to overflow (never reflowed), prose
+            // rows must respect the panel width.
+            let is_code_row = line.spans.iter().any(|s| s.content == "▏");
+            if !is_code_row {
+                assert!(rendered <= width, "prose row {rendered} chars wide exceeds width {width}: {:?}", line_text(line));
+            }
+        }
+        let joined: String = out.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("fn long_function_name_here"), "code block content missing: {joined}");
+        assert!(joined.contains("more prose after"));
     }
 }
