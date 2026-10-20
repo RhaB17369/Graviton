@@ -611,12 +611,16 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
     let rows = draw_transcript(f, chunks[1], state);
     draw_input(f, chunks[2], state, &input_rows, cursor_row, cursor_col);
 
-    if !state.waiting {
-        let input_text: String = state.input.iter().collect();
-        let suggestions = command_suggestions(&input_text);
-        if !suggestions.is_empty() {
-            draw_command_popup(f, chunks[2], state, &suggestions);
-        }
+    // Not gated on `waiting` -- typing (including `/agent ...`) and the
+    // popup it drives work the same whether a previous question is
+    // still generating or not (see `drive`'s key handling and
+    // `ChatState::queued`); gating the *rendering* here while that
+    // logic stayed live was exactly the mismatch that made it look
+    // broken -- the popup is invisible, but it's using the keys.
+    let input_text: String = state.input.iter().collect();
+    let suggestions = command_suggestions(&input_text);
+    if !suggestions.is_empty() {
+        draw_command_popup(f, chunks[2], state, &suggestions);
     }
     rows
 }
