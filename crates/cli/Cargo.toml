@@ -31,6 +31,8 @@ getrandom = "0.2"
 tokio-rustls = "0.26"
 rcgen = "0.13"
 sha2 = "0.10"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 graviton-core = { path = "../core" }
 graviton-indexer = { path = "../indexer" }
