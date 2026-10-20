@@ -52,6 +52,7 @@ enum ChatEvent {
 
 struct ChatState {
     agent: &'static AgentSpec,
+    cfg_model: String,
     messages: Vec<ChatMessage>,
     transcript: Vec<TLine>,
     input: String,
@@ -69,12 +70,9 @@ pub async fn run_chat_tui(cfg: &Config) -> Result<()> {
 
     let mut state = ChatState {
         agent,
+        cfg_model: cfg.model_for(agent.tier, agent.key).to_string(),
         messages: vec![ChatMessage::system(agent.base_prompt())],
-        transcript: vec![TLine::Sys(format!(
-            "GRAVITON — chatting with {} [{}]. /agent <key> switch · /clear reset · /exit or Esc quit.",
-            agent.display,
-            cfg.model_for(agent.tier, agent.key)
-        ))],
+        transcript: Vec::new(),
         input: String::new(),
         waiting: false,
         waiting_since: Instant::now(),
@@ -164,12 +162,9 @@ fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std
         match resolve_agent(key.trim()) {
             Ok(a) => {
                 state.agent = a;
+                state.cfg_model = cfg.model_for(a.tier, a.key).to_string();
                 state.messages = vec![ChatMessage::system(a.base_prompt())];
-                state.transcript.push(TLine::Sys(format!(
-                    "(switched to {} [{}] — conversation reset)",
-                    a.display,
-                    cfg.model_for(a.tier, a.key)
-                )));
+                state.transcript.push(TLine::Sys(format!("(switched to {} — conversation reset)", a.display)));
             }
             Err(e) => state.transcript.push(TLine::Err(format!("{e:#}"))),
         }
@@ -260,46 +255,58 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) {
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
-    let text = format!(" GRAVITON · {} ", state.agent.display);
-    f.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::White).bg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        area,
-    );
+    let line = Line::from(vec![
+        Span::styled("GRAVITON", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(state.agent.display, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" [{}]", state.cfg_model), Style::default().fg(Color::DarkGray)),
+        Span::styled("   /agent <key> switch · /clear reset · Esc quit", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
 }
 
+/// No label at all for an agent reply still waiting on its first token --
+/// that empty `LABEL›` row was its own confusing "field" with nothing in
+/// it, floating above a spinner that already says the agent is working.
+/// Skip it until there's real text.
 fn draw_transcript(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
     let mut lines: Vec<Line> = Vec::new();
     for t in &state.transcript {
         match t {
             TLine::You(s) => {
-                lines.push(Line::from(vec![Span::styled("you› ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::raw(s.clone())]));
+                lines.push(Line::from(vec![Span::styled("you  ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::raw(s.clone())]));
             }
             TLine::Agent { label, text } => {
-                let prefix = Span::styled(format!("{label}› "), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD));
                 if text.is_empty() {
-                    lines.push(Line::from(vec![prefix]));
-                } else {
-                    for (i, part) in text.split('\n').enumerate() {
-                        if i == 0 {
-                            lines.push(Line::from(vec![prefix.clone(), Span::raw(part.to_string())]));
-                        } else {
-                            lines.push(Line::from(Span::raw(part.to_string())));
-                        }
+                    continue;
+                }
+                let prefix = Span::styled(format!("{label:<5}"), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD));
+                for (i, part) in text.split('\n').enumerate() {
+                    if i == 0 {
+                        lines.push(Line::from(vec![prefix.clone(), Span::raw(" "), Span::raw(part.to_string())]));
+                    } else {
+                        lines.push(Line::from(Span::raw(format!("     {part}"))));
                     }
                 }
+                lines.push(Line::from(""));
             }
-            TLine::Tool(s) => lines.push(Line::from(Span::styled(format!("  {s}"), Style::default().fg(Color::DarkGray)))),
-            TLine::Sys(s) => lines.push(Line::from(Span::styled(s.clone(), Style::default().fg(Color::DarkGray)))),
-            TLine::Err(s) => lines.push(Line::from(Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)))),
+            TLine::Tool(s) => lines.push(Line::from(Span::styled(format!("     {s}"), Style::default().fg(Color::DarkGray)))),
+            TLine::Sys(s) => {
+                lines.push(Line::from(Span::styled(s.clone(), Style::default().fg(Color::DarkGray))));
+                lines.push(Line::from(""));
+            }
+            TLine::Err(s) => {
+                lines.push(Line::from(Span::styled(format!("error: {s}"), Style::default().fg(Color::Red))));
+                lines.push(Line::from(""));
+            }
         }
-        lines.push(Line::from(""));
     }
 
     let height = area.height.saturating_sub(2) as usize;
     let total = lines.len();
     let scroll_off = total.saturating_sub(height) as u16;
 
-    let block = Block::default().borders(Borders::ALL).title(" conversation ");
+    let block = Block::default().borders(Borders::ALL).border_type(ratatui::widgets::BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray));
     f.render_widget(
         Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll_off, 0)),
         area,
@@ -307,14 +314,20 @@ fn draw_transcript(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
 }
 
 fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
-    let title = if state.waiting {
+    let border_color = if state.waiting { Color::Yellow } else { Color::DarkGray };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let line = if state.waiting {
         let frame = SPINNER_FRAMES[(state.waiting_since.elapsed().as_millis() / 120) as usize % SPINNER_FRAMES.len()];
-        format!(" {frame} thinking… {}s — Esc to quit ", state.waiting_since.elapsed().as_secs())
+        Line::from(vec![
+            Span::styled(format!("{frame} "), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{} is thinking… {}s", state.agent.display, state.waiting_since.elapsed().as_secs()), Style::default().fg(Color::DarkGray)),
+        ])
     } else {
-        " type your question — Enter to send, Esc to quit ".to_string()
+        Line::from(vec![Span::styled("› ", Style::default().fg(Color::Cyan)), Span::raw(state.input.clone())])
     };
-    let style = if state.waiting { Style::default().fg(Color::Yellow) } else { Style::default() };
-    let block = Block::default().borders(Borders::ALL).title(title).style(style);
-    let content = if state.waiting { String::new() } else { state.input.clone() };
-    f.render_widget(Paragraph::new(content).block(block), area);
+    f.render_widget(Paragraph::new(line).block(block), area);
 }
