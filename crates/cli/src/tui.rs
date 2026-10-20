@@ -43,10 +43,21 @@ use tokio::sync::mpsc;
 enum TLine {
     You(String),
     Agent { label: String, text: String },
-    ToolCall(String),
-    ToolResult(String),
+    /// Every tool call (and its result, once back) from one agentic
+    /// turn, grouped together rather than one flat line per call --
+    /// `ChatEvent::ToolCall` appends to this same entry as long as it's
+    /// still the last transcript line, so a multi-step tool loop (read
+    /// a file, search, read another) ends up as one collapsible group
+    /// instead of a wall of `→`/`←` lines.
+    Tools(Vec<ToolEntry>),
     Sys(String),
     Err(String),
+}
+
+struct ToolEntry {
+    name: String,
+    call: String,
+    result: Option<String>,
 }
 
 enum ChatEvent {
@@ -62,7 +73,12 @@ struct ChatState {
     cfg_model: String,
     messages: Vec<ChatMessage>,
     transcript: Vec<TLine>,
-    input: String,
+    /// Chars, not a `String` -- `cursor` is a char index, and inserting/
+    /// removing at an arbitrary position needs `Vec::insert`/`remove`
+    /// rather than `String`'s byte-offset-only API (which would panic
+    /// mid-UTF8-codepoint on accented input).
+    input: Vec<char>,
+    cursor: usize,
     waiting: bool,
     waiting_since: Instant,
     /// Rows scrolled back from the live bottom. 0 = pinned to the
@@ -71,6 +87,10 @@ struct ChatState {
     /// or sends a new message (`submit` resets this to 0 so a fresh
     /// question is never missed because you were reading history).
     scroll: usize,
+    /// Global toggle (Tab) for every multi-call `TLine::Tools` group at
+    /// once -- simpler than per-group expand state, and there's only
+    /// ever one in-flight group to look at at a time anyway.
+    tools_expanded: bool,
     should_quit: bool,
 }
 
@@ -86,10 +106,12 @@ pub async fn run_chat_tui(cfg: &Config) -> Result<()> {
         cfg_model: cfg.model_for(agent.tier, agent.key).to_string(),
         messages: vec![ChatMessage::system(agent.base_prompt())],
         transcript: Vec::new(),
-        input: String::new(),
+        input: Vec::new(),
+        cursor: 0,
         waiting: false,
         waiting_since: Instant::now(),
         scroll: 0,
+        tools_expanded: false,
         should_quit: false,
     };
 
@@ -136,16 +158,41 @@ async fn drive(
                             state.should_quit = true;
                         } else {
                             match key.code {
+                                // Vertical motion scrolls the transcript; it's
+                                // always available, even while waiting, so you
+                                // can reread earlier context during a slow
+                                // generation without it fighting for keys with
+                                // text entry (which is blocked while waiting
+                                // anyway -- there's nothing to edit).
                                 KeyCode::Up => state.scroll = state.scroll.saturating_add(1),
                                 KeyCode::Down => state.scroll = state.scroll.saturating_sub(1),
                                 KeyCode::PageUp => state.scroll = state.scroll.saturating_add(page_rows),
                                 KeyCode::PageDown => state.scroll = state.scroll.saturating_sub(page_rows),
-                                KeyCode::Home => state.scroll = usize::MAX / 2,
-                                KeyCode::End => state.scroll = 0,
+                                KeyCode::Tab => state.tools_expanded = !state.tools_expanded,
+                                // Horizontal motion + editing only makes sense
+                                // on the input you're typing, which only
+                                // exists while not waiting on a reply.
                                 _ if !state.waiting => match key.code {
                                     KeyCode::Enter => submit(state, cfg, client, root, &tx),
-                                    KeyCode::Backspace => { state.input.pop(); }
-                                    KeyCode::Char(c) => state.input.push(c),
+                                    KeyCode::Backspace => {
+                                        if state.cursor > 0 {
+                                            state.cursor -= 1;
+                                            state.input.remove(state.cursor);
+                                        }
+                                    }
+                                    KeyCode::Delete => {
+                                        if state.cursor < state.input.len() {
+                                            state.input.remove(state.cursor);
+                                        }
+                                    }
+                                    KeyCode::Left => state.cursor = state.cursor.saturating_sub(1),
+                                    KeyCode::Right => state.cursor = (state.cursor + 1).min(state.input.len()),
+                                    KeyCode::Home => state.cursor = 0,
+                                    KeyCode::End => state.cursor = state.input.len(),
+                                    KeyCode::Char(c) => {
+                                        state.input.insert(state.cursor, c);
+                                        state.cursor += 1;
+                                    }
                                     _ => {}
                                 },
                                 _ => {}
@@ -176,8 +223,9 @@ async fn drive(
 }
 
 fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std::path::Path, tx: &mpsc::UnboundedSender<ChatEvent>) {
-    let line = state.input.trim().to_string();
+    let line: String = state.input.iter().collect::<String>().trim().to_string();
     state.input.clear();
+    state.cursor = 0;
     if line.is_empty() {
         return;
     }
@@ -206,7 +254,6 @@ fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std
     }
 
     state.transcript.push(TLine::You(line.clone()));
-    state.transcript.push(TLine::Agent { label: state.agent.display.to_string(), text: String::new() });
     state.waiting = true;
     state.waiting_since = Instant::now();
     // A new question is always worth seeing, even if you'd scrolled up
@@ -286,16 +333,31 @@ fn format_tool_call(name: &str, args: &serde_json::Value) -> String {
 fn apply(state: &mut ChatState, ev: ChatEvent) {
     match ev {
         ChatEvent::Token(tok) => {
-            if let Some(TLine::Agent { text, .. }) = state.transcript.last_mut() {
-                text.push_str(&tok);
+            // Lazily starts the agent's reply line on its first real
+            // token -- never on a tool call or an empty placeholder, so
+            // a turn with no text output never leaves a stray empty
+            // "LABEL›" row, and a multi-step tool loop (several
+            // ToolCall/ToolResult pairs in a row) keeps appending into
+            // the *same* `Tools` group below instead of splitting into
+            // one group per step.
+            match state.transcript.last_mut() {
+                Some(TLine::Agent { text, .. }) => text.push_str(&tok),
+                _ => state.transcript.push(TLine::Agent { label: state.agent.display.to_string(), text: tok }),
             }
         }
         ChatEvent::ToolCall(name, args) => {
-            state.transcript.push(TLine::ToolCall(format_tool_call(&name, &args)));
+            let call = format_tool_call(&name, &args);
+            match state.transcript.last_mut() {
+                Some(TLine::Tools(entries)) => entries.push(ToolEntry { name, call, result: None }),
+                _ => state.transcript.push(TLine::Tools(vec![ToolEntry { name, call, result: None }])),
+            }
         }
         ChatEvent::ToolResult(preview) => {
-            state.transcript.push(TLine::ToolResult(preview));
-            state.transcript.push(TLine::Agent { label: state.agent.display.to_string(), text: String::new() });
+            if let Some(TLine::Tools(entries)) = state.transcript.last_mut() {
+                if let Some(last) = entries.last_mut() {
+                    last.result = Some(preview);
+                }
+            }
         }
         ChatEvent::Done(messages) => {
             state.messages = messages;
@@ -327,7 +389,7 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(state.agent.display, Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(format!(" [{}]", state.cfg_model), Style::default().fg(Color::DarkGray)),
-        Span::styled("   /agent <key> switch · /clear reset · ↑↓ PgUp/PgDn scroll · Esc quit", Style::default().fg(Color::DarkGray)),
+        Span::styled("   /agent switch · /clear reset · ↑↓ PgUp/PgDn scroll · Tab tools · Esc quit", Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -571,9 +633,23 @@ fn wrapped_rows(state: &ChatState, width: usize) -> Vec<Line<'static>> {
                 push_markdown(&mut out, width, (prefix, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)), text);
                 out.push(Line::from(""));
             }
-            TLine::ToolCall(s) => push_wrapped(&mut out, width, Some(("  → ".into(), Style::default().fg(Color::DarkGray))), s, Style::default().fg(Color::DarkGray)),
-            TLine::ToolResult(s) => {
-                push_wrapped(&mut out, width, Some(("  ← ".into(), Style::default().fg(Color::Green))), s, Style::default().fg(Color::DarkGray));
+            TLine::Tools(entries) => {
+                if entries.len() > 1 && !state.tools_expanded {
+                    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                    let summary = format!("▸ {} tools called ({}) — Tab to expand", entries.len(), names.join(", "));
+                    push_wrapped(&mut out, width, None, &summary, Style::default().fg(Color::DarkGray));
+                } else {
+                    for e in entries {
+                        push_wrapped(&mut out, width, Some(("  → ".into(), Style::default().fg(Color::DarkGray))), &e.call, Style::default().fg(Color::DarkGray));
+                        let result_text = e.result.as_deref().unwrap_or("…");
+                        let result_style = if e.result.is_some() { Style::default().fg(Color::Green) } else { Style::default().fg(Color::DarkGray) };
+                        push_wrapped(&mut out, width, Some(("  ← ".into(), result_style)), result_text, Style::default().fg(Color::DarkGray));
+                    }
+                    if entries.len() > 1 {
+                        push_wrapped(&mut out, width, None, "(Tab to collapse)", Style::default().fg(Color::DarkGray));
+                    }
+                }
+                out.push(Line::from(""));
             }
             TLine::Sys(s) => {
                 push_wrapped(&mut out, width, None, s, Style::default().fg(Color::DarkGray));
@@ -607,7 +683,7 @@ fn draw_transcript(f: &mut ratatui::Frame, area: Rect, state: &ChatState) -> usi
     let visible: Vec<Line> = rows.into_iter().skip(start).take(height).collect();
 
     let title = if scroll > 0 {
-        format!(" conversation — scrolled back, End to jump to latest ({scroll} row{}) ", if scroll == 1 { "" } else { "s" })
+        format!(" conversation — scrolled back, PageDown to catch up ({scroll} row{}) ", if scroll == 1 { "" } else { "s" })
     } else {
         String::new()
     };
@@ -634,7 +710,19 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
             Span::styled(format!("{} is thinking… {}s", state.agent.display, state.waiting_since.elapsed().as_secs()), Style::default().fg(Color::DarkGray)),
         ])
     } else {
-        Line::from(vec![Span::styled("› ", Style::default().fg(Color::Cyan)), Span::raw(state.input.clone())])
+        // A real cursor position (Left/Right/Home/End-addressable), drawn
+        // as a reversed-video cell rather than relying on the terminal's
+        // own cursor -- we never move that (no `f.set_cursor_position`),
+        // so this is the only visible insertion point there is.
+        let before: String = state.input[..state.cursor].iter().collect();
+        let at: String = state.input.get(state.cursor).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
+        let after: String = state.input[state.cursor.min(state.input.len())..].iter().skip(1).collect();
+        Line::from(vec![
+            Span::styled("› ", Style::default().fg(Color::Cyan)),
+            Span::raw(before),
+            Span::styled(at, Style::default().add_modifier(Modifier::REVERSED)),
+            Span::raw(after),
+        ])
     };
     f.render_widget(Paragraph::new(line).block(block), area);
 }
