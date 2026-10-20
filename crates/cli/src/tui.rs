@@ -20,7 +20,8 @@ use crate::agents::{AgentSpec, ALL_AGENTS};
 use crate::{build_context_sync, finish_context, open_or_init_repo_db, repo_root, resolve_agent};
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
@@ -109,6 +110,15 @@ struct ChatState {
     /// override, so it stays fixed.
     user_color: Color,
     agent_color: Color,
+    /// A message typed and submitted *while the previous one was still
+    /// generating* -- queued here instead of sent immediately (the
+    /// request loop isn't reentrant: one spawned task owns `messages`
+    /// for the duration of a turn), then auto-submitted the moment
+    /// `ChatEvent::Done`/`Error` clears `waiting`. Typing itself was
+    /// never blocked on `waiting` to begin with (see `drive`) -- only
+    /// submitting was, so you can draft, edit, or even switch agents
+    /// with `/agent` mid-generation without losing anything you typed.
+    queued: Option<String>,
     should_quit: bool,
 }
 
@@ -147,12 +157,25 @@ pub async fn run_chat_tui(cfg: &Config) -> Result<()> {
         suggestion_idx: 0,
         user_color: theme_color(cfg.tui_user_color.as_deref(), Color::Cyan),
         agent_color: theme_color(cfg.tui_agent_color.as_deref(), Color::Magenta),
+        queued: None,
         should_quit: false,
     };
 
     enable_raw_mode().context("enabling raw terminal mode")?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("entering alternate screen")?;
+    // Mouse capture is kept for wheel scroll, even though it also hands
+    // every mouse event -- including click-drag -- to the app instead of
+    // the terminal, which is what breaks a terminal's *default*
+    // click-drag text selection. Nearly every terminal emulator (xterm,
+    // the VTE family -- gnome-terminal, etc. --, alacritty, kitty, foot,
+    // wezterm, iTerm2, Windows Terminal) has the same escape hatch for
+    // exactly this situation: holding Shift while selecting bypasses the
+    // app's mouse capture and forces the terminal's own native selection,
+    // which copies normally. Bracketed paste is unconditionally worth
+    // having alongside it -- it's what makes a real paste (`Event::Paste`,
+    // handled in `drive`) land as the actual pasted text instead of a
+    // burst of raw bytes crossterm has to guess at.
+    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste).context("entering alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
     terminal.clear().ok();
@@ -160,7 +183,7 @@ pub async fn run_chat_tui(cfg: &Config) -> Result<()> {
     let result = drive(&mut terminal, &mut state, cfg, &client, &root).await;
 
     disable_raw_mode().ok();
-    crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen).ok();
+    crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
     result
 }
@@ -193,14 +216,21 @@ async fn drive(
                         // computed fresh from the current input on every
                         // keystroke, never stored, so there's nothing to
                         // go stale.
+                        // Typing, editing, and the autocomplete popup all
+                        // work regardless of `waiting` -- only *sending*
+                        // is gated on it (the request loop isn't
+                        // reentrant), and that's handled below by
+                        // queuing instead of refusing the keystroke.
                         let input_text: String = state.input.iter().collect();
-                        let suggestions = if state.waiting { Vec::new() } else { command_suggestions(&input_text) };
+                        let suggestions = command_suggestions(&input_text);
                         let popup_active = !suggestions.is_empty();
                         if popup_active {
                             state.suggestion_idx = state.suggestion_idx.min(suggestions.len() - 1);
                         }
 
-                        if popup_active && key.code == KeyCode::Esc {
+                        if key.code == KeyCode::Esc && state.queued.is_some() {
+                            state.queued = None;
+                        } else if popup_active && key.code == KeyCode::Esc {
                             state.input.clear();
                             state.cursor = 0;
                         } else if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
@@ -213,68 +243,60 @@ async fn drive(
                             state.input = suggestions[state.suggestion_idx].complete.chars().collect();
                             state.cursor = state.input.len();
                         } else if popup_active && key.code == KeyCode::Enter {
-                            let complete = &suggestions[state.suggestion_idx].complete;
+                            let complete = suggestions[state.suggestion_idx].complete.clone();
                             state.input = complete.chars().collect();
                             state.cursor = state.input.len();
                             // "/agent " alone (no key yet, just the
                             // generic placeholder entry) isn't a
                             // submittable command -- land the cursor
-                            // ready to keep typing instead of sending
-                            // a bare "/agent" question to the model.
+                            // ready to keep typing instead of queuing/
+                            // sending a bare "/agent" question.
                             if complete != "/agent " {
-                                submit(state, cfg, client, root, &tx);
+                                submit_or_queue(state, cfg, client, root, &tx);
                             }
                         } else {
                             match key.code {
-                                // Vertical motion scrolls the transcript; it's
-                                // always available, even while waiting, so you
-                                // can reread earlier context during a slow
-                                // generation without it fighting for keys with
-                                // text entry (which is blocked while waiting
-                                // anyway -- there's nothing to edit).
+                                // Vertical motion scrolls the transcript --
+                                // kept as the scroll keys even while typing
+                                // is otherwise unlocked during `waiting`,
+                                // same as before.
                                 KeyCode::Up => state.scroll = state.scroll.saturating_add(1),
                                 KeyCode::Down => state.scroll = state.scroll.saturating_sub(1),
                                 KeyCode::PageUp => state.scroll = state.scroll.saturating_add(page_rows),
                                 KeyCode::PageDown => state.scroll = state.scroll.saturating_sub(page_rows),
                                 KeyCode::Tab => state.tools_expanded = !state.tools_expanded,
-                                // Horizontal motion + editing only makes sense
-                                // on the input you're typing, which only
-                                // exists while not waiting on a reply.
-                                _ if !state.waiting => match key.code {
-                                    // Alt, not Shift: most terminals collapse
-                                    // Shift+Enter to plain Enter in raw mode
-                                    // (no distinct escape sequence without
-                                    // extra keyboard-protocol negotiation),
-                                    // while Alt reliably arrives as its own
-                                    // modifier bit everywhere since it's just
-                                    // the ESC-prefix trick terminals have
-                                    // used for Alt since forever.
-                                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                                        state.input.insert(state.cursor, '\n');
-                                        state.cursor += 1;
+                                // Alt, not Shift: most terminals collapse
+                                // Shift+Enter to plain Enter in raw mode
+                                // (no distinct escape sequence without
+                                // extra keyboard-protocol negotiation),
+                                // while Alt reliably arrives as its own
+                                // modifier bit everywhere since it's just
+                                // the ESC-prefix trick terminals have
+                                // used for Alt since forever.
+                                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                                    state.input.insert(state.cursor, '\n');
+                                    state.cursor += 1;
+                                }
+                                KeyCode::Enter => submit_or_queue(state, cfg, client, root, &tx),
+                                KeyCode::Backspace => {
+                                    if state.cursor > 0 {
+                                        state.cursor -= 1;
+                                        state.input.remove(state.cursor);
                                     }
-                                    KeyCode::Enter => submit(state, cfg, client, root, &tx),
-                                    KeyCode::Backspace => {
-                                        if state.cursor > 0 {
-                                            state.cursor -= 1;
-                                            state.input.remove(state.cursor);
-                                        }
+                                }
+                                KeyCode::Delete => {
+                                    if state.cursor < state.input.len() {
+                                        state.input.remove(state.cursor);
                                     }
-                                    KeyCode::Delete => {
-                                        if state.cursor < state.input.len() {
-                                            state.input.remove(state.cursor);
-                                        }
-                                    }
-                                    KeyCode::Left => state.cursor = state.cursor.saturating_sub(1),
-                                    KeyCode::Right => state.cursor = (state.cursor + 1).min(state.input.len()),
-                                    KeyCode::Home => state.cursor = 0,
-                                    KeyCode::End => state.cursor = state.input.len(),
-                                    KeyCode::Char(c) => {
-                                        state.input.insert(state.cursor, c);
-                                        state.cursor += 1;
-                                    }
-                                    _ => {}
-                                },
+                                }
+                                KeyCode::Left => state.cursor = state.cursor.saturating_sub(1),
+                                KeyCode::Right => state.cursor = (state.cursor + 1).min(state.input.len()),
+                                KeyCode::Home => state.cursor = 0,
+                                KeyCode::End => state.cursor = state.input.len(),
+                                KeyCode::Char(c) => {
+                                    state.input.insert(state.cursor, c);
+                                    state.cursor += 1;
+                                }
                                 _ => {}
                             }
                         }
@@ -284,6 +306,22 @@ async fn drive(
                         MouseEventKind::ScrollDown => state.scroll = state.scroll.saturating_sub(3),
                         _ => {}
                     },
+                    // Bracketed paste delivers the whole clipboard text as
+                    // one event instead of a key-by-key burst, so a paste
+                    // containing anything unusual (newlines, a lone `\r`,
+                    // a character crossterm's plain key parser might not
+                    // round-trip) still lands intact. Inserted the same
+                    // way typed characters are -- multi-line content just
+                    // becomes a multi-line draft, same as Alt+Enter.
+                    Event::Paste(text) => {
+                        for c in text.chars() {
+                            if c == '\r' {
+                                continue;
+                            }
+                            state.input.insert(state.cursor, c);
+                            state.cursor += 1;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -291,7 +329,16 @@ async fn drive(
                 // Just a redraw pulse for the spinner frame/elapsed time;
                 // no state change needed here.
             }
-            Some(ev) = rx.recv() => apply(state, ev),
+            Some(ev) = rx.recv() => {
+                apply(state, ev);
+                if !state.waiting {
+                    if let Some(line) = state.queued.take() {
+                        state.input = line.chars().collect();
+                        state.cursor = state.input.len();
+                        submit(state, cfg, client, root, &tx);
+                    }
+                }
+            }
         }
 
         if state.should_quit {
@@ -300,6 +347,26 @@ async fn drive(
         terminal.draw(|f| page_rows = draw(f, state))?;
     }
     Ok(())
+}
+
+/// Enter's actual handler: submit right away if nothing's in flight,
+/// otherwise queue -- the request loop owns `messages`/the model
+/// connection for the duration of one turn, so a second one can't run
+/// concurrently, but there's no reason typing or *sending* the next
+/// question has to wait for that, any more than Claude Code makes you
+/// wait to queue up a follow-up. `drive`'s `ChatEvent::Done`/`Error`
+/// handling flushes the queue the instant `waiting` clears.
+fn submit_or_queue(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std::path::Path, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    if !state.waiting {
+        submit(state, cfg, client, root, tx);
+        return;
+    }
+    let line: String = state.input.iter().collect::<String>().trim().to_string();
+    state.input.clear();
+    state.cursor = 0;
+    if !line.is_empty() {
+        state.queued = Some(line);
+    }
 }
 
 fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std::path::Path, tx: &mpsc::UnboundedSender<ChatEvent>) {
@@ -471,7 +538,11 @@ struct Suggestion {
 
 /// Every chat-REPL command besides `/agent`, which gets its own, richer
 /// listing (every agent, with its tagline) below.
-const PLAIN_COMMANDS: &[(&str, &str)] = &[("/clear", "reset the conversation"), ("/exit", "quit"), ("/quit", "quit")];
+/// `/quit` still works in `submit` (undocumented alias, harmless to
+/// keep for anyone's muscle memory from other tools) but isn't listed
+/// here -- two entries that do the exact same thing was the duplicate
+/// the autocomplete popup didn't need to show.
+const PLAIN_COMMANDS: &[(&str, &str)] = &[("/clear", "reset the conversation"), ("/exit", "quit")];
 
 /// Autocomplete candidates for the current input, or empty if it
 /// doesn't look like a command at all. Three cases:
@@ -519,7 +590,16 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
     // transcript's own prefixes.
     let wrap_width = inner_width.saturating_sub(2).max(5);
     let (input_rows, cursor_row, cursor_col) = wrap_input_for_display(&state.input, state.cursor, wrap_width);
-    let visible_input_rows = if state.waiting { 1 } else { input_rows.len().min(6) };
+    // While waiting, row 1 is always the spinner status; a draft typed
+    // for the *next* question (queued on Enter, not sent) gets its own
+    // rows below it instead of being hidden until the current reply
+    // finishes -- otherwise unlocking typing during `waiting` would let
+    // you type into a box that visibly shows nothing back.
+    let visible_input_rows = if state.waiting {
+        1 + if state.input.is_empty() { 0 } else { input_rows.len().min(5) }
+    } else {
+        input_rows.len().min(6)
+    };
     let input_height = (visible_input_rows + 2) as u16;
 
     let chunks = Layout::default()
@@ -559,18 +639,27 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
 /// drawn after -- so visually on top of -- everything else, anchored
 /// just above the input box.
 fn draw_command_popup(f: &mut ratatui::Frame, input_area: Rect, state: &ChatState, suggestions: &[Suggestion]) {
-    let visible = suggestions.len().min(6);
-    let height = (visible + 2) as u16;
+    let total = suggestions.len();
+    let idx = state.suggestion_idx.min(total.saturating_sub(1));
+    // Up to 12 rows, but never more than fit above the input box (the
+    // header row at y=0 is the hard ceiling) -- and the window follows
+    // `idx` the same way the transcript's own scroll follows the live
+    // bottom, so selecting past row 6 (all 22 agents, not just the
+    // first page of them) is reachable instead of invisible.
+    let max_rows_above = input_area.y.saturating_sub(1).max(1) as usize;
+    let cap = total.min(12).min(max_rows_above);
+    let start = if total > cap { idx.saturating_sub(cap.saturating_sub(1)).min(total - cap) } else { 0 };
+    let visible = &suggestions[start..(start + cap).min(total)];
+
+    let height = (cap + 2) as u16;
     let area = Rect { x: input_area.x, y: input_area.y.saturating_sub(height), width: input_area.width, height };
-    let idx = state.suggestion_idx.min(suggestions.len().saturating_sub(1));
     let inner_width = area.width.saturating_sub(4) as usize;
 
-    let lines: Vec<Line> = suggestions
+    let lines: Vec<Line> = visible
         .iter()
-        .take(visible)
         .enumerate()
         .map(|(i, s)| {
-            let style = if i == idx { Style::default().fg(Color::Black).bg(state.agent_color) } else { Style::default() };
+            let style = if start + i == idx { Style::default().fg(Color::Black).bg(state.agent_color) } else { Style::default() };
             let mut label = format!(" {:<14} {}", s.label, s.description);
             if label.chars().count() > inner_width {
                 label = label.chars().take(inner_width.max(4)).collect::<String>() + "…";
@@ -579,11 +668,12 @@ fn draw_command_popup(f: &mut ratatui::Frame, input_area: Rect, state: &ChatStat
         })
         .collect();
 
+    let title = if total > cap { format!(" ↑↓ pick · Tab/Enter choose ({}/{total}) ", idx + 1) } else { " ↑↓ pick · Tab/Enter choose ".to_string() };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(state.agent_color))
-        .title(" ↑↓ pick · Tab/Enter choose ");
+        .title(title);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -954,10 +1044,25 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &ChatState, rows: &[Str
 
     let lines: Vec<Line> = if state.waiting {
         let frame = SPINNER_FRAMES[(state.waiting_since.elapsed().as_millis() / 120) as usize % SPINNER_FRAMES.len()];
-        vec![Line::from(vec![
+        let mut status = vec![
             Span::styled(format!("{frame} "), Style::default().fg(Color::Yellow)),
             Span::styled(format!("{} is thinking… {}s", state.agent.display, state.waiting_since.elapsed().as_secs()), Style::default().fg(Color::DarkGray)),
-        ])]
+        ];
+        if let Some(q) = &state.queued {
+            let preview: String = q.chars().take(40).collect();
+            let ellipsis = if q.chars().count() > 40 { "…" } else { "" };
+            status.push(Span::styled(format!("  · next: {preview}{ellipsis}"), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+        }
+        let mut out = vec![Line::from(status)];
+        // A draft for the question *after* this one, typed while still
+        // waiting -- shown so typing during `waiting` isn't typing into
+        // a box that visibly shows nothing back (see `draw`'s sizing).
+        if !state.input.is_empty() {
+            for row in rows {
+                out.push(Line::from(vec![Span::styled("  ", Style::default()), Span::styled(row.clone(), Style::default().fg(Color::DarkGray))]));
+            }
+        }
+        out
     } else {
         // Cap the visible window and keep the cursor's row inside it --
         // same idea as `scroll_window` for the transcript, just always
