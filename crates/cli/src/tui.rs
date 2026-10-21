@@ -22,8 +22,8 @@ use crate::run_io::RunIo;
 use crate::{build_context_sync, finish_context, open_or_init_repo_db, repo_root, resolve_agent};
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream,
+    KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
@@ -268,6 +268,26 @@ struct ChatState {
     /// percentage for the header's rough "how full is the context
     /// window" indicator.
     num_ctx: usize,
+    /// Last string written to the terminal title (OSC 2) -- compared
+    /// against the freshly computed one every tick so the escape
+    /// sequence is only re-sent when it would actually change.
+    last_title: String,
+    /// Whether this terminal currently has focus (`EnableFocusChange`) --
+    /// `Done`/`Error` only rings the terminal bell when this is false,
+    /// so a turn finishing while you're looking at the chat never beeps
+    /// at you.
+    focused: bool,
+    /// Tokens received so far in the turn currently generating -- reset
+    /// in `submit`, incremented per `ChatEvent::Token`, shown as a
+    /// tokens/sec rate next to the spinner.
+    turn_tokens: usize,
+    /// When this chat process started -- `/stats`' "running for" line.
+    started_at: Instant,
+    /// Hides the header and plan panel for maximum transcript space --
+    /// toggled with Ctrl+Z (safe to bind: raw mode disables the
+    /// terminal's own signal generation, same reason Ctrl+C here means
+    /// "quit the app" rather than SIGINT).
+    zen: bool,
 }
 
 /// Parses a 6-digit hex color (no `#`, e.g. `"22d3ee"`) into an RGB
@@ -322,6 +342,11 @@ pub async fn run_chat_tui(cfg: &Config, resume: Option<String>) -> Result<()> {
         history_search: None,
         context_extra: 0,
         num_ctx: cfg.num_ctx,
+        last_title: String::new(),
+        focused: true,
+        turn_tokens: 0,
+        started_at: Instant::now(),
+        zen: false,
     };
 
     if let Some(id) = resume {
@@ -342,7 +367,7 @@ pub async fn run_chat_tui(cfg: &Config, resume: Option<String>) -> Result<()> {
     // having alongside it -- it's what makes a real paste (`Event::Paste`,
     // handled in `drive`) land as the actual pasted text instead of a
     // burst of raw bytes crossterm has to guess at.
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste).context("entering alternate screen")?;
+    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange).context("entering alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
     terminal.clear().ok();
@@ -351,7 +376,7 @@ pub async fn run_chat_tui(cfg: &Config, resume: Option<String>) -> Result<()> {
     let session = state.checkpoint_session.clone();
 
     disable_raw_mode().ok();
-    crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen).ok();
+    crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, DisableBracketedPaste, DisableFocusChange, LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
     // The whole point of the checkpoint-backed session surviving past
@@ -517,7 +542,7 @@ fn history_search_next_older(state: &mut ChatState) {
     }
 }
 
-const HELP_TEXT: &str = "keys\n  Enter             send (queues instead, while a reply is still generating)\n  Alt+Enter         insert a newline\n  ↑ / ↓             browse previously sent messages\n  Ctrl+R            search sent messages by substring (Ctrl+R again: older match, Enter: send it, Esc: cancel)\n  Ctrl+↑ / Ctrl+↓   scroll the transcript one line\n  PageUp / PageDown scroll the transcript a page\n  mouse wheel       scroll the transcript (hold Shift while selecting to copy text natively)\n  Tab               expand/collapse grouped tool calls\n  Ctrl+T            cycle permission mode (manual → semi-auto → auto)\n  Esc               cancel the running turn, else dismiss the popup, else quit\n  Ctrl+C            quit\ncommands\n  /agent <key>      switch specialist agent (resets the conversation)\n  /mode [name]      show/cycle/set the permission mode\n  /checkpoints      list checkpoint sessions\n  /rollback [id] [step]  undo file changes from a session\n  /resume <id>      switch to a different checkpoint session\n  /copy             copy the last reply to your system clipboard\n  /export [file]    save the conversation as Markdown\n  /clear            reset the conversation\n  /help             this message\n  /exit             quit\nheader shows [ctx ~N%] -- a rough estimate (chars/4) of how much of num_ctx this session is using";
+const HELP_TEXT: &str = "keys\n  Enter             send (queues instead, while a reply is still generating)\n  Alt+Enter         insert a newline\n  ↑ / ↓             browse previously sent messages\n  Ctrl+R            search sent messages by substring (Ctrl+R again: older match, Enter: send it, Esc: cancel)\n  Ctrl+↑ / Ctrl+↓   scroll the transcript one line\n  PageUp / PageDown scroll the transcript a page\n  Ctrl+End / Ctrl+Home  jump the transcript to the bottom / top\n  mouse wheel       scroll the transcript (hold Shift while selecting to copy text natively)\n  Tab               expand/collapse grouped tool calls\n  Ctrl+T            cycle permission mode (manual → semi-auto → auto)\n  Ctrl+Z            toggle zen mode (hide the header and plan panel)\n  Esc               cancel the running turn, else dismiss the popup, else quit\n  Ctrl+C            quit\ncommands\n  /agent <key>      switch specialist agent (resets the conversation)\n  /mode [name]      show/cycle/set the permission mode\n  /checkpoints      list checkpoint sessions\n  /rollback [id] [step]  undo file changes from a session\n  /resume <id>      switch to a different checkpoint session\n  /copy             copy the last reply to your system clipboard\n  /export [file]    save the conversation as Markdown\n  /stats            session stats: turns, tool calls, elapsed time\n  /search <term>    search all checkpoint sessions by substring\n  /clear            reset the conversation\n  /help             this message\n  /exit             quit\nheader shows [ctx ~N%] -- a rough estimate (chars/4) of how much of num_ctx this session is using. A reply's spinner shows tok/s once it's generated enough to measure. The terminal tab title tracks the active agent and waiting status, and the terminal bell rings once a turn finishes while this window isn't focused.";
 
 async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut ChatState, cfg: &Config, root: &std::path::Path) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -632,6 +657,12 @@ async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut Ch
                         } else if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
                             state.mode = state.mode.next();
                             state.transcript.push(TLine::Sys(format!("(permission mode: {})", state.mode.label())));
+                        } else if key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            state.zen = !state.zen;
+                        } else if key.code == KeyCode::End && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            state.scroll = 0;
+                        } else if key.code == KeyCode::Home && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            state.scroll = usize::MAX;
                         } else if key.code == KeyCode::Esc && state.queued.is_some() {
                             state.queued = None;
                         } else if popup_active && key.code == KeyCode::Esc {
@@ -733,6 +764,8 @@ async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut Ch
                         MouseEventKind::ScrollDown => state.scroll = state.scroll.saturating_sub(3),
                         _ => {}
                     },
+                    Event::FocusGained => state.focused = true,
+                    Event::FocusLost => state.focused = false,
                     // Bracketed paste delivers the whole clipboard text as
                     // one event instead of a key-by-key burst, so a paste
                     // containing anything unusual (newlines, a lone `\r`,
@@ -757,7 +790,15 @@ async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut Ch
                 // no state change needed here.
             }
             Some(ev) = rx.recv() => {
+                // A turn finishing is exactly the moment worth a bell if
+                // you've looked away -- checked before `apply` consumes
+                // `ev`, since afterward there's nothing left to match on.
+                let turn_finished = matches!(ev, ChatEvent::Done | ChatEvent::Error(_));
                 apply(state, ev);
+                if turn_finished && !state.focused {
+                    print!("\x07");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
                 if !state.waiting {
                     if let Some(line) = state.queued.take() {
                         state.input = line.chars().collect();
@@ -770,6 +811,16 @@ async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut Ch
 
         if state.should_quit {
             break;
+        }
+        // OSC 2 -- the terminal tab/window title, so the agent and
+        // waiting status are visible without even looking at this pane.
+        // Compared against what was last written so an unwaiting,
+        // unchanged title doesn't get rewritten every tick for nothing.
+        let title = if state.waiting { format!("GRAVITON · {} ⏳", state.agent.display) } else { format!("GRAVITON · {}", state.agent.display) };
+        if title != state.last_title {
+            print!("\x1b]2;{title}\x07");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            state.last_title = title;
         }
         terminal.draw(|f| page_rows = draw(f, state))?;
     }
@@ -865,6 +916,58 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
         }
         return;
     }
+    if line == "/stats" {
+        let elapsed = state.started_at.elapsed();
+        let (mins, secs) = (elapsed.as_secs() / 60, elapsed.as_secs() % 60);
+        let tool_calls: usize = state.transcript.iter().map(|l| if let TLine::Tools(v) = l { v.len() } else { 0 }).sum();
+        let checkpoint_line = state
+            .checkpoint_session
+            .as_ref()
+            .and_then(|id| checkpoint::list_sessions(root).ok().map(|sessions| (id.clone(), sessions)))
+            .and_then(|(id, sessions)| sessions.into_iter().find(|s| s.id == id))
+            .map(|s| format!("{} step(s), {} file(s) touched", s.steps, s.files_touched))
+            .unwrap_or_else(|| "no checkpoint session yet".to_string());
+        state.transcript.push(TLine::Sys(format!(
+            "session stats\n  running for    {mins}m{secs:02}s\n  messages sent  {}\n  tool calls     {tool_calls}\n  checkpoint     {checkpoint_line}\n  context usage  ~{}%",
+            state.history.len(),
+            context_pct(state),
+        )));
+        return;
+    }
+    if let Some(term) = line.strip_prefix("/search") {
+        let term = term.trim();
+        if term.is_empty() {
+            state.transcript.push(TLine::Err("usage: /search <term>".into()));
+            return;
+        }
+        let q = term.to_lowercase();
+        let mut hits = Vec::new();
+        match checkpoint::list_sessions(root) {
+            Ok(sessions) => {
+                for s in sessions {
+                    if let Ok(messages) = checkpoint::load_transcript(root, &s.id) {
+                        for m in messages {
+                            if (m.role == "user" || m.role == "assistant") && m.content.to_lowercase().contains(&q) {
+                                let snippet: String = extract_question(&m.content).chars().take(80).collect();
+                                hits.push(format!("{:<20} [{}] {snippet}", s.id, m.role));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                state.transcript.push(TLine::Err(format!("{e:#}")));
+                return;
+            }
+        }
+        if hits.is_empty() {
+            state.transcript.push(TLine::Sys(format!("no matches for '{term}'")));
+        } else {
+            hits.truncate(20);
+            state.transcript.push(TLine::Sys(format!("matches for '{term}':\n{}", hits.join("\n"))));
+        }
+        return;
+    }
     if line == "/checkpoints" {
         match checkpoint::list_sessions(root) {
             Ok(sessions) if sessions.is_empty() => state.transcript.push(TLine::Sys("no checkpoint sessions yet".into())),
@@ -936,6 +1039,7 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
     state.transcript.push(TLine::You(line.clone()));
     state.waiting = true;
     state.waiting_since = Instant::now();
+    state.turn_tokens = 0;
     // A new question is always worth seeing, even if you'd scrolled up
     // to reread earlier history -- jump back to live.
     state.scroll = 0;
@@ -1179,6 +1283,7 @@ fn format_tool_call(name: &str, args: &serde_json::Value) -> String {
 fn apply(state: &mut ChatState, ev: ChatEvent) {
     match ev {
         ChatEvent::Token(tok) => {
+            state.turn_tokens += 1;
             // Lazily starts the agent's reply line on its first real
             // token -- never on a tool call or an empty placeholder, so
             // a turn with no text output never leaves a stray empty
@@ -1266,6 +1371,8 @@ const PLAIN_COMMANDS: &[(&str, &str)] = &[
     ("/rollback", "undo file changes from a session"),
     ("/copy", "copy the last reply to your system clipboard"),
     ("/export", "save the conversation as Markdown"),
+    ("/stats", "session stats: turns, tool calls, elapsed time"),
+    ("/search", "search all checkpoint sessions by substring"),
     ("/help", "keybindings and commands"),
     ("/exit", "quit"),
 ];
@@ -1365,14 +1472,19 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
     let input_height = (visible_input_rows + 2) as u16;
     // Hidden (zero height) with no plan yet -- a standing checklist
     // panel only earns its space once there's something to check off.
-    let plan_height = if state.plan.is_empty() { 0 } else { (state.plan.len().min(8) + 2) as u16 };
+    // Also hidden under Ctrl+Z's "zen" toggle, same as the header, to
+    // give the transcript the whole screen.
+    let header_height = if state.zen { 0 } else { 1 };
+    let plan_height = if state.plan.is_empty() || state.zen { 0 } else { (state.plan.len().min(8) + 2) as u16 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(plan_height), Constraint::Min(3), Constraint::Length(input_height)])
+        .constraints([Constraint::Length(header_height), Constraint::Length(plan_height), Constraint::Min(3), Constraint::Length(input_height)])
         .split(area);
 
-    draw_header(f, chunks[0], state);
+    if !state.zen {
+        draw_header(f, chunks[0], state);
+    }
     draw_plan(f, chunks[1], state);
     let rows = draw_transcript(f, chunks[2], state);
     draw_input(f, chunks[3], state, &input_rows, cursor_row, cursor_col, show_spinner);
@@ -1415,13 +1527,19 @@ fn estimate_context_chars(state: &ChatState) -> usize {
     visible + state.context_extra
 }
 
+/// `estimate_context_chars` turned into a rough "% of num_ctx used"
+/// figure -- shared by the header indicator and `/stats`.
+fn context_pct(state: &ChatState) -> usize {
+    ((estimate_context_chars(state) / 4) * 100 / state.num_ctx.max(1)).min(999)
+}
+
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
     let mode_color = match state.mode {
         PermissionMode::Manual => Color::DarkGray,
         PermissionMode::SemiAuto => Color::Yellow,
         PermissionMode::Auto => Color::Red,
     };
-    let pct = ((estimate_context_chars(state) / 4) * 100 / state.num_ctx.max(1)).min(999);
+    let pct = context_pct(state);
     let ctx_color = if pct >= 85 { Color::Red } else if pct >= 60 { Color::Yellow } else { Color::DarkGray };
     let line = Line::from(vec![
         Span::styled("GRAVITON", Style::default().fg(state.agent_color).add_modifier(Modifier::BOLD)),
@@ -1964,10 +2082,16 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &ChatState, rows: &[Str
         .border_style(Style::default().fg(border_color));
 
     let lines: Vec<Line> = if show_spinner {
-        let frame = SPINNER_FRAMES[(state.waiting_since.elapsed().as_millis() / 120) as usize % SPINNER_FRAMES.len()];
+        let elapsed = state.waiting_since.elapsed();
+        let frame = SPINNER_FRAMES[(elapsed.as_millis() / 120) as usize % SPINNER_FRAMES.len()];
+        let rate = if elapsed.as_secs_f64() > 0.5 && state.turn_tokens > 0 {
+            format!(" · {:.1} tok/s", state.turn_tokens as f64 / elapsed.as_secs_f64())
+        } else {
+            String::new()
+        };
         let mut status = vec![
             Span::styled(format!("{frame} "), Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{} is thinking… {}s", state.agent.display, state.waiting_since.elapsed().as_secs()), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{} is thinking… {}s{rate}", state.agent.display, elapsed.as_secs()), Style::default().fg(Color::DarkGray)),
         ];
         if let Some(q) = &state.queued {
             let preview: String = q.chars().take(40).collect();
@@ -2391,6 +2515,11 @@ mod tests {
             history_search: None,
             context_extra: 0,
             num_ctx: 8192,
+            last_title: String::new(),
+            focused: true,
+            turn_tokens: 0,
+            started_at: Instant::now(),
+            zen: false,
         }
     }
 
