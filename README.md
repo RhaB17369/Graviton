@@ -144,6 +144,49 @@ ARCHITECTURE.md for why that distinction is load-bearing), and writes the
 result. It will tell you plainly when a model it found isn't being
 auto-assigned and why (see the tool-calling note below).
 
+### Cloud providers — mixing in open-weight models you don't run yourself
+
+Everything above assumes Ollama. A third config file,
+`~/.config/graviton/providers.toml`, names cloud providers that speak the
+same OpenAI-compatible `/chat/completions` API nearly every open-weight
+host exposes — Groq, Together.ai, Fireworks, DeepInfra, OpenRouter,
+Cerebras, and most others — one client covers all of them, no
+provider-specific code:
+
+```toml
+# ~/.config/graviton/providers.toml
+[groq]
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+
+[together]
+base_url = "https://api.together.xyz/v1"
+api_key_env = "TOGETHER_API_KEY"
+```
+
+`api_key_env` is the *name* of an environment variable — the key itself
+is never written to this file or anywhere else on disk; set it in your
+shell (`export GROQ_API_KEY=...`) before running `grv`.
+
+Point any tier or agent at one with the usual `models.toml` routing, just
+with a `<provider>:` prefix on the model name:
+
+```sh
+grv models set architect groq:llama-3.3-70b-versatile   # one agent
+grv models set deep groq:llama-3.3-70b-versatile         # a whole tier
+```
+
+Ollama and cloud providers coexist freely — nothing stops `fast` running
+locally while `deep` routes to Groq. An Ollama tag is only ever read as
+`<provider>:<model>` when `<provider>` is an actual name from
+`providers.toml`; an ordinary tag like `qwen3:8b` is never misread, so
+leaving this file alone changes nothing. `grv status`/`grv models` show
+each configured provider and whether its key is actually set. This
+covers every command that calls a model — `run`, `ask`, `crew`, `review`,
+`swarm`, `mission`, `serve`, and the chat TUI — except embeddings
+(`--embed-model`), which stay Ollama-only, and `grv models recommend`,
+which is specifically about what's pulled *locally*.
+
 ## How the model is kept honest, and what still gets past it
 
 This project does not pretend a 4B–9B local model is as reliable as a

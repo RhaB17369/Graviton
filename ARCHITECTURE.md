@@ -30,21 +30,24 @@ a resource-planning mistake turn a slow machine into a crashed one.
 
 ## Component breakdown
 
-Four crates, 15 183 lines of Rust:
+Four crates, 18 613 lines of Rust:
 
 ```mermaid
 graph TD
-    subgraph cli["graviton-cli — the grv binary (22 files)"]
+    subgraph cli["graviton-cli — the grv binary (23 files)"]
         MAIN[main.rs<br/>command dispatch]
         AGENTS[agents.rs<br/>22-agent roster + 3 shared guards]
         CONTEXT[context.rs<br/>retrieval + promote_full_files]
         AGENTIC[agentic.rs<br/>read-only loop + full run loop]
         MODELS[models.rs<br/>per-agent routing + recommend]
+        PROVIDERS[providers.rs<br/>routed model to LlmClient + bare model]
         RESOURCES[resources.rs<br/>RAM/CPU concurrency gate]
         DAEMON[daemon.rs<br/>grv serve, JSON-RPC]
     end
     subgraph llm["graviton-llm"]
         OLLAMA[OllamaClient<br/>chat_stream / list_models / embed<br/>think:false always]
+        OPENAI[OpenAiCompatClient<br/>chat_stream over SSE<br/>any OpenAI-compatible cloud API]
+        LLMCLIENT[LlmClient<br/>Ollama or OpenAiCompat, one chat_stream]
     end
     subgraph indexer["graviton-indexer"]
         LANG[lang.rs<br/>tree-sitter queries, 66 languages]
@@ -52,7 +55,7 @@ graph TD
         RESOLVE[resolve.rs<br/>repo-wide import resolution]
     end
     subgraph core["graviton-core — leaf dependency"]
-        CONFIG[Config / ModelRouting]
+        CONFIG[Config / ModelRouting / Providers]
         SCHEMA[SQLite schema: files, symbols,<br/>calls, imports, embeddings]
     end
 
@@ -60,7 +63,10 @@ graph TD
     MAIN --> CONTEXT
     MAIN --> MODELS
     AGENTIC --> CONTEXT
-    AGENTIC --> OLLAMA
+    AGENTIC --> PROVIDERS
+    PROVIDERS --> LLMCLIENT
+    LLMCLIENT --> OLLAMA
+    LLMCLIENT --> OPENAI
     AGENTS --> MODELS
     MODELS --> OLLAMA
     MODELS --> RESOURCES
@@ -73,8 +79,8 @@ graph TD
     llm --> core
 ```
 
-- **`graviton-core`** (`crates/core`) — `Config`/`ModelRouting` (load/
-  save/resolve), the SQLite schema (`open_db`), and the handful of types
+- **`graviton-core`** (`crates/core`) — `Config`/`ModelRouting`/
+  `Providers` (load/save/resolve), the SQLite schema (`open_db`), and the handful of types
   (`Symbol`, `FileRecord`, `ModelTier`) every other crate depends on. No
   tree-sitter, no network, no CLI — kept a leaf dependency on purpose so
   the data model can be inspected/tested without pulling in parsing or
@@ -84,16 +90,20 @@ graph TD
   extraction), `resolve.rs` (repo-wide import resolution, a second
   pass once every file's path is known). The only crate that links
   against the 50+ C grammar crates.
-- **`graviton-llm`** (`crates/llm`) — the Ollama HTTP client:
-  `chat_stream` (streaming, tool-calling, "thinking" disabled by
-  default), `list_models`/`model_sizes_mb` (`/api/tags`), `embed`
-  (`/api/embeddings`). No business logic — every agent-specific decision
-  lives in `crates/cli`.
-- **`graviton-cli`** (`crates/cli`, 22 files) — everything else: the
+- **`graviton-llm`** (`crates/llm`) — two chat clients behind one
+  `LlmClient` enum: `OllamaClient` (`chat_stream` — streaming,
+  tool-calling, "thinking" disabled by default — plus
+  `list_models`/`model_sizes_mb` (`/api/tags`), `embed`
+  (`/api/embeddings`)), and `OpenAiCompatClient` (`chat_stream` over
+  SSE, same tool-calling contract, for any OpenAI-compatible cloud
+  API — see "Cloud providers" below). No business logic — every
+  agent-specific decision lives in `crates/cli`.
+- **`graviton-cli`** (`crates/cli`, 23 files) — everything else: the
   `grv` binary, the agent roster and its system prompts (`agents.rs`),
   context assembly (`context.rs`), the agentic tool loop (`agentic.rs`),
   resource/concurrency management (`resources.rs`), per-agent model
-  routing (`models.rs`), the daemon (`daemon.rs`), and more.
+  routing (`models.rs`), resolving a routed model to a client
+  (`providers.rs`), the daemon (`daemon.rs`), and more.
 
 ### Why Rust over C/C++ or a scripting language
 
@@ -271,6 +281,11 @@ tier) beats a `[tier]` override, which beats the three-slot fallback —
 in the codebase goes through to resolve a model, so the two axes can
 never silently disagree between entry points.
 
+Whatever `model_for` returns is still just a string — `Config::
+resolve_model` is the function that decides what it actually names.
+See "Cloud providers" below for the one place that string can mean
+something other than an Ollama tag.
+
 ```mermaid
 flowchart LR
     A["Config::model_for(tier, agent_key)"] --> B{"models.toml<br/>[agent] has agent_key?"}
@@ -340,6 +355,71 @@ and this machine's *available* RAM right now, it:
    Both stay recognized and are printed, flagged, available via `grv
    models set` for a workflow that mainly feeds complete context through
    `--file` and doesn't lean on the tool loop.
+
+## Cloud providers (`graviton-core::Providers`, `providers.rs`)
+
+Everything above resolves a model name assuming Ollama. `Config::
+resolve_model(routed: &str)` is where that assumption actually gets
+checked: it splits `routed` on the first `:`, and only treats the part
+before it as a provider name if that name is an actual key in
+`~/.config/graviton/providers.toml` — otherwise the whole string is
+returned as a plain Ollama tag, unsplit. This is deliberately
+conservative: Ollama tags routinely contain a colon (`qwen3:8b`), so the
+split only ever fires for a prefix someone *configured*, never a guess
+based on shape. An install with no `providers.toml` is byte-for-byte
+unaffected.
+
+```mermaid
+flowchart LR
+    A["model_for(tier, agent_key)<br/>e.g. \"groq:llama-3.3-70b\""] --> B["Config::resolve_model"]
+    B --> C{"prefix before ':' is a<br/>key in providers.toml?"}
+    C -->|no| D["ResolvedModel::Local<br/>(whole string, unsplit)"]
+    C -->|yes| E["ResolvedModel::Cloud<br/>provider + bare model name"]
+    D --> F["providers::resolve_client"]
+    E --> F
+    F --> G["LlmClient::Ollama"]
+    F --> H["LlmClient::OpenAiCompat<br/>reqwest::Client::bearer_auth(key)"]
+```
+
+`providers::resolve_client` is the one place an API key is ever read —
+straight from the environment variable named in `ProviderDef::
+api_key_env`, never from a file GRAVITON wrote. A `Cloud` resolution
+with that variable unset fails loudly (`anyhow::Error` naming the exact
+variable), not silently, before any request is attempted.
+
+`OpenAiCompatClient::chat_stream` has to do real translation work
+`OllamaClient` doesn't:
+- **Tool-call arguments stream as a JSON-encoded *string*, in fragments.**
+  OpenAI-shaped SSE deltas split a tool call's `arguments` across several
+  chunks sharing one `index`; `ToolCallAccum` concatenates them per index
+  and parses the result as JSON only once the stream ends. Ollama sends
+  one tool call whole in a single message.
+- **A tool result's `tool_call_id` has to match an id the provider
+  actually issued.** `ChatMessage`/`ChatMessage::tool_result` carry no id
+  at all (Ollama has no use for one) — `ToolCall` gained an optional
+  `id` field instead, populated from the provider's own response and
+  echoed back verbatim on the next request. History that never went
+  through this client (e.g. switching an agent from Ollama to a cloud
+  provider mid-session) has no real id to echo, so
+  `to_openai_wire_messages` falls back to a synthesized one, paired
+  positionally — safe only because GRAVITON always pushes one assistant
+  `tool_calls` message followed by exactly that many `tool` result
+  messages, in that order, every time (`agentic.rs`'s `push_and_record`
+  call sequence); a provider asked to match an id it never issued would
+  otherwise reject the request.
+- **`reasoning_content` is a second, separate streamed field**, same
+  role as Ollama's `message.thinking` — routed to the same `on_thinking`
+  callback so a served reasoning model's trace isn't silently dropped
+  the way an earlier version of `OllamaClient` dropped `thinking` (see
+  "Ollama client" above).
+
+Local-RAM-based concurrency sizing (`resources.rs`, and the swarm/mission
+schedulers in `main.rs`/`mission.rs`) excludes cloud-routed models via
+`Config::distinct_local_models` — a cloud model occupies no local RAM,
+so counting it there would only make the estimate more conservative
+than it needs to be. `grv swarm`'s per-task permit is skipped entirely
+for a cloud-routed agent rather than contending over a budget that has
+nothing to do with it.
 
 ## Resource-aware concurrency (`resources.rs`)
 
