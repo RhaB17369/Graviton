@@ -99,6 +99,9 @@ enum ChatEvent {
     /// `io.on_plan` -- the agent's current step list, replacing whatever
     /// plan was shown before rather than adding a new copy underneath it.
     Plan(Vec<PlanStep>),
+    /// The char length of the retrieved-context dump just attached to a
+    /// fresh session's first message -- see `ChatState::context_extra`.
+    ContextChars(usize),
     /// A gated action needs a decision -- `(tool, action, reply)`.
     Confirm(String, String, oneshot::Sender<Decision>),
     /// `ask_user` needs an answer -- `(question, options, multi_select, reply)`.
@@ -151,6 +154,15 @@ struct PendingChoice {
 struct PlanStep {
     text: String,
     status: String,
+}
+
+/// Ctrl+R reverse-history-search state, readline/bash-style: `query` is
+/// what's been typed to search *for*, `match_idx` the `history` entry it
+/// currently resolves to (displayed in the input box in place of the
+/// query itself) -- `None` means no entry in `history` contains `query`.
+struct HistorySearch {
+    query: String,
+    match_idx: Option<usize>,
 }
 
 struct ChatState {
@@ -236,9 +248,26 @@ struct ChatState {
     /// convention a shell's own history uses.
     history: Vec<String>,
     history_cursor: Option<usize>,
-    /// The draft that was being typed when history browsing started,
-    /// restored once ↓ walks back past the newest history entry.
+    /// The draft that was being typed when history browsing *or* a
+    /// Ctrl+R search started -- restored once ↓ walks back past the
+    /// newest history entry, or Esc/an empty-match Enter cancels a
+    /// search. The two features never run at once, so one field covers
+    /// both.
     history_draft: Vec<char>,
+    /// `Some` while a Ctrl+R reverse-history-search is in progress --
+    /// takes over the input box and most keys (see `drive`) until
+    /// Enter/Esc resolves it.
+    history_search: Option<HistorySearch>,
+    /// Characters attributed to the checkpoint session's one-time
+    /// "Retrieved context" dump (sent with the very first message of a
+    /// session, then carried in every subsequent turn's history) -- not
+    /// visible in the transcript itself, so it's tracked separately
+    /// from `estimate_context_chars`, which only sees what's on screen.
+    context_extra: usize,
+    /// `cfg.num_ctx` at startup, to turn `estimate_context_chars` into a
+    /// percentage for the header's rough "how full is the context
+    /// window" indicator.
+    num_ctx: usize,
 }
 
 /// Parses a 6-digit hex color (no `#`, e.g. `"22d3ee"`) into an RGB
@@ -290,6 +319,9 @@ pub async fn run_chat_tui(cfg: &Config, resume: Option<String>) -> Result<()> {
         history: Vec::new(),
         history_cursor: None,
         history_draft: Vec::new(),
+        history_search: None,
+        context_extra: 0,
+        num_ctx: cfg.num_ctx,
     };
 
     if let Some(id) = resume {
@@ -358,12 +390,23 @@ fn load_session_into(state: &mut ChatState, root: &std::path::Path, id: &str) {
     state.checkpoint_session = Some(id.to_string());
     state.transcript.clear();
     state.plan.clear();
+    state.context_extra = 0;
     state.transcript.push(TLine::Sys(format!("(resumed session {id})")));
     match checkpoint::load_transcript(root, id) {
         Ok(messages) => {
+            let mut first_user = true;
             for m in messages {
                 match m.role.as_str() {
                     "user" => {
+                        // The *first* user turn of a session carries the
+                        // one-time "Retrieved context" dump that never
+                        // shows up in the transcript panel itself --
+                        // counted here so the context-usage estimate
+                        // isn't silently missing it after a resume.
+                        if first_user {
+                            state.context_extra += m.content.chars().count();
+                            first_user = false;
+                        }
                         let text = extract_question(&m.content);
                         if !text.is_empty() {
                             state.transcript.push(TLine::You(text));
@@ -433,7 +476,48 @@ fn history_next(state: &mut ChatState) {
     }
 }
 
-const HELP_TEXT: &str = "keys\n  Enter             send (queues instead, while a reply is still generating)\n  Alt+Enter         insert a newline\n  ↑ / ↓             browse previously sent messages\n  Ctrl+↑ / Ctrl+↓   scroll the transcript one line\n  PageUp / PageDown scroll the transcript a page\n  mouse wheel       scroll the transcript (hold Shift while selecting to copy text natively)\n  Tab               expand/collapse grouped tool calls\n  Ctrl+T            cycle permission mode (manual → semi-auto → auto)\n  Esc               cancel the running turn, else dismiss the popup, else quit\n  Ctrl+C            quit\ncommands\n  /agent <key>      switch specialist agent (resets the conversation)\n  /mode [name]      show/cycle/set the permission mode\n  /checkpoints      list checkpoint sessions\n  /rollback [id] [step]  undo file changes from a session\n  /resume <id>      switch to a different checkpoint session\n  /clear            reset the conversation\n  /help             this message\n  /exit             quit";
+/// Re-runs a Ctrl+R search's query against `history`, most recent match
+/// first, and mirrors the result into `state.input` for display -- the
+/// input box always shows the *matched command*, never the query itself
+/// (same convention bash's reverse-i-search uses).
+fn history_search_update(state: &mut ChatState) {
+    let query = state.history_search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+    if query.is_empty() {
+        if let Some(s) = state.history_search.as_mut() {
+            s.match_idx = None;
+        }
+        state.input.clear();
+        state.cursor = 0;
+        return;
+    }
+    let q = query.to_lowercase();
+    let idx = state.history.iter().enumerate().rev().find(|(_, h)| h.to_lowercase().contains(&q)).map(|(i, _)| i);
+    if let Some(s) = state.history_search.as_mut() {
+        s.match_idx = idx;
+    }
+    state.input = idx.map(|i| state.history[i].clone()).unwrap_or_default().chars().collect();
+    state.cursor = state.input.len();
+}
+
+/// Ctrl+R again -- the next *older* entry still matching the same query.
+fn history_search_next_older(state: &mut ChatState) {
+    let Some(search) = state.history_search.as_ref() else { return };
+    let query = search.query.to_lowercase();
+    if query.is_empty() {
+        return;
+    }
+    let start = search.match_idx.unwrap_or(state.history.len());
+    let idx = state.history[..start].iter().enumerate().rev().find(|(_, h)| h.to_lowercase().contains(&query)).map(|(i, _)| i);
+    if let Some(i) = idx {
+        if let Some(s) = state.history_search.as_mut() {
+            s.match_idx = Some(i);
+        }
+        state.input = state.history[i].chars().collect();
+        state.cursor = state.input.len();
+    }
+}
+
+const HELP_TEXT: &str = "keys\n  Enter             send (queues instead, while a reply is still generating)\n  Alt+Enter         insert a newline\n  ↑ / ↓             browse previously sent messages\n  Ctrl+R            search sent messages by substring (Ctrl+R again: older match, Enter: send it, Esc: cancel)\n  Ctrl+↑ / Ctrl+↓   scroll the transcript one line\n  PageUp / PageDown scroll the transcript a page\n  mouse wheel       scroll the transcript (hold Shift while selecting to copy text natively)\n  Tab               expand/collapse grouped tool calls\n  Ctrl+T            cycle permission mode (manual → semi-auto → auto)\n  Esc               cancel the running turn, else dismiss the popup, else quit\n  Ctrl+C            quit\ncommands\n  /agent <key>      switch specialist agent (resets the conversation)\n  /mode [name]      show/cycle/set the permission mode\n  /checkpoints      list checkpoint sessions\n  /rollback [id] [step]  undo file changes from a session\n  /resume <id>      switch to a different checkpoint session\n  /copy             copy the last reply to your system clipboard\n  /export [file]    save the conversation as Markdown\n  /clear            reset the conversation\n  /help             this message\n  /exit             quit\nheader shows [ctx ~N%] -- a rough estimate (chars/4) of how much of num_ctx this session is using";
 
 async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut ChatState, cfg: &Config, root: &std::path::Path) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -470,7 +554,8 @@ async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut Ch
                         // confirm/choice -- that answer is never a
                         // command.
                         let input_text: String = state.input.iter().collect();
-                        let suggestions = if confirm_active || choice_active { Vec::new() } else { command_suggestions(&input_text, &state.known_sessions) };
+                        let searching = state.history_search.is_some();
+                        let suggestions = if confirm_active || choice_active || searching { Vec::new() } else { command_suggestions(&input_text, &state.known_sessions) };
                         let popup_active = !suggestions.is_empty();
                         if popup_active {
                             state.suggestion_idx = state.suggestion_idx.min(suggestions.len() - 1);
@@ -503,6 +588,47 @@ async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut Ch
                             if let Some(pending) = state.pending_choice.take() {
                                 let _ = pending.reply.send(Vec::new());
                             }
+                        } else if searching {
+                            // A Ctrl+R search takes over the input box
+                            // entirely (it's showing the *matched*
+                            // history entry, not a line being typed) --
+                            // every key below is about the search itself,
+                            // not ordinary editing.
+                            match key.code {
+                                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => history_search_next_older(state),
+                                KeyCode::Char(c) => {
+                                    if let Some(s) = state.history_search.as_mut() {
+                                        s.query.push(c);
+                                    }
+                                    history_search_update(state);
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(s) = state.history_search.as_mut() {
+                                        s.query.pop();
+                                    }
+                                    history_search_update(state);
+                                }
+                                KeyCode::Enter => {
+                                    state.history_search = None;
+                                    if state.input.is_empty() {
+                                        state.input = std::mem::take(&mut state.history_draft);
+                                        state.cursor = state.input.len();
+                                    } else {
+                                        submit_or_queue(state, cfg, root, &tx);
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    state.history_search = None;
+                                    state.input = std::mem::take(&mut state.history_draft);
+                                    state.cursor = state.input.len();
+                                }
+                                _ => {}
+                            }
+                        } else if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) && !state.waiting {
+                            state.history_draft = state.input.clone();
+                            state.input.clear();
+                            state.cursor = 0;
+                            state.history_search = Some(HistorySearch { query: String::new(), match_idx: None });
                         } else if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
                             state.mode = state.mode.next();
                             state.transcript.push(TLine::Sys(format!("(permission mode: {})", state.mode.label())));
@@ -685,11 +811,48 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
         state.transcript.push(TLine::Sys("(conversation cleared)".into()));
         state.checkpoint_session = None;
         state.plan.clear();
+        state.context_extra = 0;
         state.scroll = 0;
         return;
     }
     if line == "/help" {
         state.transcript.push(TLine::Sys(HELP_TEXT.to_string()));
+        return;
+    }
+    if line == "/copy" {
+        let last_reply = state.transcript.iter().rev().find_map(|l| match l {
+            TLine::Agent { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        });
+        match last_reply {
+            Some(text) => {
+                copy_to_clipboard(&text);
+                state.transcript.push(TLine::Sys("(copied last reply to clipboard)".into()));
+            }
+            None => state.transcript.push(TLine::Err("nothing to copy yet".into())),
+        }
+        return;
+    }
+    if let Some(rest) = line.strip_prefix("/export") {
+        let path = rest.trim();
+        let path = if path.is_empty() {
+            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            format!("grv-chat-{secs}.md")
+        } else {
+            path.to_string()
+        };
+        let mut md = String::from("# GRAVITON chat transcript\n\n");
+        for entry in &state.transcript {
+            match entry {
+                TLine::You(text) => md.push_str(&format!("**You:** {text}\n\n")),
+                TLine::Agent { label, text } if !text.trim().is_empty() => md.push_str(&format!("**{label}:** {text}\n\n")),
+                _ => {}
+            }
+        }
+        match std::fs::write(&path, md) {
+            Ok(()) => state.transcript.push(TLine::Sys(format!("exported to {path}"))),
+            Err(e) => state.transcript.push(TLine::Err(format!("couldn't write {path}: {e}"))),
+        }
         return;
     }
     if let Some(rest) = line.strip_prefix("/resume") {
@@ -755,6 +918,7 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
                 state.cfg_model = cfg.model_for(a.tier, a.key).to_string();
                 state.checkpoint_session = None;
                 state.plan.clear();
+                state.context_extra = 0;
                 state.transcript.push(TLine::Sys(format!("(switched to {} — conversation reset)", a.display)));
             }
             Err(e) => state.transcript.push(TLine::Err(format!("{e:#}"))),
@@ -793,7 +957,9 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
                 let conn = open_or_init_repo_db(&cfg, &root)?;
                 let (groups, semantic_src) = build_context_sync(&cfg, &root, &conn, &line, &[])?;
                 drop(conn);
-                Some(finish_context(&cfg, &line, groups, semantic_src).await?)
+                let ctx = finish_context(&cfg, &line, groups, semantic_src).await?;
+                let _ = tx2.send(ChatEvent::ContextChars(ctx.chars().count()));
+                Some(ctx)
             } else {
                 None
             };
@@ -824,6 +990,37 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
 /// `agentic::run`'s `io.emit`/action-description text ever produces
 /// (color/style codes for a raw terminal) -- so it renders as plain
 /// text instead of literal escape bytes once it's a ratatui `Span`.
+/// Writes `text` to the *system* clipboard via an OSC 52 escape
+/// sequence rather than a clipboard crate or an `xclip`/`wl-copy`
+/// subprocess call -- OSC 52 is supported directly by every terminal
+/// emulator this project's README already assumes (kitty, alacritty,
+/// wezterm, iTerm2, foot, Windows Terminal, xterm with
+/// `allowWindowOps`), so this needs no new dependency and works over
+/// SSH too, which a clipboard *tool* wouldn't. Mouse-drag copy still
+/// works via Shift+select (see `run_chat_tui`'s doc comment) -- this is
+/// for `/copy`, a one-keystroke way to grab the last reply without
+/// having to select it at all.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    print!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let _ = std::io::stdout().flush();
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(b2 & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -1020,6 +1217,7 @@ fn apply(state: &mut ChatState, ev: ChatEvent) {
             state.checkpoint_session = Some(id);
         }
         ChatEvent::Plan(steps) => state.plan = steps,
+        ChatEvent::ContextChars(n) => state.context_extra += n,
         ChatEvent::Confirm(_tool, action, reply) => {
             state.transcript.push(TLine::Confirm(action));
             state.pending_confirm = Some(reply);
@@ -1066,6 +1264,8 @@ const PLAIN_COMMANDS: &[(&str, &str)] = &[
     ("/mode", "cycle manual/semi-auto/auto"),
     ("/checkpoints", "list checkpoint sessions"),
     ("/rollback", "undo file changes from a session"),
+    ("/copy", "copy the last reply to your system clipboard"),
+    ("/export", "save the conversation as Markdown"),
     ("/help", "keybindings and commands"),
     ("/exit", "quit"),
 ];
@@ -1194,18 +1394,42 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
     rows
 }
 
+/// A rough (chars/4-as-tokens) estimate of how much of `num_ctx` the
+/// current session is using -- real tokenization varies by model and
+/// language, so this is deliberately presented as "~N%", not an exact
+/// figure. Sums what's visibly in the transcript (questions, replies,
+/// and tool call/result text, which does count against the model's
+/// context same as anything else) plus `context_extra`, the one-time
+/// retrieved-context dump that never appears in the transcript itself.
+fn estimate_context_chars(state: &ChatState) -> usize {
+    let visible: usize = state
+        .transcript
+        .iter()
+        .map(|l| match l {
+            TLine::You(t) => t.chars().count(),
+            TLine::Agent { text, .. } => text.chars().count(),
+            TLine::Tools(entries) => entries.iter().map(|e| e.call.chars().count() + e.result.as_deref().map(str::len).unwrap_or(0)).sum(),
+            _ => 0,
+        })
+        .sum();
+    visible + state.context_extra
+}
+
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
     let mode_color = match state.mode {
         PermissionMode::Manual => Color::DarkGray,
         PermissionMode::SemiAuto => Color::Yellow,
         PermissionMode::Auto => Color::Red,
     };
+    let pct = ((estimate_context_chars(state) / 4) * 100 / state.num_ctx.max(1)).min(999);
+    let ctx_color = if pct >= 85 { Color::Red } else if pct >= 60 { Color::Yellow } else { Color::DarkGray };
     let line = Line::from(vec![
         Span::styled("GRAVITON", Style::default().fg(state.agent_color).add_modifier(Modifier::BOLD)),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(state.agent.display, Style::default().fg(state.agent_color).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" [{}] ", state.cfg_model), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("[{}]", state.mode.label()), Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("[{}] ", state.mode.label()), Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("[ctx ~{pct}%]"), Style::default().fg(ctx_color)),
         Span::styled("   /help for keys & commands", Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(line), area);
@@ -1779,7 +2003,14 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &ChatState, rows: &[Str
                 // terminal's own cursor -- we never move that (no
                 // `f.set_cursor_position`), so this is the only visible
                 // insertion point there is.
-                let marker = if i == 0 { Span::styled("› ", Style::default().fg(state.user_color)) } else { Span::raw("  ") };
+                let marker = if i != 0 {
+                    Span::raw("  ")
+                } else if let Some(search) = &state.history_search {
+                    let note = if search.match_idx.is_none() && !search.query.is_empty() { " (no match)" } else { "" };
+                    Span::styled(format!("(search: {}){note} ", search.query), Style::default().fg(Color::Yellow))
+                } else {
+                    Span::styled("› ", Style::default().fg(state.user_color))
+                };
                 if i == visible_cursor_row {
                     let chars: Vec<char> = row.chars().collect();
                     let before: String = chars[..cursor_col.min(chars.len())].iter().collect();
@@ -1994,10 +2225,14 @@ mod tests {
 
     #[test]
     fn command_suggestions_lists_plain_commands_while_typing_the_slash() {
-        // "/e" is a prefix of "/exit" only (not "/agent" or "/clear"/"/quit").
-        let matches = command_suggestions("/e", &[]);
+        // "/exi" is a prefix of "/exit" only.
+        let matches = command_suggestions("/exi", &[]);
         assert_eq!(matches.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), vec!["/exit"]);
         assert_eq!(matches[0].complete, "/exit");
+
+        // "/e" is now ambiguous between "/exit" and "/export".
+        let matches = command_suggestions("/e", &[]);
+        assert_eq!(matches.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), vec!["/export", "/exit"]);
     }
 
     #[test]
@@ -2153,6 +2388,9 @@ mod tests {
             history: Vec::new(),
             history_cursor: None,
             history_draft: Vec::new(),
+            history_search: None,
+            context_extra: 0,
+            num_ctx: 8192,
         }
     }
 
@@ -2189,5 +2427,59 @@ mod tests {
         state.input = chars("untouched");
         history_next(&mut state);
         assert_eq!(state.input.iter().collect::<String>(), "untouched");
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        // RFC 4648 test vectors, including the padding cases.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn history_search_update_finds_the_most_recent_matching_entry() {
+        let mut state = test_state();
+        state.history = vec!["fix the parser".to_string(), "add tests".to_string(), "fix the lexer".to_string()];
+        state.history_search = Some(HistorySearch { query: "fix".to_string(), match_idx: None });
+        history_search_update(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "fix the lexer");
+        assert_eq!(state.history_search.unwrap().match_idx, Some(2));
+    }
+
+    #[test]
+    fn history_search_update_reports_no_match() {
+        let mut state = test_state();
+        state.history = vec!["add tests".to_string()];
+        state.history_search = Some(HistorySearch { query: "zzz".to_string(), match_idx: None });
+        history_search_update(&mut state);
+        assert!(state.input.is_empty());
+        assert_eq!(state.history_search.unwrap().match_idx, None);
+    }
+
+    #[test]
+    fn history_search_next_older_cycles_to_the_previous_match() {
+        let mut state = test_state();
+        state.history = vec!["fix the parser".to_string(), "add tests".to_string(), "fix the lexer".to_string()];
+        state.history_search = Some(HistorySearch { query: "fix".to_string(), match_idx: None });
+        history_search_update(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "fix the lexer");
+        history_search_next_older(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "fix the parser");
+        // No older match left -- stays put rather than wrapping or panicking.
+        history_search_next_older(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "fix the parser");
+    }
+
+    #[test]
+    fn estimate_context_chars_sums_transcript_text_plus_the_hidden_dump() {
+        let mut state = test_state();
+        state.context_extra = 100;
+        state.transcript.push(TLine::You("hello".to_string())); // 5
+        state.transcript.push(TLine::Agent { label: "A".to_string(), text: "world!".to_string() }); // 6
+        state.transcript.push(TLine::Tools(vec![ToolEntry { name: "x".to_string(), call: "abcd".to_string(), result: Some("ef".to_string()) }])); // 4+2
+        assert_eq!(estimate_context_chars(&state), 100 + 5 + 6 + 4 + 2);
     }
 }
