@@ -212,7 +212,7 @@ impl RunIo for ChannelIo {
         self.status.lock().unwrap().checkpoint_id = Some(id.to_string());
     }
 
-    fn confirm(&self, auto_approve: bool, action: String) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
+    fn confirm(&self, auto_approve: bool, _tool: &str, action: String) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
         Box::pin(async move {
             if auto_approve {
                 return Decision::Allow;

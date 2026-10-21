@@ -15,8 +15,9 @@
 //! a long streamed reply silently scrolled off-screen — see the
 //! `visible_rows` doc comment below for the fix).
 
-use crate::agentic;
+use crate::agentic::{self, Decision};
 use crate::agents::{AgentSpec, ALL_AGENTS};
+use crate::run_io::RunIo;
 use crate::{build_context_sync, finish_context, open_or_init_repo_db, repo_root, resolve_agent};
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -26,16 +27,18 @@ use crossterm::event::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
 use graviton_core::Config;
-use graviton_llm::{ChatMessage, OllamaClient};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
+use std::future::Future;
 use std::io::Stdout;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// One rendered row of the transcript. The in-progress agent reply is
 /// the last `Agent` entry while `waiting` is true — tokens are appended
@@ -57,7 +60,21 @@ enum TLine {
     /// a file, search, read another) ends up as one collapsible group
     /// instead of a wall of `→`/`←` lines.
     Tools(Vec<ToolEntry>),
+    /// A line from `agentic::run`'s `io.emit` (checkpoint banners,
+    /// plan updates, the step-limit warning, ...) -- ANSI-stripped,
+    /// since those calls format for a raw terminal and a literal
+    /// escape byte would otherwise show up as garbage in a `Span`.
     Sys(String),
+    /// A gated action (write/edit/delete/shell/commit/recon) waiting on
+    /// a decision in Manual or Semi-automatic mode -- the action text
+    /// (already ANSI-stripped, a diff preview for a write/edit) is
+    /// rendered multi-line, never word-wrapped across its own line
+    /// breaks (see `push_multiline`), so a diff stays readable.
+    Confirm(String),
+    /// The agent's `ask_user` tool -- a question with a fixed, numbered
+    /// set of options, answered the same way `grv run`'s terminal
+    /// prompt always has: type the number(s), or "all", Enter.
+    Choice(String),
     Err(String),
 }
 
@@ -72,14 +89,62 @@ enum ChatEvent {
     Thinking(String),
     ToolCall(String, serde_json::Value),
     ToolResult(String),
-    Done(Vec<ChatMessage>),
+    /// `agentic::run`'s `io.emit` -- plan/checkpoint/step-limit lines.
+    Emit(String),
+    /// `io.note_checkpoint_id` -- the session id this turn is (now)
+    /// running under, saved so the *next* turn resumes the same
+    /// checkpoint-backed conversation instead of starting fresh.
+    CheckpointId(String),
+    /// A gated action needs a decision -- `(tool, action, reply)`.
+    Confirm(String, String, oneshot::Sender<Decision>),
+    /// `ask_user` needs an answer -- `(question, options, multi_select, reply)`.
+    Choice(String, Vec<String>, bool, oneshot::Sender<Vec<String>>),
+    Done,
     Error(String),
+}
+
+/// Manual (ask every gated action, like `grv run` without `--yolo`),
+/// Auto (approve everything, like `--yolo`), or Semi-automatic
+/// (auto-accept `write_file`/`edit_file` -- checkpointed and
+/// rollback-able either way -- but still ask before anything that runs
+/// a command, deletes a file, or touches version control). Cycled with
+/// Ctrl+T or set with `/mode manual|semi-auto|auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionMode {
+    Manual,
+    SemiAuto,
+    Auto,
+}
+
+impl PermissionMode {
+    fn label(self) -> &'static str {
+        match self {
+            PermissionMode::Manual => "manual",
+            PermissionMode::SemiAuto => "semi-auto",
+            PermissionMode::Auto => "auto",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            PermissionMode::Manual => PermissionMode::SemiAuto,
+            PermissionMode::SemiAuto => PermissionMode::Auto,
+            PermissionMode::Auto => PermissionMode::Manual,
+        }
+    }
+}
+
+/// A pending `ask_user` call -- kept until `state.input` (typed the
+/// same way a confirm's y/n/redirect is) resolves it.
+struct PendingChoice {
+    options: Vec<String>,
+    multi: bool,
+    reply: oneshot::Sender<Vec<String>>,
 }
 
 struct ChatState {
     agent: &'static AgentSpec,
     cfg_model: String,
-    messages: Vec<ChatMessage>,
     transcript: Vec<TLine>,
     /// Chars, not a `String` -- `cursor` is a char index, and inserting/
     /// removing at an arbitrary position needs `Vec::insert`/`remove`
@@ -89,6 +154,10 @@ struct ChatState {
     cursor: usize,
     waiting: bool,
     waiting_since: Instant,
+    /// The in-flight turn's task, so Esc-while-waiting can cancel just
+    /// this turn (`.abort()`) instead of the only other option being to
+    /// quit the whole app.
+    current_task: Option<tokio::task::AbortHandle>,
     /// Rows scrolled back from the live bottom. 0 = pinned to the
     /// newest content (auto-follows as tokens stream in); any other
     /// value freezes the view there until the user scrolls back down
@@ -112,13 +181,28 @@ struct ChatState {
     agent_color: Color,
     /// A message typed and submitted *while the previous one was still
     /// generating* -- queued here instead of sent immediately (the
-    /// request loop isn't reentrant: one spawned task owns `messages`
-    /// for the duration of a turn), then auto-submitted the moment
-    /// `ChatEvent::Done`/`Error` clears `waiting`. Typing itself was
-    /// never blocked on `waiting` to begin with (see `drive`) -- only
-    /// submitting was, so you can draft, edit, or even switch agents
-    /// with `/agent` mid-generation without losing anything you typed.
+    /// request loop isn't reentrant: one spawned task owns the
+    /// checkpoint-backed conversation for the duration of a turn), then
+    /// auto-submitted the moment `ChatEvent::Done`/`Error` clears
+    /// `waiting`. Typing itself was never blocked on `waiting` to begin
+    /// with (see `drive`) -- only submitting was, so you can draft,
+    /// edit, or even switch agents with `/agent` mid-generation without
+    /// losing anything you typed.
     queued: Option<String>,
+    /// `agentic::run`'s checkpoint session id -- `None` starts a fresh
+    /// one; `Some` resumes it, the same multi-turn-conversation
+    /// mechanism `grv run --continue` uses, so the chat's own history
+    /// lives in `.graviton`'s checkpoint store, not just in memory.
+    /// Seeded from `grv --resume <id>` at startup; cleared by `/clear`
+    /// or `/agent` (a real topic/agent change starts a new session).
+    checkpoint_session: Option<String>,
+    mode: PermissionMode,
+    /// A gated action is waiting on y/n/a redirect note, typed into the
+    /// ordinary input box and resolved on Enter (Esc denies). Takes
+    /// priority over every other Enter/Esc meaning while set.
+    pending_confirm: Option<oneshot::Sender<Decision>>,
+    /// An `ask_user` call waiting on a number (or "all"), same idea.
+    pending_choice: Option<PendingChoice>,
     should_quit: bool,
 }
 
@@ -138,26 +222,29 @@ fn theme_color(hex: Option<&str>, default: Color) -> Color {
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-pub async fn run_chat_tui(cfg: &Config) -> Result<()> {
+pub async fn run_chat_tui(cfg: &Config, resume: Option<String>) -> Result<()> {
     let root = repo_root()?;
-    let client = OllamaClient::new(&cfg.ollama_host);
     let agent = resolve_agent("architect")?;
 
     let mut state = ChatState {
         agent,
         cfg_model: cfg.model_for(agent.tier, agent.key).to_string(),
-        messages: vec![ChatMessage::system(agent.base_prompt())],
         transcript: Vec::new(),
         input: Vec::new(),
         cursor: 0,
         waiting: false,
         waiting_since: Instant::now(),
+        current_task: None,
         scroll: 0,
         tools_expanded: false,
         suggestion_idx: 0,
         user_color: theme_color(cfg.tui_user_color.as_deref(), Color::Cyan),
         agent_color: theme_color(cfg.tui_agent_color.as_deref(), Color::Magenta),
         queued: None,
+        checkpoint_session: resume,
+        mode: PermissionMode::Manual,
+        pending_confirm: None,
+        pending_choice: None,
         should_quit: false,
     };
 
@@ -180,21 +267,25 @@ pub async fn run_chat_tui(cfg: &Config) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
     terminal.clear().ok();
 
-    let result = drive(&mut terminal, &mut state, cfg, &client, &root).await;
+    let result = drive(&mut terminal, &mut state, cfg, &root).await;
+    let session = state.checkpoint_session.clone();
 
     disable_raw_mode().ok();
     crossterm::execute!(terminal.backend_mut(), DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
+
+    // The whole point of the checkpoint-backed session surviving past
+    // this process: quitting (Ctrl+C, Esc, /exit) doesn't have to mean
+    // losing the conversation. Printed after leaving the alternate
+    // screen, to the real terminal scrollback, so it's still visible
+    // once the TUI is gone.
+    if let Some(id) = session {
+        println!("session {id} saved — resume with `grv --resume {id}` (or `grv run --continue {id}` for a one-shot task)");
+    }
     result
 }
 
-async fn drive(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    state: &mut ChatState,
-    cfg: &Config,
-    client: &OllamaClient,
-    root: &std::path::Path,
-) -> Result<()> {
+async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut ChatState, cfg: &Config, root: &std::path::Path) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -211,29 +302,85 @@ async fn drive(
                 let Some(Ok(ev)) = maybe_ev else { continue };
                 match ev {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // A gated action or an ask_user call takes over
+                        // Enter/Esc completely -- it's answered through
+                        // the same input box (y/n/a redirect note; a
+                        // number or "all"), but it isn't a *message*, so
+                        // it must resolve before anything else (the
+                        // autocomplete popup, queuing, quitting) gets a
+                        // say in what Enter/Esc do.
+                        let confirm_active = state.pending_confirm.is_some();
+                        let choice_active = state.pending_choice.is_some();
+
                         // The autocomplete popup, when showing, steals
                         // Up/Down/Tab/Enter/Esc for its own navigation --
                         // computed fresh from the current input on every
                         // keystroke, never stored, so there's nothing to
-                        // go stale.
-                        // Typing, editing, and the autocomplete popup all
-                        // work regardless of `waiting` -- only *sending*
-                        // is gated on it (the request loop isn't
-                        // reentrant), and that's handled below by
-                        // queuing instead of refusing the keystroke.
+                        // go stale. Suppressed while answering a
+                        // confirm/choice -- that answer is never a
+                        // command.
                         let input_text: String = state.input.iter().collect();
-                        let suggestions = command_suggestions(&input_text);
+                        let suggestions = if confirm_active || choice_active { Vec::new() } else { command_suggestions(&input_text) };
                         let popup_active = !suggestions.is_empty();
                         if popup_active {
                             state.suggestion_idx = state.suggestion_idx.min(suggestions.len() - 1);
                         }
 
-                        if key.code == KeyCode::Esc && state.queued.is_some() {
+                        if confirm_active && key.code == KeyCode::Enter {
+                            let line: String = state.input.iter().collect::<String>().trim().to_string();
+                            state.input.clear();
+                            state.cursor = 0;
+                            if let Some(reply) = state.pending_confirm.take() {
+                                let _ = reply.send(parse_confirm_answer(&line));
+                            }
+                        } else if confirm_active && key.code == KeyCode::Esc {
+                            state.input.clear();
+                            state.cursor = 0;
+                            if let Some(reply) = state.pending_confirm.take() {
+                                let _ = reply.send(Decision::Deny);
+                            }
+                        } else if choice_active && key.code == KeyCode::Enter {
+                            let line: String = state.input.iter().collect::<String>().trim().to_string();
+                            state.input.clear();
+                            state.cursor = 0;
+                            if let Some(pending) = state.pending_choice.take() {
+                                let picked = parse_choice_answer(&line, &pending.options, pending.multi);
+                                let _ = pending.reply.send(picked);
+                            }
+                        } else if choice_active && key.code == KeyCode::Esc {
+                            state.input.clear();
+                            state.cursor = 0;
+                            if let Some(pending) = state.pending_choice.take() {
+                                let _ = pending.reply.send(Vec::new());
+                            }
+                        } else if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            state.mode = state.mode.next();
+                            state.transcript.push(TLine::Sys(format!("(permission mode: {})", state.mode.label())));
+                        } else if key.code == KeyCode::Esc && state.queued.is_some() {
                             state.queued = None;
                         } else if popup_active && key.code == KeyCode::Esc {
                             state.input.clear();
                             state.cursor = 0;
+                        } else if key.code == KeyCode::Esc && state.waiting {
+                            // Esc while a turn is actually running cancels
+                            // *that turn* -- the app and the checkpoint
+                            // session underneath it stay alive, same as
+                            // Ctrl+C has always meant "stop this agent"
+                            // for `grv run`, just without also closing
+                            // the chat. Ctrl+C (below) still always means
+                            // quit.
+                            if let Some(h) = state.current_task.take() {
+                                h.abort();
+                            }
+                            state.pending_confirm = None;
+                            state.pending_choice = None;
+                            state.queued = None;
+                            state.waiting = false;
+                            state.transcript.push(TLine::Sys("(cancelled)".into()));
                         } else if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+                            if let Some(h) = state.current_task.take() {
+                                h.abort();
+                            }
                             state.should_quit = true;
                         } else if popup_active && key.code == KeyCode::Up {
                             state.suggestion_idx = state.suggestion_idx.saturating_sub(1);
@@ -252,7 +399,7 @@ async fn drive(
                             // ready to keep typing instead of queuing/
                             // sending a bare "/agent" question.
                             if complete != "/agent " {
-                                submit_or_queue(state, cfg, client, root, &tx);
+                                submit_or_queue(state, cfg, root, &tx);
                             }
                         } else {
                             match key.code {
@@ -277,7 +424,7 @@ async fn drive(
                                     state.input.insert(state.cursor, '\n');
                                     state.cursor += 1;
                                 }
-                                KeyCode::Enter => submit_or_queue(state, cfg, client, root, &tx),
+                                KeyCode::Enter => submit_or_queue(state, cfg, root, &tx),
                                 KeyCode::Backspace => {
                                     if state.cursor > 0 {
                                         state.cursor -= 1;
@@ -335,7 +482,7 @@ async fn drive(
                     if let Some(line) = state.queued.take() {
                         state.input = line.chars().collect();
                         state.cursor = state.input.len();
-                        submit(state, cfg, client, root, &tx);
+                        submit(state, cfg, root, &tx);
                     }
                 }
             }
@@ -350,15 +497,15 @@ async fn drive(
 }
 
 /// Enter's actual handler: submit right away if nothing's in flight,
-/// otherwise queue -- the request loop owns `messages`/the model
-/// connection for the duration of one turn, so a second one can't run
+/// otherwise queue -- the request loop owns the checkpoint-backed
+/// conversation for the duration of one turn, so a second one can't run
 /// concurrently, but there's no reason typing or *sending* the next
 /// question has to wait for that, any more than Claude Code makes you
 /// wait to queue up a follow-up. `drive`'s `ChatEvent::Done`/`Error`
 /// handling flushes the queue the instant `waiting` clears.
-fn submit_or_queue(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std::path::Path, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn submit_or_queue(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc::UnboundedSender<ChatEvent>) {
     if !state.waiting {
-        submit(state, cfg, client, root, tx);
+        submit(state, cfg, root, tx);
         return;
     }
     let line: String = state.input.iter().collect::<String>().trim().to_string();
@@ -369,7 +516,7 @@ fn submit_or_queue(state: &mut ChatState, cfg: &Config, client: &OllamaClient, r
     }
 }
 
-fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std::path::Path, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc::UnboundedSender<ChatEvent>) {
     let line: String = state.input.iter().collect::<String>().trim().to_string();
     state.input.clear();
     state.cursor = 0;
@@ -381,9 +528,27 @@ fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std
         return;
     }
     if line == "/clear" {
-        state.messages = vec![ChatMessage::system(state.agent.base_prompt())];
         state.transcript.push(TLine::Sys("(conversation cleared)".into()));
+        state.checkpoint_session = None;
         state.scroll = 0;
+        return;
+    }
+    if let Some(name) = line.strip_prefix("/mode") {
+        let name = name.trim();
+        let picked = match name {
+            "" => Some(state.mode.next()),
+            "manual" => Some(PermissionMode::Manual),
+            "semi-auto" | "semi" => Some(PermissionMode::SemiAuto),
+            "auto" => Some(PermissionMode::Auto),
+            _ => None,
+        };
+        match picked {
+            Some(m) => {
+                state.mode = m;
+                state.transcript.push(TLine::Sys(format!("(permission mode: {})", state.mode.label())));
+            }
+            None => state.transcript.push(TLine::Err(format!("unknown mode '{name}' — manual, semi-auto, or auto"))),
+        }
         return;
     }
     if let Some(key) = line.strip_prefix("/agent ") {
@@ -391,7 +556,7 @@ fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std
             Ok(a) => {
                 state.agent = a;
                 state.cfg_model = cfg.model_for(a.tier, a.key).to_string();
-                state.messages = vec![ChatMessage::system(a.base_prompt())];
+                state.checkpoint_session = None;
                 state.transcript.push(TLine::Sys(format!("(switched to {} — conversation reset)", a.display)));
             }
             Err(e) => state.transcript.push(TLine::Err(format!("{e:#}"))),
@@ -407,56 +572,164 @@ fn submit(state: &mut ChatState, cfg: &Config, client: &OllamaClient, root: &std
     // to reread earlier history -- jump back to live.
     state.scroll = 0;
 
-    let client = client.clone();
     let cfg = cfg.clone();
     let root = root.to_path_buf();
-    let model = cfg.model_for(state.agent.tier, state.agent.key).to_string();
-    let mut local_messages = state.messages.clone();
-    let tx = tx.clone();
+    let agent = state.agent;
+    let mode = state.mode;
+    let resume_session = state.checkpoint_session.clone();
+    let tx2 = tx.clone();
 
-    tokio::spawn(async move {
-        let outcome: Result<Vec<ChatMessage>> = async {
-            let conn = open_or_init_repo_db(&cfg, &root)?;
-            let (groups, semantic_src) = build_context_sync(&cfg, &root, &conn, &line, &[])?;
-            drop(conn);
-            let context_text = finish_context(&cfg, &line, groups, semantic_src).await?;
-            let user_msg = if context_text.is_empty() {
-                line.clone()
+    let handle = tokio::spawn(async move {
+        let io: Arc<dyn RunIo> = Arc::new(TuiIo { tx: tx2.clone(), mode });
+        let outcome: Result<()> = async {
+            // Mirrors `cmd_run`: context is only built for a fresh
+            // session -- a resumed one's restored transcript already
+            // has the original question's context in it.
+            let initial_context = if resume_session.is_none() {
+                let conn = open_or_init_repo_db(&cfg, &root)?;
+                let (groups, semantic_src) = build_context_sync(&cfg, &root, &conn, &line, &[])?;
+                drop(conn);
+                Some(finish_context(&cfg, &line, groups, semantic_src).await?)
             } else {
-                format!("Question: {line}\n\nRetrieved context:\n{context_text}")
+                None
             };
-            local_messages.push(ChatMessage::user(user_msg));
-
-            let tx_tok = tx.clone();
-            let on_token = move |tok: &str| {
-                let _ = tx_tok.send(ChatEvent::Token(tok.to_string()));
-            };
-            let tx_think = tx.clone();
-            let on_thinking = move |tok: &str| {
-                let _ = tx_think.send(ChatEvent::Thinking(tok.to_string()));
-            };
-            let tx_tool = tx.clone();
-            let on_tool_call = move |name: &str, args: &serde_json::Value| {
-                let _ = tx_tool.send(ChatEvent::ToolCall(name.to_string(), args.clone()));
-            };
-            let tx_res = tx.clone();
-            let on_tool_result = move |_name: &str, out: &str| {
-                let _ = tx_res.send(ChatEvent::ToolResult(agentic::tool_result_preview(out)));
-            };
-            agentic::run_read_only_loop_on(&client, &cfg, &root, &model, &mut local_messages, on_token, on_thinking, on_tool_call, on_tool_result).await?;
-            Ok(local_messages)
+            let loop_cfg = agentic::AgentLoopConfig { auto_approve: mode == PermissionMode::Auto, enable_browser: false };
+            agentic::run(&cfg, &root, agent, &line, initial_context, loop_cfg, resume_session, io).await
         }
         .await;
 
         match outcome {
-            Ok(msgs) => {
-                let _ = tx.send(ChatEvent::Done(msgs));
+            Ok(()) => {
+                let _ = tx2.send(ChatEvent::Done);
             }
             Err(e) => {
-                let _ = tx.send(ChatEvent::Error(format!("{e:#}")));
+                let _ = tx2.send(ChatEvent::Error(format!("{e:#}")));
             }
         }
     });
+    state.current_task = Some(handle.abort_handle());
+}
+
+/// Strips `ESC [ ... <letter>` CSI sequences -- the only ANSI
+/// `agentic::run`'s `io.emit`/action-description text ever produces
+/// (color/style codes for a raw terminal) -- so it renders as plain
+/// text instead of literal escape bytes once it's a ratatui `Span`.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            while let Some(c2) = chars.next() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `y`/`yes` allows, empty/`n`/`no` denies, anything else redirects the
+/// agent with that text as a note -- the exact same three-way parse
+/// `run_io::TerminalIo::confirm` has always used for `grv run`'s
+/// terminal prompt, reused here so the chat TUI's confirm answers mean
+/// the same thing.
+fn parse_confirm_answer(line: &str) -> Decision {
+    match line {
+        "y" | "Y" | "yes" | "Yes" => Decision::Allow,
+        "" | "n" | "N" | "no" | "No" => Decision::Deny,
+        other => Decision::Redirect(other.to_string()),
+    }
+}
+
+/// `"all"` (multi-select only) picks everything; otherwise a
+/// comma-separated list of 1-based option numbers, out-of-range or
+/// non-numeric entries silently dropped -- same parse
+/// `run_io::TerminalIo::ask_choice` uses for `grv run`'s terminal prompt.
+fn parse_choice_answer(line: &str, options: &[String], multi: bool) -> Vec<String> {
+    if multi && line.eq_ignore_ascii_case("all") {
+        return options.to_vec();
+    }
+    let mut picked = Vec::new();
+    for tok in line.split(',') {
+        if let Ok(n) = tok.trim().parse::<usize>() {
+            if n >= 1 && n <= options.len() {
+                picked.push(options[n - 1].clone());
+            }
+        }
+        if !multi {
+            break;
+        }
+    }
+    picked
+}
+
+/// Drives `agentic::run` from the chat TUI: `emit`/tool-call/thinking/
+/// token output all become `ChatEvent`s on the same channel the model's
+/// answer tokens already use; `confirm`/`ask_choice` round-trip through
+/// a fresh `oneshot` per call instead of blocking stdin the way
+/// `TerminalIo` does, since nothing here can block the UI task.
+struct TuiIo {
+    tx: mpsc::UnboundedSender<ChatEvent>,
+    mode: PermissionMode,
+}
+
+impl RunIo for TuiIo {
+    fn emit(&self, line: String) {
+        let stripped = strip_ansi(&line);
+        if !stripped.trim().is_empty() {
+            let _ = self.tx.send(ChatEvent::Emit(stripped));
+        }
+    }
+
+    fn on_token(&self, tok: &str) {
+        let _ = self.tx.send(ChatEvent::Token(tok.to_string()));
+    }
+
+    fn on_thinking(&self, tok: &str) {
+        let _ = self.tx.send(ChatEvent::Thinking(tok.to_string()));
+    }
+
+    fn on_tool_call(&self, name: &str, args: &serde_json::Value) {
+        let _ = self.tx.send(ChatEvent::ToolCall(name.to_string(), args.clone()));
+    }
+
+    fn on_tool_result(&self, _name: &str, result: &str) {
+        let _ = self.tx.send(ChatEvent::ToolResult(strip_ansi(result)));
+    }
+
+    fn note_checkpoint_id(&self, id: &str) {
+        let _ = self.tx.send(ChatEvent::CheckpointId(id.to_string()));
+    }
+
+    fn confirm(&self, _auto_approve: bool, tool: &str, action: String) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
+        let tool = tool.to_string();
+        let tx = self.tx.clone();
+        let mode = self.mode;
+        Box::pin(async move {
+            match mode {
+                PermissionMode::Auto => Decision::Allow,
+                PermissionMode::SemiAuto if matches!(tool.as_str(), "write_file" | "edit_file") => Decision::Allow,
+                _ => {
+                    let (reply, rx) = oneshot::channel();
+                    let _ = tx.send(ChatEvent::Confirm(tool, strip_ansi(&action), reply));
+                    rx.await.unwrap_or(Decision::Deny)
+                }
+            }
+        })
+    }
+
+    fn ask_choice(&self, question: String, options: Vec<String>, multi_select: bool) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            let (reply, rx) = oneshot::channel();
+            let _ = tx.send(ChatEvent::Choice(question, options, multi_select, reply));
+            rx.await.unwrap_or_default()
+        })
+    }
 }
 
 /// Pretty one-line call signature instead of a raw JSON blob: `read_file(path: "src/main.rs")`.
@@ -514,13 +787,28 @@ fn apply(state: &mut ChatState, ev: ChatEvent) {
                 }
             }
         }
-        ChatEvent::Done(messages) => {
-            state.messages = messages;
+        ChatEvent::Emit(line) => state.transcript.push(TLine::Sys(line)),
+        ChatEvent::CheckpointId(id) => state.checkpoint_session = Some(id),
+        ChatEvent::Confirm(_tool, action, reply) => {
+            state.transcript.push(TLine::Confirm(action));
+            state.pending_confirm = Some(reply);
+        }
+        ChatEvent::Choice(question, options, multi, reply) => {
+            let mut block = question;
+            for (i, opt) in options.iter().enumerate() {
+                block.push_str(&format!("\n  [{}] {opt}", i + 1));
+            }
+            state.transcript.push(TLine::Choice(block));
+            state.pending_choice = Some(PendingChoice { options, multi, reply });
+        }
+        ChatEvent::Done => {
             state.waiting = false;
+            state.current_task = None;
         }
         ChatEvent::Error(e) => {
             state.transcript.push(TLine::Err(e));
             state.waiting = false;
+            state.current_task = None;
         }
     }
 }
@@ -542,7 +830,7 @@ struct Suggestion {
 /// keep for anyone's muscle memory from other tools) but isn't listed
 /// here -- two entries that do the exact same thing was the duplicate
 /// the autocomplete popup didn't need to show.
-const PLAIN_COMMANDS: &[(&str, &str)] = &[("/clear", "reset the conversation"), ("/exit", "quit")];
+const PLAIN_COMMANDS: &[(&str, &str)] = &[("/clear", "reset the conversation"), ("/mode", "cycle manual/semi-auto/auto"), ("/exit", "quit")];
 
 /// Autocomplete candidates for the current input, or empty if it
 /// doesn't look like a command at all. Three cases:
@@ -564,6 +852,22 @@ fn command_suggestions(input: &str) -> Vec<Suggestion> {
             .iter()
             .filter(|a| a.key.to_lowercase().contains(&query) || a.display.to_lowercase().contains(&query))
             .map(|a| Suggestion { label: a.key.to_string(), description: a.tagline.to_string(), complete: format!("/agent {} ", a.key) })
+            .collect();
+    }
+    if let Some(rest) = input.strip_prefix("/mode") {
+        if !rest.is_empty() && !rest.starts_with(' ') {
+            return Vec::new();
+        }
+        let query = rest.trim_start().to_lowercase();
+        const MODES: &[(&str, &str)] = &[
+            ("manual", "ask before every write/edit/delete/shell/commit"),
+            ("semi-auto", "auto-accept writes/edits, still ask for shell/delete/commit"),
+            ("auto", "approve everything automatically"),
+        ];
+        return MODES
+            .iter()
+            .filter(|(name, _)| name.starts_with(&query))
+            .map(|(name, desc)| Suggestion { label: name.to_string(), description: desc.to_string(), complete: format!("/mode {name}") })
             .collect();
     }
     if input.starts_with('/') && !input.contains(' ') {
@@ -590,12 +894,17 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
     // transcript's own prefixes.
     let wrap_width = inner_width.saturating_sub(2).max(5);
     let (input_rows, cursor_row, cursor_col) = wrap_input_for_display(&state.input, state.cursor, wrap_width);
-    // While waiting, row 1 is always the spinner status; a draft typed
-    // for the *next* question (queued on Enter, not sent) gets its own
-    // rows below it instead of being hidden until the current reply
+    // A gated action or ask_user call is answered through this same box
+    // (y/n/a redirect note; a number or "all") -- show the ordinary
+    // editable input then, even though `waiting` is still technically
+    // true (the turn is paused on this answer, not finished).
+    let show_spinner = state.waiting && state.pending_confirm.is_none() && state.pending_choice.is_none();
+    // While the spinner's showing, row 1 is always its status; a draft
+    // typed for the *next* question (queued on Enter, not sent) gets its
+    // own rows below it instead of being hidden until the current reply
     // finishes -- otherwise unlocking typing during `waiting` would let
     // you type into a box that visibly shows nothing back.
-    let visible_input_rows = if state.waiting {
+    let visible_input_rows = if show_spinner {
         1 + if state.input.is_empty() { 0 } else { input_rows.len().min(5) }
     } else {
         input_rows.len().min(6)
@@ -609,30 +918,39 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
 
     draw_header(f, chunks[0], state);
     let rows = draw_transcript(f, chunks[1], state);
-    draw_input(f, chunks[2], state, &input_rows, cursor_row, cursor_col);
+    draw_input(f, chunks[2], state, &input_rows, cursor_row, cursor_col, show_spinner);
 
     // Not gated on `waiting` -- typing (including `/agent ...`) and the
     // popup it drives work the same whether a previous question is
     // still generating or not (see `drive`'s key handling and
     // `ChatState::queued`); gating the *rendering* here while that
     // logic stayed live was exactly the mismatch that made it look
-    // broken -- the popup is invisible, but it's using the keys.
-    let input_text: String = state.input.iter().collect();
-    let suggestions = command_suggestions(&input_text);
-    if !suggestions.is_empty() {
-        draw_command_popup(f, chunks[2], state, &suggestions);
+    // broken -- the popup is invisible, but it's using the keys. It's
+    // suppressed while answering a confirm/choice, same as in `drive`.
+    if state.pending_confirm.is_none() && state.pending_choice.is_none() {
+        let input_text: String = state.input.iter().collect();
+        let suggestions = command_suggestions(&input_text);
+        if !suggestions.is_empty() {
+            draw_command_popup(f, chunks[2], state, &suggestions);
+        }
     }
     rows
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
+    let mode_color = match state.mode {
+        PermissionMode::Manual => Color::DarkGray,
+        PermissionMode::SemiAuto => Color::Yellow,
+        PermissionMode::Auto => Color::Red,
+    };
     let line = Line::from(vec![
         Span::styled("GRAVITON", Style::default().fg(state.agent_color).add_modifier(Modifier::BOLD)),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(state.agent.display, Style::default().fg(state.agent_color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" [{}]", state.cfg_model), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" [{}] ", state.cfg_model), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("[{}]", state.mode.label()), Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
         Span::styled(
-            "   /agent switch · /clear reset · ↑↓ PgUp/PgDn scroll · Tab tools · Alt+Enter newline · Esc quit",
+            "   /agent switch · /mode · Ctrl+T cycle mode · Esc cancel/quit · Ctrl+C quit",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -710,6 +1028,20 @@ fn push_wrapped(out: &mut Vec<Line<'static>>, width: usize, prefix: Option<(Stri
         } else {
             out.push(Line::from(Span::styled(row.to_string(), body_style)));
         }
+    }
+}
+
+/// Renders text that must keep its own line breaks -- a diff preview,
+/// numbered options -- as one `push_wrapped` call per original line
+/// instead of one call over the whole string. `push_wrapped` word-wraps
+/// through `textwrap`, which treats a literal `\n` as just more
+/// whitespace to reflow across, so wrapping the text as a single blob
+/// would merge a diff's `+`/`-` lines into paragraphs and make it
+/// unreadable; wrapping only *within* each line (still, if a line is
+/// wider than the panel) keeps the structure intact.
+fn push_multiline(out: &mut Vec<Line<'static>>, width: usize, style: Style, text: &str) {
+    for line in text.split('\n') {
+        push_wrapped(out, width, None, line, style);
     }
 }
 
@@ -950,6 +1282,22 @@ fn wrapped_rows(state: &ChatState, width: usize) -> Vec<Line<'static>> {
                 push_wrapped(&mut out, width, None, s, Style::default().fg(Color::DarkGray));
                 out.push(Line::from(""));
             }
+            TLine::Confirm(action) => {
+                push_wrapped(
+                    &mut out,
+                    width,
+                    None,
+                    "⚠ confirm — y = allow · n = deny · type a note + Enter = redirect",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                );
+                push_multiline(&mut out, width, Style::default().fg(Color::Yellow), action);
+                out.push(Line::from(""));
+            }
+            TLine::Choice(block) => {
+                push_wrapped(&mut out, width, None, "? choose — number(s), or \"all\" + Enter", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                push_multiline(&mut out, width, Style::default().fg(Color::Cyan), block);
+                out.push(Line::from(""));
+            }
             TLine::Err(s) => {
                 push_wrapped(&mut out, width, Some(("error ".into(), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))), s, Style::default().fg(Color::Red));
                 out.push(Line::from(""));
@@ -1039,14 +1387,14 @@ fn wrap_input_for_display(input: &[char], cursor: usize, width: usize) -> (Vec<S
     (rows, cursor_row, cursor_col)
 }
 
-fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &ChatState, rows: &[String], cursor_row: usize, cursor_col: usize) {
-    let border_color = if state.waiting { Color::Yellow } else { Color::DarkGray };
+fn draw_input(f: &mut ratatui::Frame, area: Rect, state: &ChatState, rows: &[String], cursor_row: usize, cursor_col: usize, show_spinner: bool) {
+    let border_color = if show_spinner || state.pending_confirm.is_some() || state.pending_choice.is_some() { Color::Yellow } else { Color::DarkGray };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
 
-    let lines: Vec<Line> = if state.waiting {
+    let lines: Vec<Line> = if show_spinner {
         let frame = SPINNER_FRAMES[(state.waiting_since.elapsed().as_millis() / 120) as usize % SPINNER_FRAMES.len()];
         let mut status = vec![
             Span::styled(format!("{frame} "), Style::default().fg(Color::Yellow)),
@@ -1315,5 +1663,47 @@ mod tests {
         for (cmd, _) in PLAIN_COMMANDS {
             assert!(labels.contains(cmd), "missing {cmd} in {labels:?}");
         }
+    }
+
+    #[test]
+    fn command_suggestions_mode_lists_all_three_and_filters() {
+        let all = command_suggestions("/mode");
+        assert_eq!(all.len(), 3);
+        let semi = command_suggestions("/mode semi");
+        assert_eq!(semi.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), vec!["semi-auto"]);
+        assert_eq!(semi[0].complete, "/mode semi-auto");
+    }
+
+    #[test]
+    fn permission_mode_cycles_through_all_three_and_back() {
+        assert_eq!(PermissionMode::Manual.next(), PermissionMode::SemiAuto);
+        assert_eq!(PermissionMode::SemiAuto.next(), PermissionMode::Auto);
+        assert_eq!(PermissionMode::Auto.next(), PermissionMode::Manual);
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences_but_keeps_the_text() {
+        assert_eq!(strip_ansi("\x1b[1;35mhello\x1b[0m world"), "hello world");
+        assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+        assert_eq!(strip_ansi("\x1b[2m→ write_file(path: \"a.rs\")\x1b[0m"), "→ write_file(path: \"a.rs\")");
+    }
+
+    #[test]
+    fn parse_confirm_answer_matches_terminal_ios_three_way_split() {
+        assert_eq!(parse_confirm_answer("y"), Decision::Allow);
+        assert_eq!(parse_confirm_answer("Yes"), Decision::Allow);
+        assert_eq!(parse_confirm_answer(""), Decision::Deny);
+        assert_eq!(parse_confirm_answer("n"), Decision::Deny);
+        assert!(matches!(parse_confirm_answer("do X instead"), Decision::Redirect(n) if n == "do X instead"));
+    }
+
+    #[test]
+    fn parse_choice_answer_picks_by_number_and_all() {
+        let options = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(parse_choice_answer("2", &options, false), vec!["b".to_string()]);
+        assert_eq!(parse_choice_answer("1,3", &options, true), vec!["a".to_string(), "c".to_string()]);
+        assert_eq!(parse_choice_answer("all", &options, true), options.clone());
+        assert_eq!(parse_choice_answer("9", &options, false), Vec::<String>::new(), "out-of-range number picks nothing");
+        assert_eq!(parse_choice_answer("nope", &options, false), Vec::<String>::new());
     }
 }

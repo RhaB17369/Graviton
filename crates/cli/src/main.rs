@@ -32,6 +32,11 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Command>,
+    /// Bare `grv` only: resume a checkpoint session from a previous chat
+    /// (the id the chat TUI prints on exit, also `grv checkpoints`)
+    /// instead of starting a fresh one.
+    #[arg(long)]
+    resume: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -384,7 +389,7 @@ async fn main() -> Result<()> {
     let cfg = Config::load_or_init()?;
 
     let Some(cmd) = cli.cmd else {
-        return cmd_chat(&cfg).await;
+        return cmd_chat(&cfg, cli.resume).await;
     };
     match cmd {
         Command::Index { path, force, watch } => cmd_index(&cfg, path, force, watch),
@@ -781,8 +786,8 @@ async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &Agen
 /// confirm/checkpoint safety net around it. See `tui.rs` for the actual
 /// screen (persistent input box, scrolling transcript, live spinner) and
 /// `tui::run_chat_tui` for the event loop.
-async fn cmd_chat(cfg: &Config) -> Result<()> {
-    tui::run_chat_tui(cfg).await
+async fn cmd_chat(cfg: &Config, resume: Option<String>) -> Result<()> {
+    tui::run_chat_tui(cfg, resume).await
 }
 
 async fn cmd_crew(cfg: &Config, question: &str, files: Vec<PathBuf>, pipeline: &str) -> Result<()> {

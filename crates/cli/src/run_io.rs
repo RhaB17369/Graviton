@@ -12,6 +12,7 @@
 //! avoids needing for one method).
 
 use crate::agentic::Decision;
+use serde_json::Value;
 use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
@@ -36,6 +37,20 @@ pub trait RunIo: Send + Sync {
     /// (the chat TUI) override this.
     fn on_thinking(&self, _tok: &str) {}
 
+    /// A tool call's invocation, before it runs. Default: the same
+    /// `emit`-formatted "→ name(args)" line `grv run`'s terminal output
+    /// has always had. The chat TUI overrides this to group every call
+    /// from one turn into a single collapsible entry instead.
+    fn on_tool_call(&self, name: &str, args: &Value) {
+        self.emit(format!("\x1b[2m→ {name}({args})\x1b[0m"));
+    }
+
+    /// A tool call's result, already truncated to a sane display size by
+    /// the caller. Default: the same `emit`-formatted "← result" line.
+    fn on_tool_result(&self, _name: &str, result: &str) {
+        self.emit(format!("\x1b[2m← {result}\x1b[0m"));
+    }
+
     /// Once known (right after `checkpoint::Session` is created/reopened),
     /// the session id `grv checkpoints`/`grv rollback`/`grv plan` use.
     /// Default no-op — `TerminalIo` doesn't need it (it's already printed
@@ -45,8 +60,13 @@ pub trait RunIo: Send + Sync {
     /// Ask for a decision on a gated action (a write/edit/delete/shell/
     /// commit/recon/custom-tool call not covered by a permissions.toml
     /// rule). `auto_approve` is `--yolo`'s value, passed through so an
-    /// implementation doesn't need its own copy.
-    fn confirm(&self, auto_approve: bool, action: String) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>>;
+    /// implementation doesn't need its own copy. `tool` is the gate's own
+    /// tool name (`"write_file"`, `"run_shell"`, ...) -- separate from the
+    /// formatted `action` text so an implementation that wants to treat
+    /// tool types differently (the chat TUI's semi-automatic mode:
+    /// auto-accept edits, still ask before a shell command or a delete)
+    /// doesn't have to pattern-match the human-readable string to do it.
+    fn confirm(&self, auto_approve: bool, tool: &str, action: String) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>>;
 
     /// Ask a clarifying question with a fixed set of options (the
     /// `ask_user` tool) — the agent's own version of the AskUserQuestion
@@ -73,7 +93,7 @@ impl RunIo for TerminalIo {
         let _ = lock.flush();
     }
 
-    fn confirm(&self, auto_approve: bool, action: String) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
+    fn confirm(&self, auto_approve: bool, _tool: &str, action: String) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
         Box::pin(async move {
             if auto_approve {
                 return Decision::Allow;

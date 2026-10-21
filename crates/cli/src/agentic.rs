@@ -635,6 +635,7 @@ fn tool_defs(enable_browser: bool, custom: &[CustomTool]) -> Vec<ToolDef> {
 /// instead of only being expressible as a blind yes/no. This only fires at
 /// existing confirmation pauses — a `--yolo` run has none, so it can only
 /// be interrupted with Ctrl-C, which this doesn't change.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
     Allow,
     Deny,
@@ -663,7 +664,7 @@ async fn gate(state: &State, tool: &str, primary_arg: &str, action_desc: &str, d
         permissions::Verdict::Allow => Ok(()),
         permissions::Verdict::Deny(reason) => anyhow::bail!("{declined_msg} — {reason}"),
         permissions::Verdict::Fallback => {
-            let decision = state.io.confirm(state.auto_approve, action_desc.to_string()).await;
+            let decision = state.io.confirm(state.auto_approve, tool, action_desc.to_string()).await;
             require_allowed(decision, declined_msg)
         }
     }
@@ -1192,9 +1193,9 @@ pub async fn run(
         push_and_record(&mut messages, &state, ChatMessage::assistant_tool_calls(clone_tool_calls(&result.tool_calls)));
         for call in &result.tool_calls {
             let name = &call.function.name;
-            io.emit(format!("\x1b[2m→ {name}({})\x1b[0m", call.function.arguments));
+            io.on_tool_call(name, &call.function.arguments);
             let output = dispatch(&mut state, name, &call.function.arguments).await;
-            io.emit(format!("\x1b[2m← {}\x1b[0m", truncate_display(&output)));
+            io.on_tool_result(name, &truncate_display(&output));
             push_and_record(&mut messages, &state, ChatMessage::tool_result(name.clone(), output));
         }
 
