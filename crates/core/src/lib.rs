@@ -78,6 +78,12 @@ pub struct Config {
     pub tui_user_color: Option<String>,
     #[serde(default)]
     pub tui_agent_color: Option<String>,
+    /// The chat TUI's permission mode at startup (`"manual"`,
+    /// `"semi-auto"`, or `"auto"`) -- unset keeps the always-ask default.
+    /// Changing it in-chat (Ctrl+T or `/mode`) only applies for that
+    /// session; this is the hand-edited, persisted default.
+    #[serde(default)]
+    pub tui_default_mode: Option<String>,
 }
 
 impl Default for Config {
@@ -100,6 +106,7 @@ impl Default for Config {
             routing: ModelRouting::default(),
             tui_user_color: None,
             tui_agent_color: None,
+            tui_default_mode: None,
         }
     }
 }
@@ -319,6 +326,9 @@ fn toml_to_string(cfg: &Config) -> Result<String> {
     if let Some(c) = &cfg.tui_agent_color {
         out.push_str(&format!("tui_agent_color = \"{c}\"\n"));
     }
+    if let Some(m) = &cfg.tui_default_mode {
+        out.push_str(&format!("tui_default_mode = \"{m}\"\n"));
+    }
     Ok(out)
 }
 
@@ -347,6 +357,7 @@ fn toml_from_str(raw: &str) -> Result<Config> {
             "index_dir" => cfg.index_dir = value.to_string(),
             "tui_user_color" => cfg.tui_user_color = (!value.is_empty()).then(|| value.to_string()),
             "tui_agent_color" => cfg.tui_agent_color = (!value.is_empty()).then(|| value.to_string()),
+            "tui_default_mode" => cfg.tui_default_mode = (!value.is_empty()).then(|| value.to_string()),
             _ => {}
         }
     }

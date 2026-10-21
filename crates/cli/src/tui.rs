@@ -221,6 +221,24 @@ struct ChatState {
     /// stays visible as a record of what the turn actually did.
     plan: Vec<PlanStep>,
     should_quit: bool,
+    /// Every checkpoint session this process has touched (created via
+    /// `submit`, or loaded via `/resume`/`--resume`), most-recent last --
+    /// what `/resume`'s autocomplete offers, so picking one never
+    /// requires remembering an id from `/checkpoints`. Deliberately not
+    /// a live filesystem scan (that would need threading `root` into the
+    /// render path for every keystroke); a session from a *different*
+    /// `grv` run that this chat never touched simply isn't offered here,
+    /// `/checkpoints` (which does hit the filesystem) is still the full
+    /// list.
+    known_sessions: Vec<String>,
+    /// Previously *sent* questions (not slash-commands), oldest first --
+    /// what ↑/↓ recall. `None` means "showing the live draft", same
+    /// convention a shell's own history uses.
+    history: Vec<String>,
+    history_cursor: Option<usize>,
+    /// The draft that was being typed when history browsing started,
+    /// restored once ↓ walks back past the newest history entry.
+    history_draft: Vec<char>,
 }
 
 /// Parses a 6-digit hex color (no `#`, e.g. `"22d3ee"`) into an RGB
@@ -258,13 +276,25 @@ pub async fn run_chat_tui(cfg: &Config, resume: Option<String>) -> Result<()> {
         user_color: theme_color(cfg.tui_user_color.as_deref(), Color::Cyan),
         agent_color: theme_color(cfg.tui_agent_color.as_deref(), Color::Magenta),
         queued: None,
-        checkpoint_session: resume,
-        mode: PermissionMode::Manual,
+        checkpoint_session: None,
+        mode: match cfg.tui_default_mode.as_deref() {
+            Some("semi-auto") | Some("semi") => PermissionMode::SemiAuto,
+            Some("auto") => PermissionMode::Auto,
+            _ => PermissionMode::Manual,
+        },
         pending_confirm: None,
         pending_choice: None,
         plan: Vec::new(),
         should_quit: false,
+        known_sessions: Vec::new(),
+        history: Vec::new(),
+        history_cursor: None,
+        history_draft: Vec::new(),
     };
+
+    if let Some(id) = resume {
+        load_session_into(&mut state, &root, &id);
+    }
 
     enable_raw_mode().context("enabling raw terminal mode")?;
     let mut stdout = std::io::stdout();
@@ -303,6 +333,108 @@ pub async fn run_chat_tui(cfg: &Config, resume: Option<String>) -> Result<()> {
     result
 }
 
+/// Strips `agentic::run`'s own wrapping back off a stored user turn so
+/// `/resume`/`--resume` replay shows the question that was actually
+/// typed, not its internal framing (see the `format!` calls building
+/// `"Task: ..."`/`"Additional instruction: ..."` in `agentic.rs`). Not
+/// matching either prefix just returns the content as-is -- a cosmetic
+/// heuristic, not a parser that can fail.
+fn extract_question(content: &str) -> String {
+    if let Some(rest) = content.strip_prefix("Task: ") {
+        return rest.split("\n\nRetrieved context:").next().unwrap_or(rest).trim().to_string();
+    }
+    if let Some(rest) = content.strip_prefix("Additional instruction: ") {
+        return rest.trim().to_string();
+    }
+    content.trim().to_string()
+}
+
+/// Switches to a different checkpoint-backed session -- `--resume` at
+/// startup, or `/resume <id>` mid-chat -- replacing whatever's on screen
+/// with that session's own history instead of silently continuing it
+/// off-screen (which is all the old behavior did: the model saw the
+/// restored transcript, the chat never showed it).
+fn load_session_into(state: &mut ChatState, root: &std::path::Path, id: &str) {
+    state.checkpoint_session = Some(id.to_string());
+    state.transcript.clear();
+    state.plan.clear();
+    state.transcript.push(TLine::Sys(format!("(resumed session {id})")));
+    match checkpoint::load_transcript(root, id) {
+        Ok(messages) => {
+            for m in messages {
+                match m.role.as_str() {
+                    "user" => {
+                        let text = extract_question(&m.content);
+                        if !text.is_empty() {
+                            state.transcript.push(TLine::You(text));
+                        }
+                    }
+                    "assistant" if !m.content.trim().is_empty() => {
+                        state.transcript.push(TLine::Agent { label: state.agent.display.to_string(), text: m.content });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(e) => state.transcript.push(TLine::Err(format!("{e:#}"))),
+    }
+    if let Ok(Some(plan)) = checkpoint::load_plan(root, id) {
+        let steps = plan.get("steps").cloned().unwrap_or(plan);
+        if let Some(arr) = steps.as_array() {
+            state.plan = arr
+                .iter()
+                .map(|s| PlanStep {
+                    text: s.get("text").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                    status: s.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string(),
+                })
+                .collect();
+        }
+    }
+    if !state.known_sessions.iter().any(|s| s == id) {
+        state.known_sessions.push(id.to_string());
+    }
+}
+
+/// ↑ (no Ctrl) with input history to browse: starts by saving the live
+/// draft, then walks backward one sent question at a time.
+fn history_prev(state: &mut ChatState) {
+    if state.history.is_empty() {
+        return;
+    }
+    match state.history_cursor {
+        None => {
+            state.history_draft = state.input.clone();
+            state.history_cursor = Some(state.history.len() - 1);
+        }
+        Some(i) if i > 0 => state.history_cursor = Some(i - 1),
+        Some(_) => return,
+    }
+    if let Some(i) = state.history_cursor {
+        state.input = state.history[i].chars().collect();
+        state.cursor = state.input.len();
+    }
+}
+
+/// ↓ -- walks forward, restoring the saved draft once it passes the
+/// newest history entry (the same convention a shell's history uses).
+fn history_next(state: &mut ChatState) {
+    match state.history_cursor {
+        None => {}
+        Some(i) if i + 1 < state.history.len() => {
+            state.history_cursor = Some(i + 1);
+            state.input = state.history[i + 1].chars().collect();
+            state.cursor = state.input.len();
+        }
+        Some(_) => {
+            state.history_cursor = None;
+            state.input = std::mem::take(&mut state.history_draft);
+            state.cursor = state.input.len();
+        }
+    }
+}
+
+const HELP_TEXT: &str = "keys\n  Enter             send (queues instead, while a reply is still generating)\n  Alt+Enter         insert a newline\n  ↑ / ↓             browse previously sent messages\n  Ctrl+↑ / Ctrl+↓   scroll the transcript one line\n  PageUp / PageDown scroll the transcript a page\n  mouse wheel       scroll the transcript (hold Shift while selecting to copy text natively)\n  Tab               expand/collapse grouped tool calls\n  Ctrl+T            cycle permission mode (manual → semi-auto → auto)\n  Esc               cancel the running turn, else dismiss the popup, else quit\n  Ctrl+C            quit\ncommands\n  /agent <key>      switch specialist agent (resets the conversation)\n  /mode [name]      show/cycle/set the permission mode\n  /checkpoints      list checkpoint sessions\n  /rollback [id] [step]  undo file changes from a session\n  /resume <id>      switch to a different checkpoint session\n  /clear            reset the conversation\n  /help             this message\n  /exit             quit";
+
 async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut ChatState, cfg: &Config, root: &std::path::Path) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     let mut events = EventStream::new();
@@ -338,7 +470,7 @@ async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut Ch
                         // confirm/choice -- that answer is never a
                         // command.
                         let input_text: String = state.input.iter().collect();
-                        let suggestions = if confirm_active || choice_active { Vec::new() } else { command_suggestions(&input_text) };
+                        let suggestions = if confirm_active || choice_active { Vec::new() } else { command_suggestions(&input_text, &state.known_sessions) };
                         let popup_active = !suggestions.is_empty();
                         if popup_active {
                             state.suggestion_idx = state.suggestion_idx.min(suggestions.len() - 1);
@@ -421,12 +553,16 @@ async fn drive(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &mut Ch
                             }
                         } else {
                             match key.code {
-                                // Vertical motion scrolls the transcript --
-                                // kept as the scroll keys even while typing
-                                // is otherwise unlocked during `waiting`,
-                                // same as before.
-                                KeyCode::Up => state.scroll = state.scroll.saturating_add(1),
-                                KeyCode::Down => state.scroll = state.scroll.saturating_sub(1),
+                                // Plain ↑/↓ browse input history (shell-
+                                // style); Ctrl+↑/↓ scroll the transcript
+                                // one line instead, since both can't have
+                                // the bare arrow keys. PageUp/PageDown and
+                                // the mouse wheel remain the easy way to
+                                // scroll casually.
+                                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => state.scroll = state.scroll.saturating_add(1),
+                                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => state.scroll = state.scroll.saturating_sub(1),
+                                KeyCode::Up => history_prev(state),
+                                KeyCode::Down => history_next(state),
                                 KeyCode::PageUp => state.scroll = state.scroll.saturating_add(page_rows),
                                 KeyCode::PageDown => state.scroll = state.scroll.saturating_sub(page_rows),
                                 KeyCode::Tab => state.tools_expanded = !state.tools_expanded,
@@ -552,6 +688,20 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
         state.scroll = 0;
         return;
     }
+    if line == "/help" {
+        state.transcript.push(TLine::Sys(HELP_TEXT.to_string()));
+        return;
+    }
+    if let Some(rest) = line.strip_prefix("/resume") {
+        let id = rest.trim();
+        if id.is_empty() {
+            state.transcript.push(TLine::Err("usage: /resume <session-id> — see /checkpoints for the list".into()));
+        } else {
+            load_session_into(state, root, id);
+            state.scroll = 0;
+        }
+        return;
+    }
     if line == "/checkpoints" {
         match checkpoint::list_sessions(root) {
             Ok(sessions) if sessions.is_empty() => state.transcript.push(TLine::Sys("no checkpoint sessions yet".into())),
@@ -612,6 +762,12 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
         state.scroll = 0;
         return;
     }
+
+    if state.history.last().map(String::as_str) != Some(line.as_str()) {
+        state.history.push(line.clone());
+    }
+    state.history_cursor = None;
+    state.history_draft.clear();
 
     state.transcript.push(TLine::You(line.clone()));
     state.waiting = true;
@@ -857,7 +1013,12 @@ fn apply(state: &mut ChatState, ev: ChatEvent) {
             }
         }
         ChatEvent::Emit(line) => state.transcript.push(TLine::Sys(line)),
-        ChatEvent::CheckpointId(id) => state.checkpoint_session = Some(id),
+        ChatEvent::CheckpointId(id) => {
+            if !state.known_sessions.iter().any(|s| s == &id) {
+                state.known_sessions.push(id.clone());
+            }
+            state.checkpoint_session = Some(id);
+        }
         ChatEvent::Plan(steps) => state.plan = steps,
         ChatEvent::Confirm(_tool, action, reply) => {
             state.transcript.push(TLine::Confirm(action));
@@ -905,6 +1066,7 @@ const PLAIN_COMMANDS: &[(&str, &str)] = &[
     ("/mode", "cycle manual/semi-auto/auto"),
     ("/checkpoints", "list checkpoint sessions"),
     ("/rollback", "undo file changes from a session"),
+    ("/help", "keybindings and commands"),
     ("/exit", "quit"),
 ];
 
@@ -918,7 +1080,19 @@ const PLAIN_COMMANDS: &[(&str, &str)] = &[
 ///   followed by a space, e.g. "/agentic workflows...", which is a
 ///   message that merely starts with that text, not the command):
 ///   nothing, so an ordinary question never spuriously triggers a popup.
-fn command_suggestions(input: &str) -> Vec<Suggestion> {
+fn command_suggestions(input: &str, known_sessions: &[String]) -> Vec<Suggestion> {
+    if let Some(rest) = input.strip_prefix("/resume") {
+        if !rest.is_empty() && !rest.starts_with(' ') {
+            return Vec::new();
+        }
+        let query = rest.trim_start().to_lowercase();
+        return known_sessions
+            .iter()
+            .rev()
+            .filter(|id| id.to_lowercase().contains(&query))
+            .map(|id| Suggestion { label: id.clone(), description: "checkpoint session".to_string(), complete: format!("/resume {id}") })
+            .collect();
+    }
     if let Some(rest) = input.strip_prefix("/agent") {
         if !rest.is_empty() && !rest.starts_with(' ') {
             return Vec::new();
@@ -951,6 +1125,9 @@ fn command_suggestions(input: &str) -> Vec<Suggestion> {
         let mut out: Vec<Suggestion> = Vec::new();
         if "/agent".starts_with(&query) {
             out.push(Suggestion { label: "/agent <key>".into(), description: "switch to a specialist agent".into(), complete: "/agent ".into() });
+        }
+        if "/resume".starts_with(&query) {
+            out.push(Suggestion { label: "/resume <id>".into(), description: "switch to a different checkpoint session".into(), complete: "/resume ".into() });
         }
         for (cmd, desc) in PLAIN_COMMANDS {
             if cmd.starts_with(&query) {
@@ -1009,7 +1186,7 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
     // suppressed while answering a confirm/choice, same as in `drive`.
     if state.pending_confirm.is_none() && state.pending_choice.is_none() {
         let input_text: String = state.input.iter().collect();
-        let suggestions = command_suggestions(&input_text);
+        let suggestions = command_suggestions(&input_text, &state.known_sessions);
         if !suggestions.is_empty() {
             draw_command_popup(f, chunks[3], state, &suggestions);
         }
@@ -1029,10 +1206,7 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
         Span::styled(state.agent.display, Style::default().fg(state.agent_color).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" [{}] ", state.cfg_model), Style::default().fg(Color::DarkGray)),
         Span::styled(format!("[{}]", state.mode.label()), Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            "   /agent switch · /mode · Ctrl+T cycle mode · Esc cancel/quit · Ctrl+C quit",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("   /help for keys & commands", Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -1796,13 +1970,13 @@ mod tests {
 
     #[test]
     fn command_suggestions_lists_every_agent_on_bare_command() {
-        let all = command_suggestions("/agent");
+        let all = command_suggestions("/agent", &[]);
         assert_eq!(all.len(), ALL_AGENTS.len());
     }
 
     #[test]
     fn command_suggestions_filters_agents_by_key_substring() {
-        let matches = command_suggestions("/agent crypto");
+        let matches = command_suggestions("/agent crypto", &[]);
         let labels: Vec<&str> = matches.iter().map(|s| s.label.as_str()).collect();
         assert!(labels.iter().any(|l| l.contains("crypto")), "expected a crypto-ish agent in {labels:?}");
         for s in &matches {
@@ -1814,21 +1988,21 @@ mod tests {
     fn command_suggestions_ignores_an_unrelated_message() {
         // "/agentic workflows are great" isn't the /agent command -- no
         // space (or end-of-input) right after "/agent".
-        assert!(command_suggestions("/agentic workflows are great").is_empty());
-        assert!(command_suggestions("just a normal question").is_empty());
+        assert!(command_suggestions("/agentic workflows are great", &[]).is_empty());
+        assert!(command_suggestions("just a normal question", &[]).is_empty());
     }
 
     #[test]
     fn command_suggestions_lists_plain_commands_while_typing_the_slash() {
         // "/e" is a prefix of "/exit" only (not "/agent" or "/clear"/"/quit").
-        let matches = command_suggestions("/e");
+        let matches = command_suggestions("/e", &[]);
         assert_eq!(matches.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), vec!["/exit"]);
         assert_eq!(matches[0].complete, "/exit");
     }
 
     #[test]
     fn command_suggestions_bare_slash_offers_agent_and_every_plain_command() {
-        let matches = command_suggestions("/");
+        let matches = command_suggestions("/", &[]);
         let labels: Vec<&str> = matches.iter().map(|s| s.label.as_str()).collect();
         assert!(labels.contains(&"/agent <key>"));
         for (cmd, _) in PLAIN_COMMANDS {
@@ -1838,9 +2012,9 @@ mod tests {
 
     #[test]
     fn command_suggestions_mode_lists_all_three_and_filters() {
-        let all = command_suggestions("/mode");
+        let all = command_suggestions("/mode", &[]);
         assert_eq!(all.len(), 3);
-        let semi = command_suggestions("/mode semi");
+        let semi = command_suggestions("/mode semi", &[]);
         assert_eq!(semi.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), vec!["semi-auto"]);
         assert_eq!(semi[0].complete, "/mode semi-auto");
     }
@@ -1918,5 +2092,102 @@ mod tests {
             let rendered: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
             assert!(rendered <= width, "row {rendered} chars wide exceeds width {width}: {:?}", line_text(line));
         }
+    }
+
+    #[test]
+    fn extract_question_strips_the_task_wrapper_and_any_retrieved_context() {
+        assert_eq!(extract_question("Task: fix the bug\n\nRetrieved context:\nsome file contents here"), "fix the bug");
+        assert_eq!(extract_question("Task: no context attached"), "no context attached");
+    }
+
+    #[test]
+    fn extract_question_strips_the_additional_instruction_wrapper() {
+        assert_eq!(extract_question("Additional instruction: and now add tests"), "and now add tests");
+    }
+
+    #[test]
+    fn extract_question_passes_through_anything_unrecognized() {
+        assert_eq!(extract_question("  just plain text  "), "just plain text");
+    }
+
+    #[test]
+    fn command_suggestions_resume_lists_known_sessions_most_recent_first() {
+        let sessions = vec!["111-aaa".to_string(), "222-bbb".to_string()];
+        let matches = command_suggestions("/resume", &sessions);
+        let labels: Vec<&str> = matches.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["222-bbb", "111-aaa"]);
+        assert_eq!(matches[0].complete, "/resume 222-bbb");
+    }
+
+    #[test]
+    fn command_suggestions_resume_filters_by_substring() {
+        let sessions = vec!["111-aaa".to_string(), "222-bbb".to_string()];
+        let matches = command_suggestions("/resume bbb", &sessions);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].label, "222-bbb");
+    }
+
+    fn test_state() -> ChatState {
+        ChatState {
+            agent: &ALL_AGENTS[0],
+            cfg_model: String::new(),
+            transcript: Vec::new(),
+            input: Vec::new(),
+            cursor: 0,
+            waiting: false,
+            waiting_since: Instant::now(),
+            current_task: None,
+            scroll: 0,
+            tools_expanded: false,
+            suggestion_idx: 0,
+            user_color: Color::Cyan,
+            agent_color: Color::Magenta,
+            queued: None,
+            checkpoint_session: None,
+            mode: PermissionMode::Manual,
+            pending_confirm: None,
+            pending_choice: None,
+            plan: Vec::new(),
+            should_quit: false,
+            known_sessions: Vec::new(),
+            history: Vec::new(),
+            history_cursor: None,
+            history_draft: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn history_prev_walks_backward_and_saves_the_live_draft() {
+        let mut state = test_state();
+        state.history = vec!["first question".to_string(), "second question".to_string()];
+        state.input = chars("still typing");
+        history_prev(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "second question");
+        history_prev(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "first question");
+        // Already at the oldest entry -- stays put.
+        history_prev(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "first question");
+    }
+
+    #[test]
+    fn history_next_restores_the_saved_draft_past_the_newest_entry() {
+        let mut state = test_state();
+        state.history = vec!["only question".to_string()];
+        state.input = chars("my draft");
+        history_prev(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "only question");
+        history_next(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "my draft");
+        assert_eq!(state.history_cursor, None);
+    }
+
+    #[test]
+    fn history_next_is_a_no_op_when_not_browsing() {
+        let mut state = test_state();
+        state.history = vec!["a question".to_string()];
+        state.input = chars("untouched");
+        history_next(&mut state);
+        assert_eq!(state.input.iter().collect::<String>(), "untouched");
     }
 }
