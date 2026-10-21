@@ -763,7 +763,7 @@ async fn dispatch_inner(state: &mut State, name: &str, args: &Value) -> Result<S
         }
         "update_plan" => {
             let steps = args.get("steps").cloned().unwrap_or(Value::Array(vec![]));
-            state.io.emit(format_plan(&steps));
+            state.io.on_plan(&steps);
             state.checkpoint.save_plan(&json!({ "steps": steps })).ok();
             Ok(format!("plan updated ({} step(s))", steps.as_array().map(|a| a.len()).unwrap_or(0)))
         }
@@ -1135,7 +1135,7 @@ pub async fn run(
     if resumed {
         io.emit(format!("\x1b[2mresumed — {} prior message(s) restored\x1b[0m", messages.len()));
         if let Ok(Some(plan)) = checkpoint::load_plan(root, &state.checkpoint.id) {
-            io.emit(format_plan(plan.get("steps").unwrap_or(&plan)));
+            io.on_plan(plan.get("steps").unwrap_or(&plan));
         }
     }
 

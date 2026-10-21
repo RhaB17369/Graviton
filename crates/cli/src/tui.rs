@@ -17,6 +17,7 @@
 
 use crate::agentic::{self, Decision};
 use crate::agents::{AgentSpec, ALL_AGENTS};
+use crate::checkpoint;
 use crate::run_io::RunIo;
 use crate::{build_context_sync, finish_context, open_or_init_repo_db, repo_root, resolve_agent};
 use anyhow::{Context, Result};
@@ -95,6 +96,9 @@ enum ChatEvent {
     /// running under, saved so the *next* turn resumes the same
     /// checkpoint-backed conversation instead of starting fresh.
     CheckpointId(String),
+    /// `io.on_plan` -- the agent's current step list, replacing whatever
+    /// plan was shown before rather than adding a new copy underneath it.
+    Plan(Vec<PlanStep>),
     /// A gated action needs a decision -- `(tool, action, reply)`.
     Confirm(String, String, oneshot::Sender<Decision>),
     /// `ask_user` needs an answer -- `(question, options, multi_select, reply)`.
@@ -140,6 +144,13 @@ struct PendingChoice {
     options: Vec<String>,
     multi: bool,
     reply: oneshot::Sender<Vec<String>>,
+}
+
+/// One `update_plan` step -- `status` is `"pending"`, `"in_progress"`,
+/// or `"done"` (unrecognized values render like `"pending"`).
+struct PlanStep {
+    text: String,
+    status: String,
 }
 
 struct ChatState {
@@ -203,6 +214,12 @@ struct ChatState {
     pending_confirm: Option<oneshot::Sender<Decision>>,
     /// An `ask_user` call waiting on a number (or "all"), same idea.
     pending_choice: Option<PendingChoice>,
+    /// The agent's current plan (`update_plan`), shown as a standing
+    /// checklist panel above the transcript -- empty hides the panel
+    /// entirely. Cleared by `/clear`/`/agent` (a fresh topic has no
+    /// plan yet); *not* cleared on `Done`, so the finished checklist
+    /// stays visible as a record of what the turn actually did.
+    plan: Vec<PlanStep>,
     should_quit: bool,
 }
 
@@ -245,6 +262,7 @@ pub async fn run_chat_tui(cfg: &Config, resume: Option<String>) -> Result<()> {
         mode: PermissionMode::Manual,
         pending_confirm: None,
         pending_choice: None,
+        plan: Vec::new(),
         should_quit: false,
     };
 
@@ -530,7 +548,36 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
     if line == "/clear" {
         state.transcript.push(TLine::Sys("(conversation cleared)".into()));
         state.checkpoint_session = None;
+        state.plan.clear();
         state.scroll = 0;
+        return;
+    }
+    if line == "/checkpoints" {
+        match checkpoint::list_sessions(root) {
+            Ok(sessions) if sessions.is_empty() => state.transcript.push(TLine::Sys("no checkpoint sessions yet".into())),
+            Ok(sessions) => {
+                let mut block = String::new();
+                for s in sessions {
+                    let marker = if state.checkpoint_session.as_deref() == Some(s.id.as_str()) { "* " } else { "  " };
+                    block.push_str(&format!("{marker}{:<20} {} step(s), {} file(s) touched\n", s.id, s.steps, s.files_touched));
+                }
+                state.transcript.push(TLine::Sys(block.trim_end().to_string()));
+            }
+            Err(e) => state.transcript.push(TLine::Err(format!("{e:#}"))),
+        }
+        return;
+    }
+    if let Some(rest) = line.strip_prefix("/rollback") {
+        let mut parts = rest.trim().split_whitespace();
+        let session_id = parts.next().map(str::to_string).or_else(|| state.checkpoint_session.clone());
+        let to = parts.next().and_then(|s| s.parse::<u64>().ok());
+        match session_id {
+            None => state.transcript.push(TLine::Err("no checkpoint session yet — ask the agent to do something first, or see /checkpoints for an id".into())),
+            Some(id) => match checkpoint::rollback(root, &id, to) {
+                Ok(n) => state.transcript.push(TLine::Sys(format!("rolled back {n} change(s) from session {id}"))),
+                Err(e) => state.transcript.push(TLine::Err(format!("{e:#}"))),
+            },
+        }
         return;
     }
     if let Some(name) = line.strip_prefix("/mode") {
@@ -557,6 +604,7 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
                 state.agent = a;
                 state.cfg_model = cfg.model_for(a.tier, a.key).to_string();
                 state.checkpoint_session = None;
+                state.plan.clear();
                 state.transcript.push(TLine::Sys(format!("(switched to {} — conversation reset)", a.display)));
             }
             Err(e) => state.transcript.push(TLine::Err(format!("{e:#}"))),
@@ -705,6 +753,21 @@ impl RunIo for TuiIo {
         let _ = self.tx.send(ChatEvent::CheckpointId(id.to_string()));
     }
 
+    fn on_plan(&self, steps: &serde_json::Value) {
+        let parsed = steps
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|s| PlanStep {
+                        text: s.get("text").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                        status: s.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = self.tx.send(ChatEvent::Plan(parsed));
+    }
+
     fn confirm(&self, _auto_approve: bool, tool: &str, action: String) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
         let tool = tool.to_string();
         let tx = self.tx.clone();
@@ -789,6 +852,7 @@ fn apply(state: &mut ChatState, ev: ChatEvent) {
         }
         ChatEvent::Emit(line) => state.transcript.push(TLine::Sys(line)),
         ChatEvent::CheckpointId(id) => state.checkpoint_session = Some(id),
+        ChatEvent::Plan(steps) => state.plan = steps,
         ChatEvent::Confirm(_tool, action, reply) => {
             state.transcript.push(TLine::Confirm(action));
             state.pending_confirm = Some(reply);
@@ -830,7 +894,13 @@ struct Suggestion {
 /// keep for anyone's muscle memory from other tools) but isn't listed
 /// here -- two entries that do the exact same thing was the duplicate
 /// the autocomplete popup didn't need to show.
-const PLAIN_COMMANDS: &[(&str, &str)] = &[("/clear", "reset the conversation"), ("/mode", "cycle manual/semi-auto/auto"), ("/exit", "quit")];
+const PLAIN_COMMANDS: &[(&str, &str)] = &[
+    ("/clear", "reset the conversation"),
+    ("/mode", "cycle manual/semi-auto/auto"),
+    ("/checkpoints", "list checkpoint sessions"),
+    ("/rollback", "undo file changes from a session"),
+    ("/exit", "quit"),
+];
 
 /// Autocomplete candidates for the current input, or empty if it
 /// doesn't look like a command at all. Three cases:
@@ -910,15 +980,19 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
         input_rows.len().min(6)
     };
     let input_height = (visible_input_rows + 2) as u16;
+    // Hidden (zero height) with no plan yet -- a standing checklist
+    // panel only earns its space once there's something to check off.
+    let plan_height = if state.plan.is_empty() { 0 } else { (state.plan.len().min(8) + 2) as u16 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(input_height)])
+        .constraints([Constraint::Length(1), Constraint::Length(plan_height), Constraint::Min(3), Constraint::Length(input_height)])
         .split(area);
 
     draw_header(f, chunks[0], state);
-    let rows = draw_transcript(f, chunks[1], state);
-    draw_input(f, chunks[2], state, &input_rows, cursor_row, cursor_col, show_spinner);
+    draw_plan(f, chunks[1], state);
+    let rows = draw_transcript(f, chunks[2], state);
+    draw_input(f, chunks[3], state, &input_rows, cursor_row, cursor_col, show_spinner);
 
     // Not gated on `waiting` -- typing (including `/agent ...`) and the
     // popup it drives work the same whether a previous question is
@@ -931,7 +1005,7 @@ fn draw(f: &mut ratatui::Frame, state: &ChatState) -> usize {
         let input_text: String = state.input.iter().collect();
         let suggestions = command_suggestions(&input_text);
         if !suggestions.is_empty() {
-            draw_command_popup(f, chunks[2], state, &suggestions);
+            draw_command_popup(f, chunks[3], state, &suggestions);
         }
     }
     rows
@@ -955,6 +1029,30 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
         ),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// The standing checklist panel for `update_plan`'s current steps --
+/// `[x]` done (green), `[~]` in progress (yellow, bold), `[ ]` pending
+/// (dim) -- a no-op when `state.plan` is empty (`draw`'s `plan_height`
+/// is 0 then, so this has no area to draw into anyway).
+fn draw_plan(f: &mut ratatui::Frame, area: Rect, state: &ChatState) {
+    if state.plan.is_empty() {
+        return;
+    }
+    let lines: Vec<Line> = state
+        .plan
+        .iter()
+        .map(|step| {
+            let (mark, style) = match step.status.as_str() {
+                "done" => ("[x]", Style::default().fg(Color::Green)),
+                "in_progress" => ("[~]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                _ => ("[ ]", Style::default().fg(Color::DarkGray)),
+            };
+            Line::from(vec![Span::styled(format!("{mark} "), style), Span::styled(step.text.clone(), style)])
+        })
+        .collect();
+    let block = Block::default().borders(Borders::ALL).border_type(ratatui::widgets::BorderType::Rounded).border_style(Style::default().fg(Color::DarkGray)).title(" plan ");
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// A floating autocomplete popup (agents, or the plain commands),
@@ -1045,6 +1143,27 @@ fn push_multiline(out: &mut Vec<Line<'static>>, width: usize, style: Style, text
     }
 }
 
+/// Same idea as `push_multiline`, but colors each line by `diff_preview`'s
+/// own leading sign (`agentic::diff_preview`: `+`/`-`/` ` for insert/
+/// delete/unchanged context) instead of one flat color -- the point of
+/// showing a diff at all, at exactly the moment a write/edit is being
+/// approved or denied, is to see what changed at a glance. A line that
+/// doesn't start with one of those (a non-diff action like `run_shell`
+/// or `delete_file`, which this same `TLine::Confirm` renders too) just
+/// falls back to `default_style`.
+fn push_diff_aware(out: &mut Vec<Line<'static>>, width: usize, default_style: Style, text: &str) {
+    for line in text.split('\n') {
+        let style = if line.starts_with('+') {
+            Style::default().fg(Color::Green)
+        } else if line.starts_with('-') {
+            Style::default().fg(Color::Red)
+        } else {
+            default_style
+        };
+        push_wrapped(out, width, None, line, style);
+    }
+}
+
 /// A paragraph-or-code-fence chunk of a markdown-lite message. Only
 /// fenced ` ``` ` blocks are block-level; everything else is prose that
 /// still gets inline `**bold**`/`` `code` `` parsed within it.
@@ -1094,6 +1213,28 @@ fn split_code_fences(text: &str) -> Vec<MdBlock<'_>> {
 /// no lists) -- just the two inline forms a model's running text
 /// actually uses, parsed by hand instead of pulling in a markdown crate
 /// for it.
+/// Recognizes a Markdown list item's leading marker -- `- `/`* ` (bullet)
+/// or `N. `/`N) ` (numbered) -- and splits it into (leading whitespace,
+/// the marker to display, the rest of the line). `None` for anything
+/// else, including a bare `-`/digit with no following space (so "a - b"
+/// or a version number mid-sentence never gets mistaken for a list).
+fn parse_list_marker(line: &str) -> Option<(&str, String, &str)> {
+    let leading_len = line.len() - line.trim_start().len();
+    let leading = &line[..leading_len];
+    let trimmed = &line[leading_len..];
+    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        return Some((leading, "•".to_string(), rest));
+    }
+    let digits_len = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
+    if digits_len > 0 {
+        let after_digits = &trimmed[digits_len..];
+        if let Some(rest) = after_digits.strip_prefix(". ").or_else(|| after_digits.strip_prefix(") ")) {
+            return Some((leading, format!("{}.", &trimmed[..digits_len]), rest));
+        }
+    }
+    None
+}
+
 fn parse_inline(line: &str, base: Style, code_style: Style, bold_style: Style) -> Vec<(String, Style)> {
     let mut spans = Vec::new();
     let mut chars = line.chars().peekable();
@@ -1214,6 +1355,30 @@ fn push_markdown(out: &mut Vec<Line<'static>>, width: usize, prefix: (String, St
                         emit(out, vec![]);
                         continue;
                     }
+                    if let Some((leading, marker, rest)) = parse_list_marker(line) {
+                        // Hanging indent so a wrapped item's continuation
+                        // lines align under its *text*, not its marker --
+                        // handled entirely here (not through `emit`'s own
+                        // first-row-only indent) since it's per list item,
+                        // not per message.
+                        let hang = leading.chars().count() + marker.chars().count() + 1;
+                        let item_avail = avail.saturating_sub(hang).max(10);
+                        let spans = parse_inline(rest, base, code_style, bold_style);
+                        let mut rows = wrap_styled(spans, item_avail);
+                        if rows.is_empty() {
+                            rows.push(Vec::new());
+                        }
+                        for (i, row) in rows.into_iter().enumerate() {
+                            let mut row_spans: Vec<Span<'static>> = if i == 0 {
+                                vec![Span::raw(leading.to_string()), Span::styled(format!("{marker} "), Style::default().fg(Color::Magenta))]
+                            } else {
+                                vec![Span::raw(" ".repeat(hang))]
+                            };
+                            row_spans.extend(row.into_iter().map(|(t, s)| Span::styled(t, s)));
+                            emit(out, row_spans);
+                        }
+                        continue;
+                    }
                     let spans = parse_inline(line, base, code_style, bold_style);
                     for row in wrap_styled(spans, avail) {
                         let row_spans = row.into_iter().map(|(t, s)| Span::styled(t, s)).collect();
@@ -1290,7 +1455,7 @@ fn wrapped_rows(state: &ChatState, width: usize) -> Vec<Line<'static>> {
                     "⚠ confirm — y = allow · n = deny · type a note + Enter = redirect",
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 );
-                push_multiline(&mut out, width, Style::default().fg(Color::Yellow), action);
+                push_diff_aware(&mut out, width, Style::default().fg(Color::Yellow), action);
                 out.push(Line::from(""));
             }
             TLine::Choice(block) => {
@@ -1705,5 +1870,47 @@ mod tests {
         assert_eq!(parse_choice_answer("all", &options, true), options.clone());
         assert_eq!(parse_choice_answer("9", &options, false), Vec::<String>::new(), "out-of-range number picks nothing");
         assert_eq!(parse_choice_answer("nope", &options, false), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_list_marker_recognizes_bullets_and_numbers() {
+        assert_eq!(parse_list_marker("- item one"), Some(("", "•".to_string(), "item one")));
+        assert_eq!(parse_list_marker("* item two"), Some(("", "•".to_string(), "item two")));
+        assert_eq!(parse_list_marker("  - indented"), Some(("  ", "•".to_string(), "indented")));
+        assert_eq!(parse_list_marker("3. third step"), Some(("", "3.".to_string(), "third step")));
+        assert_eq!(parse_list_marker("12) twelfth"), Some(("", "12.".to_string(), "twelfth")));
+    }
+
+    #[test]
+    fn parse_list_marker_ignores_non_list_text() {
+        // A bare hyphen or a version number mid-sentence isn't a list.
+        assert_eq!(parse_list_marker("a - b"), None);
+        assert_eq!(parse_list_marker("released v3.2 today"), None);
+        assert_eq!(parse_list_marker("just a normal sentence"), None);
+    }
+
+    #[test]
+    fn push_diff_aware_colors_plus_and_minus_lines() {
+        let mut out = Vec::new();
+        push_diff_aware(&mut out, 80, Style::default().fg(Color::Yellow), "write_file a.rs\n-old line\n+new line\n unchanged");
+        let color_of = |i: usize| out[i].spans[0].style.fg;
+        assert_eq!(color_of(0), Some(Color::Yellow), "non-diff header line keeps the default style");
+        assert_eq!(color_of(1), Some(Color::Red));
+        assert_eq!(color_of(2), Some(Color::Green));
+        assert_eq!(color_of(3), Some(Color::Yellow));
+    }
+
+    #[test]
+    fn markdown_reply_renders_a_bulleted_list_with_hanging_indent() {
+        let width = 40;
+        let mut out = Vec::new();
+        push_markdown(&mut out, width, ("AGENT ".into(), Style::default()), "- first item\n- a second item that is long enough to wrap onto another row for sure");
+        let joined: String = out.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("first item"));
+        assert!(joined.contains("second item"));
+        for line in &out {
+            let rendered: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(rendered <= width, "row {rendered} chars wide exceeds width {width}: {:?}", line_text(line));
+        }
     }
 }

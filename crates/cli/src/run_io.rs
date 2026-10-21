@@ -51,6 +51,17 @@ pub trait RunIo: Send + Sync {
         self.emit(format!("\x1b[2m← {result}\x1b[0m"));
     }
 
+    /// The agent's current plan (`update_plan`'s `steps`, each a
+    /// `{text, status}` object -- `status` one of "pending"/
+    /// "in_progress"/"done"). Default: `grv run`'s existing text block
+    /// (`agentic::format_plan`). The chat TUI overrides this to drive a
+    /// standing checklist panel instead of a transcript line, so a
+    /// revised plan replaces the old one in place rather than printing
+    /// a second copy underneath it.
+    fn on_plan(&self, steps: &Value) {
+        self.emit(crate::agentic::format_plan(steps));
+    }
+
     /// Once known (right after `checkpoint::Session` is created/reopened),
     /// the session id `grv checkpoints`/`grv rollback`/`grv plan` use.
     /// Default no-op — `TerminalIo` doesn't need it (it's already printed
