@@ -10,6 +10,7 @@ mod daemon;
 mod mission;
 mod models;
 mod permissions;
+mod providers;
 mod resources;
 mod run_io;
 mod semantic;
@@ -771,10 +772,8 @@ async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &Agen
     };
 
     println!("\x1b[1;35m═══ {} ═══\x1b[0m", agent.display);
-    let client = OllamaClient::new(&cfg.ollama_host);
-    agentic::run_read_only_loop(&client, cfg, &root, cfg.model_for(agent.tier, agent.key), &system, &user_msg, true)
-        .await
-        .map(|_| ())
+    let (client, model) = providers::resolve_client(cfg, cfg.model_for(agent.tier, agent.key))?;
+    agentic::run_read_only_loop(&client, cfg, &root, &model, &system, &user_msg, true).await.map(|_| ())
 }
 
 /// Bare `grv`, no subcommand: a real full-screen TUI chat instead of
@@ -818,7 +817,6 @@ fn resolve_pipeline(pipeline: &str) -> Result<Vec<&'static AgentSpec>> {
 /// doesn't blow past `num_ctx` by the final stage), not just the same
 /// context re-served.
 async fn run_pipeline(cfg: &Config, root: &std::path::Path, prompt: &str, context_block: &str, handoff_label: &str, specs: &[&'static AgentSpec]) -> Result<()> {
-    let client = OllamaClient::new(&cfg.ollama_host);
     let mut prior = String::new();
 
     for spec in specs {
@@ -828,7 +826,10 @@ async fn run_pipeline(cfg: &Config, root: &std::path::Path, prompt: &str, contex
         } else {
             format!("{prompt}\n\n{context_block}\n\n{handoff_label}\n{prior}")
         };
-        let output = agentic::run_read_only_loop(&client, cfg, root, cfg.model_for(spec.tier, spec.key), &spec.base_prompt(), &user_msg, true).await?;
+        // Resolved per stage, not once for the whole pipeline -- two
+        // stages can route to two different providers.
+        let (client, model) = providers::resolve_client(cfg, cfg.model_for(spec.tier, spec.key))?;
+        let output = agentic::run_read_only_loop(&client, cfg, root, &model, &spec.base_prompt(), &user_msg, true).await?;
         prior.push_str(&format!("\n--- {} ---\n{}\n", spec.display, output.trim()));
         let cap = cfg.context_char_budget();
         if prior.len() > cap {
@@ -908,15 +909,25 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
         specs.push(resolve_agent(k)?);
     }
 
-    let client = OllamaClient::new(&cfg.ollama_host);
-    let models: Vec<String> = {
-        let mut m: Vec<String> = specs.iter().map(|s| cfg.model_for(s.tier, s.key).to_string()).collect();
+    // Only the Ollama-routed subset sizes the local-RAM scheduler -- a
+    // cloud-routed agent doesn't occupy any local RAM, so it shouldn't
+    // make the estimate more conservative than it needs to be, and its
+    // task below skips the scheduler permit entirely instead of
+    // contending over a budget that has nothing to do with it.
+    let local_client = OllamaClient::new(&cfg.ollama_host);
+    let local_models: Vec<String> = {
+        let mut m: Vec<String> = specs
+            .iter()
+            .map(|s| cfg.model_for(s.tier, s.key))
+            .filter(|m| matches!(cfg.resolve_model(m), graviton_core::ResolvedModel::Local { .. }))
+            .map(String::from)
+            .collect();
         m.dedup();
         m
     };
-    let sizes = resources::model_sizes_mb(&client).await;
+    let sizes = resources::model_sizes_mb(&local_client).await;
     let hard_cap = max_parallel.unwrap_or(specs.len()).max(1);
-    let scheduler = resources::LiveScheduler::spawn(models, sizes, hard_cap);
+    let scheduler = resources::LiveScheduler::spawn(local_models, sizes, hard_cap);
     if max_parallel.is_none() {
         println!(
             "\x1b[2mstarting concurrency ~{} (auto, re-sampled live from RAM as the swarm runs — see `grv status`)\x1b[0m\n",
@@ -927,25 +938,29 @@ async fn cmd_swarm(cfg: &Config, question: &str, files: Vec<PathBuf>, roster: &s
     let mut tasks = tokio::task::JoinSet::new();
     for spec in specs {
         let scheduler = scheduler.clone();
-        let client = OllamaClient::new(&cfg.ollama_host);
         let cfg_owned = cfg.clone();
         let root_owned = root.clone();
-        let model = cfg.model_for(spec.tier, spec.key).to_string();
+        let routed_model = cfg.model_for(spec.tier, spec.key).to_string();
+        let is_cloud = matches!(cfg.resolve_model(&routed_model), graviton_core::ResolvedModel::Cloud { .. });
         let system = spec.base_prompt();
         let user_msg = format!("Question: {question}\n\n{context_block}");
         let display = spec.display;
         let tagline = spec.tagline;
         tasks.spawn(async move {
-            let _permit = scheduler.acquire().await;
+            let _permit = if is_cloud { None } else { Some(scheduler.acquire().await) };
             let started = std::time::Instant::now();
-            // stream_final_answer=false: several agents run concurrently
-            // here, so live token streaming from more than one at once
-            // would interleave garbled output -- each agent's full answer
-            // prints as one block once it finishes instead (tool-call log
-            // lines can still interleave, same tradeoff `grv mission`
-            // already accepts for its concurrent leaves).
-            let result = agentic::run_read_only_loop(&client, &cfg_owned, &root_owned, &model, &system, &user_msg, false).await;
-            (display, tagline, model, started.elapsed(), result)
+            let result = async {
+                let (client, model) = providers::resolve_client(&cfg_owned, &routed_model)?;
+                // stream_final_answer=false: several agents run concurrently
+                // here, so live token streaming from more than one at once
+                // would interleave garbled output -- each agent's full answer
+                // prints as one block once it finishes instead (tool-call log
+                // lines can still interleave, same tradeoff `grv mission`
+                // already accepts for its concurrent leaves).
+                agentic::run_read_only_loop(&client, &cfg_owned, &root_owned, &model, &system, &user_msg, false).await
+            }
+            .await;
+            (display, tagline, routed_model, started.elapsed(), result)
         });
     }
 
@@ -1144,9 +1159,17 @@ async fn cmd_status(cfg: &Config) -> Result<()> {
     }
 
     let cap = resources::detect();
-    let distinct = cfg.distinct_models();
+    let distinct = cfg.distinct_local_models();
     let (_, note) = resources::safe_concurrency(&client, &distinct, &cap).await;
     println!("swarm capacity: {note}");
+
+    if !cfg.providers.is_empty() {
+        println!("cloud providers:");
+        for (name, provider) in cfg.providers.iter() {
+            let key_state = if std::env::var(&provider.api_key_env).is_ok() { "set" } else { "MISSING" };
+            println!("  - {name} ({}) -- ${} {key_state}", provider.base_url, provider.api_key_env);
+        }
+    }
     println!("heaviest processes on this machine right now (what that estimate is actually competing with):");
     for (name, mb) in resources::top_memory_consumers(5) {
         println!("  {name:<24} {mb} MB");

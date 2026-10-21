@@ -13,13 +13,14 @@ use crate::browser::BrowserSession;
 use crate::checkpoint;
 use crate::custom_tools::{self, CustomTool};
 use crate::permissions;
+use crate::providers;
 use crate::run_io::RunIo;
 use crate::semantic;
 use crate::tools as recon_tools;
 use crate::web;
 use anyhow::{Context, Result};
 use graviton_core::Config;
-use graviton_llm::{ChatMessage, OllamaClient, ToolCall, ToolDef};
+use graviton_llm::{ChatMessage, LlmClient, ToolCall, ToolDef};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -352,7 +353,7 @@ pub(crate) async fn dispatch_read_only(cfg: &Config, root: &Path, name: &str, ar
 pub const MAX_READONLY_TOOL_STEPS: usize = 6;
 
 pub async fn run_read_only_loop(
-    client: &OllamaClient,
+    client: &LlmClient,
     cfg: &Config,
     root: &Path,
     model: &str,
@@ -398,7 +399,7 @@ pub async fn run_read_only_loop(
 /// socket instead of terminal output), rather than a second hand-copied
 /// implementation drifting from this one over time.
 pub async fn run_read_only_loop_with(
-    client: &OllamaClient,
+    client: &LlmClient,
     cfg: &Config,
     root: &Path,
     model: &str,
@@ -425,7 +426,7 @@ pub async fn run_read_only_loop_with(
 /// is appended to `messages` before returning, so the caller's next turn
 /// sees it without having to re-append it itself.
 pub async fn run_read_only_loop_on(
-    client: &OllamaClient,
+    client: &LlmClient,
     cfg: &Config,
     root: &Path,
     model: &str,
@@ -1175,13 +1176,11 @@ pub async fn run(
         push_and_record(&mut messages, &state, ChatMessage::user(format!("Additional instruction: {task}")));
     }
 
-    let client = OllamaClient::new(&cfg.ollama_host);
+    let (client, model) = providers::resolve_client(cfg, cfg.model_for(agent.tier, agent.key))?;
     io.emit(format!("\x1b[1;35m═══ {} (agentic) ═══\x1b[0m", agent.display));
 
     for step in 0..MAX_STEPS {
-        let result = client
-            .chat_stream(cfg.model_for(agent.tier, agent.key), &messages, cfg.num_ctx, &tools, |tok| io.on_token(tok), |tok| io.on_thinking(tok))
-            .await?;
+        let result = client.chat_stream(&model, &messages, cfg.num_ctx, &tools, |tok| io.on_token(tok), |tok| io.on_thinking(tok)).await?;
         io.emit(String::new()); // blank line after the streamed answer, matching the terminal's old unconditional println!()
 
         if result.tool_calls.is_empty() {
@@ -1232,6 +1231,7 @@ fn clone_tool_calls(calls: &[ToolCall]) -> Vec<ToolCall> {
     calls
         .iter()
         .map(|c| ToolCall {
+            id: c.id.clone(),
             function: graviton_llm::ToolCallFunction {
                 name: c.function.name.clone(),
                 arguments: c.function.arguments.clone(),

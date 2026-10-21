@@ -322,7 +322,7 @@ pub async fn serve(cfg: &Config, root: PathBuf, socket: Option<PathBuf>, tcp: Op
     remove_stale_socket(&socket_path).await;
 
     let client = OllamaClient::new(&cfg.ollama_host);
-    let all_models: Vec<String> = cfg.distinct_models().into_iter().map(String::from).collect();
+    let all_models: Vec<String> = cfg.distinct_local_models().into_iter().map(String::from).collect();
     let sizes = resources::model_sizes_mb(&client).await;
     let scheduler = resources::LiveScheduler::spawn(all_models, sizes, DAEMON_HARD_CAP);
 
@@ -650,8 +650,12 @@ async fn handle_streaming<W: AsyncWrite + Unpin>(ctx: &DaemonCtx, req: &RpcReque
         let _ = tx.send(Event::ToolCall(name.to_string(), args.clone()));
     };
 
+    let (client, model_name) = match crate::providers::resolve_client(&ctx.cfg, &model) {
+        Ok(v) => v,
+        Err(e) => return write_line(writer, &json!({"jsonrpc":"2.0","id":req.id,"error":{"code":-32000,"message":format!("{e:#}")}})).await,
+    };
     let _permit = ctx.scheduler.acquire().await;
-    let loop_fut = crate::agentic::run_read_only_loop_with(&ctx.client, &ctx.cfg, &ctx.root, &model, &system, &user_msg, on_token, |_| {}, on_tool_call, |_, _| {});
+    let loop_fut = crate::agentic::run_read_only_loop_with(&client, &ctx.cfg, &ctx.root, &model_name, &system, &user_msg, on_token, |_| {}, on_tool_call, |_, _| {});
     tokio::pin!(loop_fut);
     let result = loop {
         tokio::select! {
@@ -837,8 +841,9 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
         }
         "ask" => {
             let (spec, model, system, user_msg) = prepare_ask(ctx, params).await?;
+            let (client, model_name) = crate::providers::resolve_client(&ctx.cfg, &model)?;
             let _permit = ctx.scheduler.acquire().await;
-            let answer = crate::agentic::run_read_only_loop_with(&ctx.client, &ctx.cfg, &ctx.root, &model, &system, &user_msg, |_| {}, |_| {}, log_tool_call, |_, _| {}).await?;
+            let answer = crate::agentic::run_read_only_loop_with(&client, &ctx.cfg, &ctx.root, &model_name, &system, &user_msg, |_| {}, |_| {}, log_tool_call, |_, _| {}).await?;
             Ok(json!({"agent": spec.key, "model": model, "answer": answer}))
         }
         "review" => {
@@ -846,8 +851,9 @@ async fn handle_method(ctx: &DaemonCtx, method: &str, params: &Value) -> Result<
             let Some(user_msg) = user_msg else {
                 return Ok(json!({"agent": spec.key, "model": model, "answer": "(no diff -- nothing to review)"}));
             };
+            let (client, model_name) = crate::providers::resolve_client(&ctx.cfg, &model)?;
             let _permit = ctx.scheduler.acquire().await;
-            let answer = crate::agentic::run_read_only_loop_with(&ctx.client, &ctx.cfg, &ctx.root, &model, &system, &user_msg, |_| {}, |_| {}, log_tool_call, |_, _| {}).await?;
+            let answer = crate::agentic::run_read_only_loop_with(&client, &ctx.cfg, &ctx.root, &model_name, &system, &user_msg, |_| {}, |_| {}, log_tool_call, |_, _| {}).await?;
             Ok(json!({"agent": spec.key, "model": model, "answer": answer}))
         }
         "run_start" => {

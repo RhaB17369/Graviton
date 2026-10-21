@@ -84,6 +84,11 @@ pub struct Config {
     /// session; this is the hand-edited, persisted default.
     #[serde(default)]
     pub tui_default_mode: Option<String>,
+    /// Named cloud providers (OpenAI-compatible endpoints), loaded from
+    /// the separate `providers.toml` (see [`Providers`]) -- like
+    /// `routing`, never read from or written to `config.toml` itself.
+    #[serde(skip, default)]
+    pub providers: Providers,
 }
 
 impl Default for Config {
@@ -107,6 +112,7 @@ impl Default for Config {
             tui_user_color: None,
             tui_agent_color: None,
             tui_default_mode: None,
+            providers: Providers::default(),
         }
     }
 }
@@ -136,6 +142,7 @@ impl Config {
             toml_from_str(&raw)?
         };
         cfg.routing = ModelRouting::load()?;
+        cfg.providers = Providers::load()?;
         Ok(cfg)
     }
 
@@ -207,6 +214,89 @@ impl Config {
             }
         }
         out
+    }
+
+    /// Same as `distinct_models`, but only the ones that actually run on
+    /// the local Ollama daemon -- for sizing anything based on this
+    /// machine's RAM (`resources::safe_concurrency`, the swarm/mission
+    /// schedulers): a cloud-routed model doesn't occupy local RAM at all,
+    /// so counting it there would just make the estimate too conservative.
+    pub fn distinct_local_models(&self) -> Vec<&str> {
+        self.distinct_models().into_iter().filter(|m| matches!(self.resolve_model(m), ResolvedModel::Local { .. })).collect()
+    }
+
+    /// Resolves a routed model string -- whatever `model_for`/
+    /// `model_for_tier` returned -- into either a plain Ollama tag or a
+    /// cloud provider + its own model name. The convention is
+    /// `"<provider>:<model>"`, e.g. `"groq:llama-3.3-70b-versatile"` --
+    /// but only when `<provider>` is actually a name in `providers.toml`;
+    /// otherwise the whole string is just an Ollama tag, colons and all
+    /// (Ollama tags routinely contain one, like `"qwen3:8b"`), so an
+    /// untouched config with no providers configured can never
+    /// misinterpret its own model tags.
+    pub fn resolve_model<'a>(&'a self, routed: &'a str) -> ResolvedModel<'a> {
+        if let Some((prefix, rest)) = routed.split_once(':') {
+            if let Some(provider) = self.providers.get(prefix) {
+                return ResolvedModel::Cloud { provider_name: prefix, provider, model: rest };
+            }
+        }
+        ResolvedModel::Local { model: routed }
+    }
+}
+
+/// What `Config::resolve_model` resolved a routed model string to.
+#[derive(Debug, Clone, Copy)]
+pub enum ResolvedModel<'a> {
+    Local { model: &'a str },
+    Cloud { provider_name: &'a str, provider: &'a ProviderDef, model: &'a str },
+}
+
+/// One configured OpenAI-compatible cloud provider -- `providers.toml`'s
+/// `[name]` table. The API key itself is never stored here (or anywhere
+/// on disk GRAVITON writes): `api_key_env` is the *name* of the
+/// environment variable to read it from at call time, so a committed or
+/// shared `providers.toml` never leaks a secret.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderDef {
+    /// e.g. `"https://api.groq.com/openai/v1"` -- `/chat/completions` is
+    /// appended by the client.
+    pub base_url: String,
+    pub api_key_env: String,
+}
+
+/// Named cloud providers, loaded from `~/.config/graviton/providers.toml`.
+/// Missing file = no cloud providers configured, not an error -- every
+/// routed model resolves to a plain Ollama tag exactly as before this
+/// existed (see `Config::resolve_model`).
+#[derive(Debug, Clone, Default)]
+pub struct Providers(std::collections::BTreeMap<String, ProviderDef>);
+
+impl Providers {
+    pub fn path() -> Result<PathBuf> {
+        let base = dirs::config_dir().context("no config dir on this platform")?;
+        Ok(base.join("graviton").join("providers.toml"))
+    }
+
+    pub fn load() -> Result<Self> {
+        let path = Self::path()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let map: std::collections::BTreeMap<String, ProviderDef> = toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Self(map))
+    }
+
+    pub fn get(&self, name: &str) -> Option<&ProviderDef> {
+        self.0.get(name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &ProviderDef)> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -549,4 +639,73 @@ pub fn clear_index(conn: &Connection) -> Result<()> {
         "#,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_providers(providers: &[(&str, &str, &str)]) -> Config {
+        let mut cfg = Config::default();
+        let map = providers.iter().map(|(name, base_url, api_key_env)| (name.to_string(), ProviderDef { base_url: base_url.to_string(), api_key_env: api_key_env.to_string() })).collect();
+        cfg.providers = Providers(map);
+        cfg
+    }
+
+    #[test]
+    fn resolve_model_treats_a_configured_provider_prefix_as_cloud() {
+        let cfg = cfg_with_providers(&[("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY")]);
+        match cfg.resolve_model("groq:llama-3.3-70b-versatile") {
+            ResolvedModel::Cloud { provider_name, provider, model } => {
+                assert_eq!(provider_name, "groq");
+                assert_eq!(model, "llama-3.3-70b-versatile");
+                assert_eq!(provider.api_key_env, "GROQ_API_KEY");
+            }
+            ResolvedModel::Local { .. } => panic!("expected Cloud"),
+        }
+    }
+
+    #[test]
+    fn resolve_model_never_misreads_an_ollama_tag_as_a_provider() {
+        // No providers configured at all -- the single most important
+        // case, since it's every existing install's config: an Ollama
+        // tag containing a colon must never be split.
+        let cfg = Config::default();
+        match cfg.resolve_model("qwen2.5-coder:7b") {
+            ResolvedModel::Local { model } => assert_eq!(model, "qwen2.5-coder:7b"),
+            ResolvedModel::Cloud { .. } => panic!("expected Local"),
+        }
+    }
+
+    #[test]
+    fn resolve_model_only_splits_on_a_prefix_that_is_actually_a_configured_provider() {
+        // A provider named "groq" is configured, but this Ollama tag's
+        // prefix ("qwen3") isn't one of the configured provider names --
+        // stays a plain local tag, colon and all.
+        let cfg = cfg_with_providers(&[("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY")]);
+        match cfg.resolve_model("qwen3:8b") {
+            ResolvedModel::Local { model } => assert_eq!(model, "qwen3:8b"),
+            ResolvedModel::Cloud { .. } => panic!("expected Local"),
+        }
+    }
+
+    #[test]
+    fn distinct_local_models_excludes_cloud_routed_entries() {
+        let mut cfg = cfg_with_providers(&[("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY")]);
+        cfg.model = "qwen2.5-coder:7b".to_string();
+        cfg.routing.tiers.insert("deep".to_string(), "groq:llama-3.3-70b-versatile".to_string());
+        let local = cfg.distinct_local_models();
+        assert!(local.contains(&"qwen2.5-coder:7b"));
+        assert!(!local.contains(&"groq:llama-3.3-70b-versatile"));
+    }
+
+    #[test]
+    fn providers_parses_a_real_toml_file() {
+        let raw = "[groq]\nbase_url = \"https://api.groq.com/openai/v1\"\napi_key_env = \"GROQ_API_KEY\"\n\n[together]\nbase_url = \"https://api.together.xyz/v1\"\napi_key_env = \"TOGETHER_API_KEY\"\n";
+        let map: std::collections::BTreeMap<String, ProviderDef> = toml::from_str(raw).unwrap();
+        let providers = Providers(map);
+        assert_eq!(providers.get("groq").unwrap().api_key_env, "GROQ_API_KEY");
+        assert_eq!(providers.get("together").unwrap().base_url, "https://api.together.xyz/v1");
+        assert!(providers.get("nonexistent").is_none());
+    }
 }

@@ -52,8 +52,6 @@ pub async fn run(
     max_parallel: Option<usize>,
     resume_session: Option<String>,
 ) -> Result<()> {
-    let client = OllamaClient::new(&cfg.ollama_host);
-
     let checkpoint = match &resume_session {
         Some(id) => {
             let cp = MissionCheckpoint::open_existing(root, id)?;
@@ -109,9 +107,12 @@ pub async fn run(
         m.dedup();
         m
     };
-    let sizes = crate::resources::model_sizes_mb(&client).await;
+    // Only the Ollama-routed subset sizes the scheduler -- see
+    // `Config::distinct_local_models`'s doc comment.
+    let local_models: Vec<String> = all_models.iter().filter(|m| matches!(cfg.resolve_model(m), graviton_core::ResolvedModel::Local { .. })).cloned().collect();
+    let sizes = crate::resources::model_sizes_mb(&OllamaClient::new(&cfg.ollama_host)).await;
     let hard_cap = max_parallel.unwrap_or(6).max(1);
-    let scheduler = crate::resources::LiveScheduler::spawn(all_models, sizes, hard_cap);
+    let scheduler = crate::resources::LiveScheduler::spawn(local_models, sizes, hard_cap);
     println!(
         "\x1b[2mmission scheduler: ~{} concurrent model call(s) to start, max depth {depth} \
          (both re-sampled/enforced live — see `grv status`)\x1b[0m\n",
@@ -120,7 +121,6 @@ pub async fn run(
 
     let result = execute_node(
         cfg.clone(),
-        client,
         root.to_path_buf(),
         context_block,
         task.to_string(),
@@ -146,7 +146,6 @@ pub async fn run(
 #[allow(clippy::too_many_arguments)]
 fn execute_node(
     cfg: Config,
-    client: OllamaClient,
     root: PathBuf,
     context_block: String,
     task: String,
@@ -169,7 +168,7 @@ fn execute_node(
         }
 
         if depth_remaining == 0 {
-            let result = run_leaf(&cfg, &client, &root, &context_block, &task, &assigned_agent, &scheduler).await;
+            let result = run_leaf(&cfg, &root, &context_block, &task, &assigned_agent, &scheduler).await;
             record_leaf(&checkpoint, &node_path, &task, &assigned_agent, &result);
             return result;
         }
@@ -184,7 +183,7 @@ fn execute_node(
                 recorded.into_iter().map(|(agent, task)| SubtaskSpec { agent, task }).collect()
             }
             None => {
-                let subtasks = decompose(&cfg, &client, &context_block, &task, &scheduler).await?;
+                let subtasks = decompose(&cfg, &context_block, &task, &scheduler).await?;
                 checkpoint.record(
                     &node_path,
                     MissionNodeRecord {
@@ -201,7 +200,7 @@ fn execute_node(
 
         if subtasks.len() <= 1 {
             let agent = subtasks.into_iter().next().map(|s| s.agent).unwrap_or(assigned_agent);
-            let result = run_leaf(&cfg, &client, &root, &context_block, &task, &agent, &scheduler).await;
+            let result = run_leaf(&cfg, &root, &context_block, &task, &agent, &scheduler).await;
             record_leaf(&checkpoint, &node_path, &task, &agent, &result);
             return result;
         }
@@ -219,7 +218,6 @@ fn execute_node(
         for (i, sub) in subtasks.into_iter().enumerate() {
             set.spawn(execute_node(
                 cfg.clone(),
-                client.clone(),
                 root.clone(),
                 context_block.clone(),
                 sub.task,
@@ -235,7 +233,7 @@ fn execute_node(
             children.push(joined.context("mission subtask panicked")??);
         }
 
-        let result = synthesize(&cfg, &client, &context_block, &task, &children, &scheduler).await;
+        let result = synthesize(&cfg, &context_block, &task, &children, &scheduler).await;
         record_synthesis(&checkpoint, &node_path, &task, &assigned_agent, &result);
         result
     })
@@ -276,10 +274,11 @@ fn record_synthesis(checkpoint: &MissionCheckpoint, node_path: &str, task: &str,
 /// Every model call in a mission — leaf work, planning, synthesis — funnels
 /// through here, so every one of them (not just leaves) is gated by the
 /// same live scheduler.
-async fn call_model(client: &OllamaClient, cfg: &Config, model: &str, system: &str, user_msg: &str, scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<String> {
+async fn call_model(cfg: &Config, model: &str, system: &str, user_msg: &str, scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<String> {
     let _permit = scheduler.acquire().await;
+    let (client, model) = crate::providers::resolve_client(cfg, model)?;
     let result = client
-        .chat_stream(model, &[ChatMessage::system(system), ChatMessage::user(user_msg)], cfg.num_ctx, &[], |_| {}, |_| {})
+        .chat_stream(&model, &[ChatMessage::system(system), ChatMessage::user(user_msg)], cfg.num_ctx, &[], |_| {}, |_| {})
         .await?;
     Ok(result.content)
 }
@@ -289,9 +288,10 @@ async fn call_model(client: &OllamaClient, cfg: &Config, model: &str, system: &s
 /// check current information instead of answering from memory alone. Each
 /// round's model call still goes through the shared scheduler like every
 /// other call in the tree.
-async fn run_leaf(cfg: &Config, client: &OllamaClient, root: &Path, context_block: &str, task: &str, agent_key: &str, scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<String> {
+async fn run_leaf(cfg: &Config, root: &Path, context_block: &str, task: &str, agent_key: &str, scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<String> {
     let spec = agents::find(agent_key).unwrap_or(&agents::ARCHITECT);
-    let model = cfg.model_for(spec.tier, spec.key);
+    let (client, model) = crate::providers::resolve_client(cfg, cfg.model_for(spec.tier, spec.key))?;
+    let model = model.as_str();
     let tools = agentic::read_only_tool_defs();
     let mut messages = vec![
         ChatMessage::system(spec.base_prompt()),
@@ -321,7 +321,7 @@ async fn run_leaf(cfg: &Config, client: &OllamaClient, root: &Path, context_bloc
     Ok(msg)
 }
 
-async fn decompose(cfg: &Config, client: &OllamaClient, context_block: &str, task: &str, scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<Vec<SubtaskSpec>> {
+async fn decompose(cfg: &Config, context_block: &str, task: &str, scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<Vec<SubtaskSpec>> {
     let roster: String = agents::ALL_AGENTS.iter().map(|a| format!("{}: {}", a.key, a.tagline)).collect::<Vec<_>>().join("\n");
     let system = format!(
         "You are GRAVITON's mission planner. Break the given task into independent \
@@ -338,11 +338,11 @@ async fn decompose(cfg: &Config, client: &OllamaClient, context_block: &str, tas
     );
     let user_msg = format!("Task: {task}\n\nRetrieved context:\n{context_block}");
     let model = cfg.model_for_tier(ModelTier::Fast);
-    let raw = call_model(client, cfg, model, &system, &user_msg, scheduler).await?;
+    let raw = call_model(cfg, model, &system, &user_msg, scheduler).await?;
     parse_subtasks(&raw)
 }
 
-async fn synthesize(cfg: &Config, client: &OllamaClient, context_block: &str, task: &str, children: &[String], scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<String> {
+async fn synthesize(cfg: &Config, context_block: &str, task: &str, children: &[String], scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<String> {
     let combined = children.join("\n\n---\n\n");
     let system = "You are GRAVITON's mission synthesizer. Combine the following subtask \
                   results into one coherent, non-redundant answer to the original task. \
@@ -351,7 +351,7 @@ async fn synthesize(cfg: &Config, client: &OllamaClient, context_block: &str, ta
                   impactful first.";
     let user_msg = format!("Original task: {task}\n\nRetrieved context:\n{context_block}\n\nSubtask results:\n{combined}");
     let model = cfg.model_for_tier(ModelTier::Fast);
-    call_model(client, cfg, model, system, &user_msg, scheduler).await
+    call_model(cfg, model, system, &user_msg, scheduler).await
 }
 
 /// Extract a JSON array from the planner's response by bracket-counting

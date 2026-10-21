@@ -46,12 +46,17 @@ pub async fn cmd_models_show(cfg: &Config) -> Result<()> {
             last_tier = Some(a.tier);
         }
         let resolved = cfg.model_for(a.tier, a.key);
-        let flag = if pulled.is_empty() {
-            String::new()
-        } else if pulled.iter().any(|m| m == resolved) {
-            String::new()
-        } else {
-            " \x1b[31m(not pulled — `ollama pull` it or `grv models set` a different one)\x1b[0m".to_string()
+        let flag = match cfg.resolve_model(resolved) {
+            graviton_core::ResolvedModel::Cloud { provider_name, provider, .. } => {
+                if std::env::var(&provider.api_key_env).is_ok() {
+                    format!(" \x1b[36m(cloud: {provider_name})\x1b[0m")
+                } else {
+                    format!(" \x1b[31m(cloud: {provider_name}, but ${} isn't set)\x1b[0m", provider.api_key_env)
+                }
+            }
+            graviton_core::ResolvedModel::Local { .. } if pulled.is_empty() => String::new(),
+            graviton_core::ResolvedModel::Local { .. } if pulled.iter().any(|m| m == resolved) => String::new(),
+            graviton_core::ResolvedModel::Local { .. } => " \x1b[31m(not pulled — `ollama pull` it or `grv models set` a different one)\x1b[0m".to_string(),
         };
         let source = if cfg.routing.agents.contains_key(a.key) {
             "agent override"
