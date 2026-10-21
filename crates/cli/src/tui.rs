@@ -641,7 +641,13 @@ fn submit(state: &mut ChatState, cfg: &Config, root: &std::path::Path, tx: &mpsc
             } else {
                 None
             };
-            let loop_cfg = agentic::AgentLoopConfig { auto_approve: mode == PermissionMode::Auto, enable_browser: false };
+            // Browser tools (navigate/eval/screenshot/console) aren't
+            // gated by permission mode -- same as `grv run --browser`,
+            // they were never behind `gate()`'s write/edit/delete/shell
+            // confirmation to begin with, so there's no extra risk tier
+            // to wire up here; this just extends an existing capability
+            // to the chat's own agentic loop.
+            let loop_cfg = agentic::AgentLoopConfig { auto_approve: mode == PermissionMode::Auto, enable_browser: true };
             agentic::run(&cfg, &root, agent, &line, initial_context, loop_cfg, resume_session, io).await
         }
         .await;

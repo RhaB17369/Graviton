@@ -779,13 +779,14 @@ async fn cmd_ask(cfg: &Config, question: &str, files: Vec<PathBuf>, agent: &Agen
 
 /// Bare `grv`, no subcommand: a real full-screen TUI chat instead of
 /// printing help and exiting (clap's default for a missing subcommand,
-/// and this project's own behavior until this was replaced). Read-only —
-/// the same tool loop `ask` uses (`read_file`/`search_code`/`web_search`/
-/// ...), never the acting one `grv run` has, so there's no write/edit/
-/// delete/shell call a chat session could make without `grv run`'s own
-/// confirm/checkpoint safety net around it. See `tui.rs` for the actual
-/// screen (persistent input box, scrolling transcript, live spinner) and
-/// `tui::run_chat_tui` for the event loop.
+/// and this project's own behavior until this was replaced). Drives the
+/// same agentic, write-capable loop `grv run` does (`agentic::run`,
+/// checkpointed/rollback-able, browser tools included) through its own
+/// `TuiIo`, gated by an in-chat manual/semi-automatic/automatic
+/// permission mode (Ctrl+T or `/mode`) instead of `grv run`'s blocking
+/// stdin prompt. See `tui.rs` for the actual screen (persistent input
+/// box, scrolling transcript, live spinner, the plan/checkpoint panels)
+/// and `tui::run_chat_tui` for the event loop.
 async fn cmd_chat(cfg: &Config, resume: Option<String>) -> Result<()> {
     tui::run_chat_tui(cfg, resume).await
 }
