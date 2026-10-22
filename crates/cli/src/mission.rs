@@ -277,9 +277,9 @@ fn record_synthesis(checkpoint: &MissionCheckpoint, node_path: &str, task: &str,
 async fn call_model(cfg: &Config, model: &str, system: &str, user_msg: &str, scheduler: &Arc<crate::resources::LiveScheduler>) -> Result<String> {
     let _permit = scheduler.acquire().await;
     let (client, model) = crate::providers::resolve_client(cfg, model)?;
-    let result = client
-        .chat_stream(&model, &[ChatMessage::system(system), ChatMessage::user(user_msg)], cfg.num_ctx, &[], |_| {}, |_| {})
-        .await?;
+    let messages = [ChatMessage::system(system), ChatMessage::user(user_msg)];
+    let num_ctx = cfg.effective_num_ctx(graviton_llm::estimate_prompt_chars(&messages, &[]));
+    let result = client.chat_stream(&model, &messages, num_ctx, &[], |_| {}, |_| {}).await?;
     Ok(result.content)
 }
 
@@ -302,7 +302,8 @@ async fn run_leaf(cfg: &Config, root: &Path, context_block: &str, task: &str, ag
     for _ in 0..MAX_LEAF_TOOL_STEPS {
         let result = {
             let _permit = scheduler.acquire().await;
-            client.chat_stream(model, &messages, cfg.num_ctx, &tools, |_| {}, |_| {}).await?
+            let num_ctx = agentic::num_ctx_for_tool_loop(cfg, &messages, &tools);
+            client.chat_stream(model, &messages, num_ctx, &tools, |_| {}, |_| {}).await?
         };
         if result.tool_calls.is_empty() {
             let out = result.content;

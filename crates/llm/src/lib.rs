@@ -176,6 +176,27 @@ struct EmbeddingsResponse {
     embedding: Vec<f32>,
 }
 
+/// A rough (chars, not tokens) size of everything about to be sent on one
+/// `chat_stream` call -- every message's text plus any tool-call
+/// arguments, and every offered tool's name/description/parameter
+/// schema, since all of that is injected into the prompt the model
+/// actually processes. Callers use this to size `options.num_ctx` to
+/// what a call actually needs (see `graviton_core::Config::
+/// effective_num_ctx`) rather than always requesting the configured
+/// ceiling, which costs real throughput on CPU-only inference whether or
+/// not a given call needed that much room.
+pub fn estimate_prompt_chars(messages: &[ChatMessage], tools: &[ToolDef]) -> usize {
+    let messages_chars: usize = messages
+        .iter()
+        .map(|m| {
+            let tool_calls_chars: usize = m.tool_calls.as_ref().map(|calls| calls.iter().map(|c| c.function.name.len() + c.function.arguments.to_string().len()).sum()).unwrap_or(0);
+            m.content.len() + tool_calls_chars
+        })
+        .sum();
+    let tools_chars: usize = tools.iter().map(|t| t.function.name.len() + t.function.description.len() + t.function.parameters.to_string().len()).sum();
+    messages_chars + tools_chars
+}
+
 /// One turn of a chat completion: either free-text content, or one/more
 /// tool calls the caller is expected to execute and feed back.
 #[derive(Debug, Default)]
@@ -609,6 +630,24 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn estimate_prompt_chars_counts_message_text_and_tool_schemas() {
+        let messages = vec![ChatMessage::system("0123456789")]; // 10 chars
+        let tools = vec![ToolDef::new("t", "desc", serde_json::json!({}))]; // "t"(1) + "desc"(4) + "{}"(2)
+        let total = estimate_prompt_chars(&messages, &tools);
+        assert_eq!(total, 10 + 1 + 4 + 2);
+    }
+
+    #[test]
+    fn estimate_prompt_chars_counts_tool_call_arguments_in_assistant_messages() {
+        let messages = vec![ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: None,
+            function: ToolCallFunction { name: "read_file".into(), arguments: serde_json::json!({"path": "a.rs"}) },
+        }])];
+        let total = estimate_prompt_chars(&messages, &[]);
+        assert!(total > "read_file".len(), "expected the arguments JSON to be counted too, got {total}");
+    }
 
     #[test]
     fn to_openai_wire_messages_pairs_tool_results_with_real_ids() {

@@ -163,6 +163,39 @@ impl Config {
         tokens * 4
     }
 
+    /// The `options.num_ctx` to actually request for a call whose full
+    /// prompt (system + history + tool defs) comes to `content_chars`
+    /// characters -- `num_ctx` itself is a hard ceiling (retrieval is
+    /// already sized against it via `context_char_budget`, so a request
+    /// never legitimately needs more than that), not what gets sent on
+    /// every call.
+    ///
+    /// Why this exists: on CPU-only inference, Ollama/llama.cpp allocates
+    /// the KV cache for the *entire configured* `num_ctx`, not just the
+    /// tokens actually in use -- measured live on this project's own
+    /// target hardware, the exact same short prompt against the exact
+    /// same model ran at 3.30 tok/s with Ollama's own (small) default
+    /// context, 2.46 tok/s at `num_ctx=8192`, and 2.02 tok/s at
+    /// `num_ctx=32768` -- a user who raised `num_ctx` to fit occasional
+    /// large retrieved context was paying that cost on *every* call,
+    /// including a one-line question that never needed more than a few
+    /// hundred tokens. Rounding up to the next power-of-two bucket (never
+    /// below 2048) keeps this cheap for the common short case while
+    /// still reaching the full ceiling once a request's content actually
+    /// needs it -- and since a single agentic run's message history only
+    /// grows turn over turn, the bucket it picks can only grow within
+    /// that run, never shrink and force a reload partway through.
+    pub fn effective_num_ctx(&self, content_chars: usize) -> usize {
+        // /4 chars-per-token heuristic (same one `context_char_budget`
+        // uses) plus fixed headroom for the answer itself.
+        let needed_tokens = content_chars / 4 + 2048;
+        let mut bucket = 2048usize;
+        while bucket < needed_tokens && bucket < self.num_ctx {
+            bucket *= 2;
+        }
+        bucket.min(self.num_ctx)
+    }
+
     /// Resolve which model tag an agent in the given tier should call,
     /// ignoring any per-agent override — i.e. just the `model`/
     /// `model_fast`/`model_deep` fallback layer. `Fast`/`Deep` fall back to
@@ -707,5 +740,47 @@ mod tests {
         assert_eq!(providers.get("groq").unwrap().api_key_env, "GROQ_API_KEY");
         assert_eq!(providers.get("together").unwrap().base_url, "https://api.together.xyz/v1");
         assert!(providers.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn effective_num_ctx_floor_for_near_empty_content() {
+        let mut cfg = Config::default();
+        cfg.num_ctx = 32768;
+        assert_eq!(cfg.effective_num_ctx(0), 2048);
+    }
+
+    #[test]
+    fn effective_num_ctx_stays_small_for_a_short_prompt_even_with_a_huge_ceiling() {
+        let mut cfg = Config::default();
+        cfg.num_ctx = 32768;
+        // A one-line question (a couple hundred chars): the 2048 headroom
+        // alone already pushes past the smallest bucket, landing on the
+        // next one up -- still a tiny fraction of the 32768 ceiling.
+        assert_eq!(cfg.effective_num_ctx(200), 4096);
+    }
+
+    #[test]
+    fn effective_num_ctx_grows_to_the_next_bucket_as_content_grows() {
+        let mut cfg = Config::default();
+        cfg.num_ctx = 32768;
+        // ~6000 tokens of content (24000 chars) + 2048 headroom needs more
+        // than the 4096 bucket, so it should land on 8192.
+        assert_eq!(cfg.effective_num_ctx(24000), 8192);
+    }
+
+    #[test]
+    fn effective_num_ctx_never_exceeds_the_configured_ceiling() {
+        let mut cfg = Config::default();
+        cfg.num_ctx = 8192;
+        // Content that would otherwise need a much bigger bucket is
+        // still capped at the user's configured num_ctx.
+        assert_eq!(cfg.effective_num_ctx(1_000_000), 8192);
+    }
+
+    #[test]
+    fn effective_num_ctx_respects_a_ceiling_smaller_than_the_smallest_bucket() {
+        let mut cfg = Config::default();
+        cfg.num_ctx = 1024;
+        assert_eq!(cfg.effective_num_ctx(200), 1024);
     }
 }

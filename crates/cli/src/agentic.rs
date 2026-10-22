@@ -352,6 +352,34 @@ pub(crate) async fn dispatch_read_only(cfg: &Config, root: &Path, name: &str, ar
 /// harder before answering.
 pub const MAX_READONLY_TOOL_STEPS: usize = 6;
 
+/// `options.num_ctx` for one round of a tool-calling loop (`run_read_only_
+/// loop_on`'s `for` loop, or `run()`'s `MAX_STEPS` loop below) -- called
+/// fresh every round, but padded `4x` over what the conversation needs
+/// *right now* specifically so it doesn't have to change every round.
+///
+/// Why that padding matters: `Config::effective_num_ctx` sizes `num_ctx`
+/// to what the content actually needs instead of always the configured
+/// ceiling (see its doc comment for the measured speedup on CPU-only
+/// inference) -- but `options.num_ctx` is fixed at model-load time, as a
+/// `-c` flag Ollama launches its `llama-server` subprocess with
+/// (confirmed live: visible in `ps` output). A later round in the *same*
+/// loop that lands in a bigger bucket, because tool results pushed the
+/// conversation past a boundary, doesn't just lose a KV cache -- Ollama
+/// kills that process and starts a new one at the new size, a full
+/// model reload (confirmed live: 15+ seconds just for `load_duration` on
+/// this project's target hardware) plus reprocessing the entire
+/// conversation from scratch at the new size. Tool results aren't
+/// size-capped before being fed back to the model (unlike the truncated
+/// copy shown in the terminal), so content can grow a lot between
+/// rounds; the `4x` headroom means a bucket only has to change once
+/// growth has clearly outrun it, not on every round's small increment --
+/// occasional, not eliminated. If a single round still blows past it,
+/// Ollama's own `--context-shift` (also visible in that `ps` output)
+/// drops the oldest tokens rather than erroring.
+pub(crate) fn num_ctx_for_tool_loop(cfg: &Config, messages: &[ChatMessage], tools: &[ToolDef]) -> usize {
+    cfg.effective_num_ctx(graviton_llm::estimate_prompt_chars(messages, tools) * 4)
+}
+
 pub async fn run_read_only_loop(
     client: &LlmClient,
     cfg: &Config,
@@ -439,7 +467,8 @@ pub async fn run_read_only_loop_on(
     let tools = read_only_tool_defs();
 
     for _ in 0..MAX_READONLY_TOOL_STEPS {
-        let result = client.chat_stream(model, messages, cfg.num_ctx, &tools, &mut on_token, &mut on_thinking).await?;
+        let num_ctx = num_ctx_for_tool_loop(cfg, messages, &tools);
+        let result = client.chat_stream(model, messages, num_ctx, &tools, &mut on_token, &mut on_thinking).await?;
         if result.tool_calls.is_empty() {
             messages.push(ChatMessage::assistant(result.content.clone()));
             return Ok(result.content);
@@ -455,7 +484,8 @@ pub async fn run_read_only_loop_on(
     // Used up the tool-call budget without a final answer -- ask once
     // more with no tools offered, forcing a text response instead of
     // silently returning nothing.
-    let result = client.chat_stream(model, messages, cfg.num_ctx, &[], &mut on_token, &mut on_thinking).await?;
+    let num_ctx = num_ctx_for_tool_loop(cfg, messages, &[]);
+    let result = client.chat_stream(model, messages, num_ctx, &[], &mut on_token, &mut on_thinking).await?;
     messages.push(ChatMessage::assistant(result.content.clone()));
     Ok(result.content)
 }
@@ -1180,7 +1210,8 @@ pub async fn run(
     io.emit(format!("\x1b[1;35m═══ {} (agentic) ═══\x1b[0m", agent.display));
 
     for step in 0..MAX_STEPS {
-        let result = client.chat_stream(&model, &messages, cfg.num_ctx, &tools, |tok| io.on_token(tok), |tok| io.on_thinking(tok)).await?;
+        let num_ctx = num_ctx_for_tool_loop(cfg, &messages, &tools);
+        let result = client.chat_stream(&model, &messages, num_ctx, &tools, |tok| io.on_token(tok), |tok| io.on_thinking(tok)).await?;
         io.emit(String::new()); // blank line after the streamed answer, matching the terminal's old unconditional println!()
 
         if result.tool_calls.is_empty() {
