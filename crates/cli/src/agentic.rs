@@ -354,7 +354,7 @@ pub const MAX_READONLY_TOOL_STEPS: usize = 6;
 
 /// `options.num_ctx` for one round of a tool-calling loop (`run_read_only_
 /// loop_on`'s `for` loop, or `run()`'s `MAX_STEPS` loop below) -- called
-/// fresh every round, but padded `4x` over what the conversation needs
+/// fresh every round, but one bucket above what the conversation needs
 /// *right now* specifically so it doesn't have to change every round.
 ///
 /// Why that padding matters: `Config::effective_num_ctx` sizes `num_ctx`
@@ -370,14 +370,36 @@ pub const MAX_READONLY_TOOL_STEPS: usize = 6;
 /// this project's target hardware) plus reprocessing the entire
 /// conversation from scratch at the new size. Tool results aren't
 /// size-capped before being fed back to the model (unlike the truncated
-/// copy shown in the terminal), so content can grow a lot between
-/// rounds; the `4x` headroom means a bucket only has to change once
+/// copy shown in the terminal), so content can grow between rounds; one
+/// extra bucket of headroom means a change only has to happen once
 /// growth has clearly outrun it, not on every round's small increment --
 /// occasional, not eliminated. If a single round still blows past it,
 /// Ollama's own `--context-shift` (also visible in that `ps` output)
 /// drops the oldest tokens rather than erroring.
+///
+/// Doubling the already-*bucketed* bare value (not multiplying the raw
+/// character count) matters just as much: `run()`'s system prompt plus
+/// its ~18 tools alone measured 20000+ characters live, before a single
+/// token of the actual question -- multiplying that raw count by a
+/// fixed factor overshot straight to the configured ceiling even for a
+/// trivial "say hello", the single slowest setting measured, which
+/// defeated the point of sizing this dynamically at all. Doubling the
+/// bucket scales proportionally instead: small stays small, large
+/// doesn't get inflated into "always the ceiling."
 pub(crate) fn num_ctx_for_tool_loop(cfg: &Config, messages: &[ChatMessage], tools: &[ToolDef]) -> usize {
-    cfg.effective_num_ctx(graviton_llm::estimate_prompt_chars(messages, tools) * 4)
+    // One bucket of headroom above the bare minimum, not a flat
+    // multiplier on the raw content size -- multiplying a *large* base
+    // (the write-capable loop's system prompt + its ~18 tools alone ran
+    // 20000+ characters in testing, live) by a fixed factor overshoots
+    // straight to the configured ceiling even for a trivial exchange,
+    // which defeats the entire point of sizing this dynamically (and
+    // was confirmed doing exactly that: `grv run`'s "say hello" case
+    // landed on num_ctx=32768 -- the single slowest setting measured --
+    // for a call that needed nowhere near it). Doubling the already-
+    // bucketed bare value scales proportionally instead: small stays
+    // small, large doesn't get multiplied into "always the ceiling."
+    let bare = cfg.effective_num_ctx(graviton_llm::estimate_prompt_chars(messages, tools));
+    (bare * 2).min(cfg.num_ctx)
 }
 
 pub async fn run_read_only_loop(
