@@ -366,8 +366,12 @@ before it as a provider name if that name is an actual key in
 returned as a plain Ollama tag, unsplit. This is deliberately
 conservative: Ollama tags routinely contain a colon (`qwen3:8b`), so the
 split only ever fires for a prefix someone *configured*, never a guess
-based on shape. An install with no `providers.toml` is byte-for-byte
-unaffected.
+based on shape. `Providers::load()` writes a fully-commented example
+template to `providers.toml` the first time it's missing (so there's
+always a real file at a known path to edit, no separate scaffolding
+command needed); an untouched template parses as an empty table, so
+behavior stays byte-for-byte unaffected until someone actually
+uncomments a provider.
 
 ```mermaid
 flowchart LR

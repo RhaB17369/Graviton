@@ -310,9 +310,20 @@ impl Providers {
         Ok(base.join("graviton").join("providers.toml"))
     }
 
+    /// Loads `providers.toml`, writing a fully-commented example template
+    /// on first run if it doesn't exist yet -- so there's always a real
+    /// file at a known path to open and edit, instead of leaving the user
+    /// to guess the format and location from documentation alone. The
+    /// template parses as an empty table (every line is commented out),
+    /// so a user who never touches it gets exactly the same
+    /// no-cloud-providers-configured behavior as before this existed.
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         if !path.exists() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, EXAMPLE_PROVIDERS_TOML)?;
             return Ok(Self::default());
         }
         let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -332,6 +343,24 @@ impl Providers {
         self.0.is_empty()
     }
 }
+
+/// Written to `providers.toml` the first time it's loaded and no such
+/// file exists yet -- every line commented out, so it parses as an
+/// empty table. Mirrors the example in README.md; keep both in sync.
+const EXAMPLE_PROVIDERS_TOML: &str = r#"# GRAVITON cloud providers -- uncomment and fill in to route an agent or
+# tier at an open-weight model hosted elsewhere instead of local Ollama.
+# `api_key_env` is the *name* of an environment variable, never the key
+# itself -- set it in your shell (e.g. `export GROQ_API_KEY=...`) before
+# running `grv`. See README.md's "Cloud providers" section for details.
+
+# [groq]
+# base_url = "https://api.groq.com/openai/v1"
+# api_key_env = "GROQ_API_KEY"
+
+# [together]
+# base_url = "https://api.together.xyz/v1"
+# api_key_env = "TOGETHER_API_KEY"
+"#;
 
 /// Per-tier and per-agent-key model overrides, loaded from the separate
 /// `~/.config/graviton/models.toml` — `config.toml`'s `model`/
@@ -740,6 +769,16 @@ mod tests {
         assert_eq!(providers.get("groq").unwrap().api_key_env, "GROQ_API_KEY");
         assert_eq!(providers.get("together").unwrap().base_url, "https://api.together.xyz/v1");
         assert!(providers.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn example_providers_toml_template_parses_as_empty() {
+        // Every line of the scaffold `Providers::load()` writes on first
+        // run is commented out, so a user who never edits it keeps
+        // exactly the pre-existing "no cloud providers configured"
+        // behavior, not an error or a half-filled-in provider.
+        let map: std::collections::BTreeMap<String, ProviderDef> = toml::from_str(EXAMPLE_PROVIDERS_TOML).unwrap();
+        assert!(map.is_empty());
     }
 
     #[test]

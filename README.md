@@ -151,7 +151,11 @@ Everything above assumes Ollama. A third config file,
 same OpenAI-compatible `/chat/completions` API nearly every open-weight
 host exposes — Groq, Together.ai, Fireworks, DeepInfra, OpenRouter,
 Cerebras, and most others — one client covers all of them, no
-provider-specific code:
+provider-specific code. Unlike `models.toml`, which stays genuinely
+missing until you create it, `providers.toml` is written for you (with
+every line commented out, so it changes nothing) the first time `grv`
+runs — open it and uncomment/edit, there's no separate command needed to
+create it:
 
 ```toml
 # ~/.config/graviton/providers.toml
